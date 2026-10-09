@@ -80,6 +80,9 @@ jobs:
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || github.ref }}
           persist-credentials: false
+      # Container root vs the runner-owned workspace: git refuses it as "dubious ownership".
+      - name: Mark the workspace a safe git directory
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       # As in ci.yml (GITHUB_ENV, because `github.workspace` is the host path).
       - name: Keep the cargo home in the workspace

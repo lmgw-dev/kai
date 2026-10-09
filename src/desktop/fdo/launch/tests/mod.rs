@@ -10,7 +10,7 @@
 //! which it moves the scope's PIDs, as the manager does. So a drop's `cgroup.kill` and `KillUnit`
 //! reach what the command started, `setsid` and reparented processes too; the rig kills what is
 //! left in them and removes them when it ends. Where it cannot (no cgroup v2, a read-only one),
-//! `KillUnit` kills the PIDs and their descendants, and [`Rig::cgroups`] says so.
+//! `KillUnit` kills the PIDs and their descendants, and `ManagerState::cgroups` stays empty.
 
 mod entries;
 mod mime;
@@ -239,11 +239,6 @@ impl Drop for Rig {
 }
 
 impl Rig {
-    /// The fake gave its scopes real cgroups (module doc).
-    pub fn cgroups(&self) -> bool {
-        own_cgroup().is_some()
-    }
-
     pub fn home(&self) -> PathBuf {
         self.dir.path().join("home")
     }

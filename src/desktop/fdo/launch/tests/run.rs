@@ -288,11 +288,31 @@ async fn a_cancelled_command_is_killed_with_its_scope() {
         p = read_when_there(&pidfile) => p,
     };
     // The select dropped the call's future: the cancellation.
-    for pid in pids.split_whitespace() {
+    // The shell and the plain background sleep die with the process group either way. The
+    // `setsid` one is out of that group and, once the shell is gone, reparented away from the
+    // PIDs the fake knows: only a cgroup still reaches it. Without one the fake's `KillUnit`
+    // cannot (the real manager would, by its own cgroup), so it is not expected gone there.
+    // (The scope got a cgroup only where the test's own was writable.)
+    let cgroup = !r.state.lock().unwrap().cgroups.is_empty();
+    let reach = if cgroup { 3 } else { 2 };
+    for pid in pids.split_whitespace().take(reach) {
         gone(pid.parse().unwrap()).await;
     }
+    if !cgroup {
+        // Nothing else will end it: the test does.
+        if let Some(p) = pids
+            .split_whitespace()
+            .nth(2)
+            .and_then(|p| p.parse::<i32>().ok())
+        {
+            // SAFETY: kill on the test's own process.
+            unsafe {
+                libc::kill(p, libc::SIGKILL);
+            }
+        }
+    }
     let kills = r.state.lock().unwrap().kills.len();
-    if r.cgroups() {
+    if cgroup {
         assert_eq!(
             r.state.lock().unwrap().cgroups.len(),
             1,
