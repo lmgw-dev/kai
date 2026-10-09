@@ -1,6 +1,6 @@
 # Format, lint and test gate for pull requests and pushes to main, on GitHub's own runners: the
 # same checks as `just check`, minus what needs a desktop session or lmgw's development history.
-# Runs in fedora:latest, the image the release build uses, because the build dependencies (GTK 3,
+# Runs in quay.io/fedora/fedora:latest, the image the release build uses, because the build dependencies (GTK 3,
 # WebKitGTK 4.1, gtk-layer-shell, PipeWire, Wayland) are installed as Fedora packages.
 #
 # lmgw's crates are path dependencies (../lmgw/crates/<crate>): every job clones the public lmgw at
@@ -48,7 +48,8 @@ jobs:
     name: cargo fmt
     runs-on: ubuntu-latest
     container:
-      image: fedora:latest
+      # Fedora's own registry: Docker Hub's unauthenticated pull limit fails GitHub's runners.
+      image: quay.io/fedora/fedora:latest
     timeout-minutes: 10
     steps:
       # git so actions/checkout makes a real clone instead of a REST tarball.
@@ -73,7 +74,8 @@ jobs:
     name: clippy and tests
     runs-on: ubuntu-latest
     container:
-      image: fedora:latest
+      # Fedora's own registry: Docker Hub's unauthenticated pull limit fails GitHub's runners.
+      image: quay.io/fedora/fedora:latest
     # This bounds what a hung test can cost.
     timeout-minutes: 60
     env:

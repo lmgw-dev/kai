@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Kai's public release build, in GitHub Actions (.github/workflows/release.yml), one per pushed tag
-# v<X.Y.Z>: the RPM of that tag, version X.Y.Z (which must equal the version in Cargo.toml, so the
+# v<X.Y.Z> (or dispatched for an existing one): the RPM of that tag, version X.Y.Z (which must equal the version in Cargo.toml, so the
 # tagged source says what it is), its updater pointed at the public feed, and the manifest that feed
 # serves (latest.json). Output in target/rpm/dist/ (the RPM, latest.json), which the workflow
 # attaches to the tag's GitHub release.
@@ -24,15 +24,19 @@ PUBLIC_MANIFEST_URL=https://github.com/lmgw-dev/kai/releases/latest/download/lat
   echo "packaging/gh-build.sh runs inside GitHub Actions; build locally with \`just rpm\`" >&2
   exit 1
 }
-if [[ "${GITHUB_REF_TYPE:-}" != "tag" || "${GITHUB_REF_NAME:-}" != v* ]]; then
-  echo "public builds are made from a v<X.Y.Z> tag, not ${GITHUB_REF:-an unknown ref}" >&2
+# The tag: the workflow's KAI_RELEASE_TAG (the pushed tag, or the dispatch input, whose checkout is
+# that tag); a tag push without it falls back to its ref name.
+tag=${KAI_RELEASE_TAG:-}
+if [[ -z "$tag" && "${GITHUB_REF_TYPE:-}" == "tag" ]]; then tag=${GITHUB_REF_NAME:-}; fi
+if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  echo "public builds are made from a v<X.Y.Z> tag, not '${tag}' (${GITHUB_REF:-an unknown ref})" >&2
   exit 1
 fi
 base=$(grep -m1 -oE '^version = "[0-9]+\.[0-9]+\.[0-9]+"' Cargo.toml | grep -oE '[0-9.]+' || true)
 [[ -n "$base" ]] || { echo "no X.Y.Z version in Cargo.toml" >&2; exit 1; }
-version=${GITHUB_REF_NAME#v}
+version=${tag#v}
 if [[ "$version" != "$base" ]]; then
-  echo "tag ${GITHUB_REF_NAME} does not match version ${base} in Cargo.toml" >&2
+  echo "tag ${tag} does not match version ${base} in Cargo.toml" >&2
   echo "(scripts/release.sh bumps the version and tags in one go)" >&2
   exit 1
 fi
@@ -60,11 +64,11 @@ dist=target/rpm/dist
 rm -rf "$dist"
 mkdir -p "$dist"
 cp "$rpm" "$dist/$name"
-commit=${GITHUB_SHA:-unknown}
+commit=$(git rev-parse HEAD 2>/dev/null || echo unknown)
 cat > "$dist/latest.json" <<JSON
 {
   "version": "${KAI_VERSION}",
-  "notes": "Automated build of ${commit:0:8} on ${GITHUB_REF_NAME}.",
+  "notes": "Automated build of ${commit:0:8} on ${tag}.",
   "pub_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
   "rpm": {
     "file": "${name}",

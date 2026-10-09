@@ -22,6 +22,14 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  # Builds an existing tag from this workflow's version (a tag push that started no run, or a
+  # re-build): the build checks out refs/tags/<tag>, the tag is never moved.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and release, v<X.Y.Z>"
+        required: true
+        type: string
 
 # Each job names what it needs.
 permissions: {}
@@ -47,18 +55,30 @@ jobs:
     # Current Fedora, as on GitLab, so the RPM's GTK, WebKitGTK, gtk-layer-shell and PipeWire
     # SONAME dependencies match the hosts it is installed on.
     container:
-      image: fedora:latest
+      # Fedora's own registry: Docker Hub's unauthenticated pull limit fails GitHub's runners.
+      image: quay.io/fedora/fedora:latest
     # A cold release build (thin LTO) from scratch; this bounds what a hung build can cost.
     timeout-minutes: 90
     env:
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: "0"
+      # The tag being built: the pushed one, or the dispatch input. packaging/gh-build.sh reads it.
+      KAI_RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
     steps:
       # git for a real clone; jq to read the manifest.
       - name: Install checkout tools
         run: dnf -y install git-core jq
+      - name: Check the tag exists
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          [[ "$KAI_RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+            || { echo "::error::$KAI_RELEASE_TAG is no v<X.Y.Z> tag"; exit 1; }
+          git ls-remote --exit-code --tags "https://github.com/${GITHUB_REPOSITORY}.git" \
+            "refs/tags/${KAI_RELEASE_TAG}" >/dev/null \
+            || { echo "::error::tag $KAI_RELEASE_TAG does not exist"; exit 1; }
       - uses: actions/checkout@v7
         with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || github.ref }}
           persist-credentials: false
 
       # As in ci.yml (GITHUB_ENV, because `github.workspace` is the host path).
@@ -86,8 +106,14 @@ jobs:
           bash scripts/lmgw-pin.sh verify-tree ../lmgw
 
       # Refuses a tag that is not the version in Cargo.toml.
+      # A dispatch checks out the tag's own scripts, which read the ref from GITHUB_REF*, GITHUB_SHA
+      # (those of a tag push): state them for the tag being built (GITHUB_ENV cannot set GITHUB_*).
       - name: Build the RPM and latest.json
-        run: bash packaging/gh-build.sh
+        run: |
+          GITHUB_SHA="$(git rev-parse HEAD)"
+          export GITHUB_SHA GITHUB_REF_TYPE=tag GITHUB_REF_NAME="$KAI_RELEASE_TAG" \
+            GITHUB_REF="refs/tags/$KAI_RELEASE_TAG"
+          bash packaging/gh-build.sh
 
       # Advisory, as on GitLab: rpmlint's verdict is in the log, it does not hold up the release.
       - name: rpmlint
@@ -115,7 +141,7 @@ jobs:
     timeout-minutes: 15
     env:
       GH_REPO: ${{ github.repository }}
-      TAG: ${{ github.ref_name }}
+      TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
     # No checkout and nothing from the build but the two files: this job runs only the steps below,
     # with the runner's own gh, jq and sha256sum.
     steps:
