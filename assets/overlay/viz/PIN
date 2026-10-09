@@ -1,0 +1,7 @@
+# lmgw's ring files, vendored byte-identical (docs/design/2026-10-06-kai-design.md §9.2).
+# `just viz-check` verifies the copies against this pin and lmgw main against the pin (drift);
+# `just viz-vendor` copies them again from lmgw main and rewrites this file.
+lmgw_commit 0884d2877f76209c437daabc56543de18bcc99ca
+source crates/lmgw-ui/assets/voice/viz
+sha256 engine.js f124051d99b1dcbcc76a17126140255a1b53f78afa4e52b38db3ca51961e2b50
+sha256 ring.js 7a910f11a1814e7c2ebb826cb55e49d63debff50822ac670c4604ff5c46fdcba

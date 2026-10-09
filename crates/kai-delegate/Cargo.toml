@@ -1,0 +1,18 @@
+[package]
+name = "kai-delegate"
+version = "0.1.0"
+edition = "2024"
+description = "K25's delegate loop, client-neutral: a task-tuned prompt (static part first, dynamic part last), the model and the tools behind traits, a plan confirmed once, a short done, partial or failed answer"
+license = "FSL-1.1-MIT"
+publish = false
+
+[dependencies]
+# Tool arguments and schemas are JSON values; nothing else is parsed here.
+serde_json = "1"
+# The caller's cancellation (rmcp's request contexts carry the same token), and `select!` to honour
+# it at every wait. No runtime, no I/O: the model and the tools are the client's (traits).
+tokio-util = { version = "0.7", default-features = false }
+tokio = { version = "1", default-features = false, features = ["macros"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros", "time", "sync", "test-util"] }

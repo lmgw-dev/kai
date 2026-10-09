@@ -1,0 +1,7 @@
+# Spike-local stand-in for gtk-layer-shell-devel (not installed). Proper fix: dnf install gtk-layer-shell-devel
+# The -sys crate is pure FFI, it only needs the pkg-config probe and an unversioned .so to link.
+Name: gtk-layer-shell-0
+Description: spike shim
+Version: 0.10.0
+Libs: -L${pcfiledir}/../lib -lgtk-layer-shell
+Cflags:

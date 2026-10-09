@@ -1,0 +1,16 @@
+# The lmgw source Kai is built and tested against (review KAI-3 K3-5): lmgw-client, lmgw-api-types,
+# lmgw-update and lmgw-ui-kit, and the dev lmgw of the live checks. Three lines that name the same
+# source and are bumped together (docs/development.md, "The lmgw pin"):
+#   lmgw_commit  the commit in lmgw's development history (the checkout next to this repository,
+#                GitLab CI's clone); `just check` and the live checks warn (never fail) when that
+#                checkout is at another commit or has changes
+#   lmgw_tag     the published lmgw release (github.com/lmgw-dev/lmgw) whose tree is lmgw_tree;
+#                GitHub's CI clones lmgw at this tag
+#   lmgw_tree    the tree of both: the public repository gets one squashed commit per publish, with
+#                other commit hashes but the same tree, so the tree is what GitHub's CI checks
+#                (`scripts/lmgw-pin.sh verify-tree` fails on any other) and what `just rpm` stages
+#                the four crates and lmgw's workspace root from (`git archive`), so the RPM is the
+#                same whatever the checkout holds
+lmgw_commit b81a82db0f04269016d85248cf33c3a1d2bc4bac
+lmgw_tag v0.4.3
+lmgw_tree 81ea8fc1bbe9d2a426e9006aebcd1b139420fcb5

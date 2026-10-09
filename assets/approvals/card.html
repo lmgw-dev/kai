@@ -1,0 +1,27 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Kai approval</title>
+<link rel="stylesheet" href="card.css">
+<script src="card.js" defer></script>
+<body>
+<main class="card" id="card">
+  <header id="head">
+    <h1 id="heading"></h1>
+    <p id="asked"></p>
+    <p id="count" hidden></p>
+  </header>
+  <section id="args" aria-label="Arguments"></section>
+  <p id="more" hidden>More arguments below: scroll to the end before Enter approves (Ctrl+Enter approves as it is).</p>
+  <footer id="foot">
+    <p id="note" hidden></p>
+    <p id="busy" hidden></p>
+    <div class="buttons">
+      <button id="decline" type="button">Decline</button>
+      <button id="approve" type="button">Approve</button>
+    </div>
+    <p id="hint"></p>
+    <p id="typed" hidden></p>
+    <p id="arming">Not armed yet: keys and clicks now do not answer.</p>
+  </footer>
+</main>
+</body>

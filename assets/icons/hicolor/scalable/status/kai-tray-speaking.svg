@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 22 22">
+  <!-- Kai tray, speaking (K9): the reply plays. Blue ring with three level bars. -->
+  <circle cx="11" cy="11" r="10.5" fill="#23272C"/>
+  <circle cx="11" cy="11" r="7.25" fill="none" stroke="#3DAEE9" stroke-width="2"/>
+  <rect x="6.6" y="9" width="2" height="4" rx="1" fill="#3DAEE9"/>
+  <rect x="10" y="7" width="2" height="8" rx="1" fill="#3DAEE9"/>
+  <rect x="13.4" y="9" width="2" height="4" rx="1" fill="#3DAEE9"/>
+</svg>

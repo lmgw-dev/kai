@@ -1,0 +1,137 @@
+[package]
+name = "kai"
+version = "0.1.0"
+edition = "2024"
+description = "A Plasma client of lmgw, the local model gateway: voice at any time, tray state, overlays, desktop MCP tools"
+license = "FSL-1.1-MIT"
+publish = false
+
+# PD1 (§15.1.3): the root package `kai` (the binary) and the crates beside it: `kai-desktop` (K23: the
+# tool contract, no desktop, I/O or runtime dependency); `kai-delegate` and `kai-browser-host`
+# (phase 3) join as members when they are built. The configuration window's frontend (`ui/`, wasm,
+# built by trunk) stays out of the native workspace (`exclude`). The spikes are standalone trial builds with
+# workspaces of their own.
+[workspace]
+members = ["crates/kai-desktop", "crates/kai-delegate"]
+exclude = ["spikes", "ui"]
+
+[[bin]]
+name = "kai"
+path = "src/main.rs"
+
+[dependencies]
+# GTK3 on the main thread: the paste dialog now, layer-shell overlays from WP5 (crate versions as
+# verified in spikes/overlay and spikes/wp0).
+gtk = "0.18"
+glib = "0.18"
+# The tokio core: D-Bus (single instance, notifications), ksni, the Secret Service.
+tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "sync", "time", "signal", "process"] }
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+ksni = "0.3.6"
+# The tray icons are sent as pixmaps too (rendered from assets/icons): Plasma uses IconPixmap when
+# IconName does not resolve. No fonts or raster images are needed.
+resvg = { version = "0.48", default-features = false }
+secret-service = { version = "5.2", features = ["rt-tokio-crypto-rust"] }
+# tokio -> GTK bridge (drained by glib::MainContext::spawn_local).
+async-channel = "2"
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+toml_edit = "0.25"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+url = "2"
+# Unicode's Default_Ignorable_Code_Point and General_Category (Cf) for what a dialog or the approval
+# card escapes (`host::confirm::deceptive`); already in the tree through url's idna, compiled data.
+icu_properties = "2.3"
+form_urlencoded = "1"
+thiserror = "2"
+# Audio (§6, K7): PipeWire through pipewire-rs; `v0_3_50` gives `Stream::time()` through
+# `pw_stream_get_time_n` (WP0 (p)) and `Buffer::requested()`.
+pipewire = { version = "0.10.1", features = ["v0_3_50"] }
+# Wait-free single-producer single-consumer rings between the PipeWire callbacks and the rest (§2).
+rtrb = "0.3"
+# prctl(PR_SET_PDEATHSIG) for the echo-cancel child (K20) and CLOCK_MONOTONIC for the heard position.
+libc = "0.2"
+serde_json = "1"
+# The ring overlay (§9, WP5): a gtk-layer-shell surface hosting a WebKitGTK view (crate versions
+# and features as verified in spikes/overlay and spikes/wp0). `v0_6`: `set_keyboard_mode`; the sys
+# crate for `gtk_layer_set_monitor(NULL)` (the compositor's choice), which the safe API cannot say.
+gtk-layer-shell = { version = "0.8", features = ["v0_6"] }
+gtk-layer-shell-sys = "0.7"
+# `v2_40`: `evaluate_javascript`. soup3 sets the kai:// responses' CSP header (K10); the
+# javascriptcore crate reads the page's script messages.
+webkit2gtk = { version = "2.0", features = ["v2_40"] }
+soup3 = "0.5"
+javascriptcore-rs = "1"
+# The outputs' connector names (wl_output v4 `name`), which GDK3 does not expose, so `ring.output`
+# and KWin's active output can be named explicitly (§9.1).
+wayland-client = "0.31"
+# WP14: client bindings generated from the protocol files in src/desktop/plasma/protocols (the
+# window management protocol of ruling 16, xdg-output), at wayland-client's version.
+wayland-scanner = "0.31"
+wayland-backend = "0.3"
+# The global shortcuts (§8.2): the XDG GlobalShortcuts portal (zbus 5 on tokio, as Kai's own), and
+# the signal streams' combinators.
+ashpd = { version = "0.13", default-features = false, features = ["tokio", "global_shortcuts", "remote_desktop", "screencast"] }
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
+# The feed's HTTP client (§3.2): a streamed body for the SSE, rustls with the system's trust store
+# for a gateway behind https (lmgw itself speaks http only; a pairing link may name https).
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+# The voice session's WebSocket (`/v1/realtime?chat_thread=`, §5). For a `wss:` gateway it is given
+# the same TLS as the feed: rustls on aws-lc-rs with the system's trust store through the platform
+# verifier (both already in the build through reqwest).
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "handshake", "rustls-tls-native-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+rustls-platform-verifier = "0.7"
+# The live-test build's check of a link the live script minted (`src/live_test.rs`); the updater's
+# test of its download; the configuration window's CSP names the page's one inline script by hash
+# (`src/settings/window/assets.rs`).
+sha2 = "0.11"
+# The configuration window's page (WP21b): `ui/dist/`, built by trunk, embedded in a release build
+# and read from disk in a debug build (`just ui`); a build without it has no window page and says so.
+rust-embed = "8.11"
+# lmgw's sans-IO client rules (K3, api §4.1): the realtime protocol, the voice machine, the
+# truncate bookkeeping, the feed reader, the request builders. By path from lmgw's checkout next to
+# this repository, which must sit at the commit or tree LMGW_PIN names (`just check` warns otherwise); a
+# worktree of Kai must be a sibling of that checkout (../lmgw), never nested inside another
+# repository. `just rpm` stages the crate from the pinned tree into its tarball.
+lmgw-client = { path = "../lmgw/crates/lmgw-client" }
+# Kai's self-updater (§13, the owner's decision 2026-10-08): lmgw's update mechanism (the manifest,
+# the version order, the sha256-checked RPM download, `pkexec dnf install`), shared with lmgw's own
+# updater; Kai's feed and every word it shows are Kai's (`src/update.rs`). Staged like lmgw-client.
+lmgw-update = { path = "../lmgw/crates/lmgw-update" }
+# The hosted MCP server (§10.1, §11.1, PD2): the tool contract (K22, K23), and rmcp's server role at
+# the version lmgw's client role uses (lmgw's Cargo.lock: 2.0.0; Kai's lock holds it there), over
+# Kai's own WebSocket transport to lmgw's `/mcp/host` (api §5.1). tokio-util for the calls'
+# cancellation tokens, which rmcp's request contexts carry.
+kai-desktop = { path = "crates/kai-desktop" }
+# K25's delegate loop (PD1, WP17): client-neutral, the model and the tools behind traits.
+kai-delegate = { path = "crates/kai-delegate" }
+rmcp = { version = "2.0.0", default-features = false, features = ["server"] }
+tokio-util = { version = "0.7", default-features = false }
+# WP15's seeing and reading: a capture goes to the model as a PNG at its real resolution, base64 in
+# MCP's image content; the recently used files are the freedesktop XBEL list; `find_files` runs
+# baloosearch6 (tokio's process, killed when its call ends).
+png = "0.18"
+base64 = "0.23"
+roxmltree = "0.21"
+# WP11: overlay_image decodes every picture and writes it out again as a fresh PNG before WebKit sees
+# it (`src/widgets/image.rs`); only the four formats an image URL is expected to serve.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+
+[features]
+# Live checks against a dev lmgw only (`src/live_test.rs`, `scripts/live-check-link.sh`): with
+# KAI_LIVE_LINK=1, the links the live script minted (KAI_LIVE_LINK_ACCEPT) are confirmed without the
+# owner's dialog. Never in a default or release build (a release build with it does not compile),
+# and built into target/live-test, never target/debug.
+live-test = ["kai-desktop/live-test"]
+
+[dev-dependencies]
+tempfile = "3"
+# The `log` bridge in the test that reads a trace-level log (review KAI-2 K2-1): tungstenite logs
+# through `log`.
+tracing-log = "0.2"
+tokio = { version = "1", features = ["test-util", "process", "io-util", "net"] }
+
+[profile.release]
+lto = "thin"

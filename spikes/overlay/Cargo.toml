@@ -1,0 +1,16 @@
+[package]
+name = "overlay"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+gtk = "0.18"
+gdk = "0.18"
+glib = "0.18"
+gtk-layer-shell = { version = "0.8", features = ["v0_6"] }
+webkit2gtk = { version = "2.0", features = ["v2_40"] }
+cairo-rs = "0.18"
+javascriptcore-rs = "1"
+
+[workspace]

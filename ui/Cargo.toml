@@ -1,0 +1,43 @@
+[package]
+name = "kai-ui"
+version = "0.1.0"
+edition = "2024"
+description = "Kai's configuration window: the Leptos (CSR/WASM) frontend, built by trunk and embedded in the kai binary (WP21b, K29)"
+license = "FSL-1.1-MIT"
+publish = false
+
+# Its own workspace: the frontend is wasm and stays out of the native one (Cargo.toml's `exclude`).
+# Native, `cargo test` here runs the model's tests; the page is built by `trunk build` (just ui).
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "kai-ui"
+path = "src/main.rs"
+
+[dependencies]
+# lmgw's shared UI kit (tokens, kit.css, generic widgets), by path from lmgw's checkout next to this
+# repository, which must sit at the commit LMGW_PIN names (`just check` warns otherwise); `just rpm`
+# stages the crate from the pinned commit. Same leptos minor as the kit.
+lmgw-ui-kit = { path = "../../lmgw/crates/lmgw-ui-kit" }
+leptos = { version = "0.8", features = ["csr"] }
+console_error_panic_hook = "0.1"
+gloo-net = { version = "0.6", default-features = false, features = ["http", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["HtmlInputElement", "HtmlSelectElement", "KeyboardEvent", "Event"] }
+
+# trunk builds the release profile (bundle size; wasm-opt does the rest).
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+
+# The debug `trunk build` (just check): no DWARF for the page (trunk strips it from dist/ anyway).
+[profile.dev]
+debug = false

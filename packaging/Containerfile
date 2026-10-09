@@ -1,0 +1,15 @@
+# The build image of `just rpm`: Fedora with kai.spec's build dependencies installed, so repeated
+# builds start at once. Built by packaging/build-rpm.sh when absent (FEDORA_RELEASE = the host's).
+# Besides the spec's build dependencies it holds what builds the configuration window's page (ui/):
+# the wasm32 standard library and trunk, wasm-bindgen and wasm-opt
+# (packaging/install-trunk.sh and install-wasm-tools.sh, pinned and hash-checked).
+ARG FEDORA_RELEASE=44
+FROM registry.fedoraproject.org/fedora:${FEDORA_RELEASE}
+RUN dnf -y install rpm-build rpmlint desktop-file-utils rust cargo gcc gcc-c++ make pkgconf-pkg-config \
+        clang clang-devel gtk3-devel webkit2gtk4.1-devel libsoup3-devel gtk-layer-shell-devel \
+        pipewire-devel wayland-devel git tar gzip \
+        rust-std-static-wasm32-unknown-unknown curl \
+    && dnf clean all
+COPY install-trunk.sh install-wasm-tools.sh /usr/local/share/kai/
+RUN /usr/local/share/kai/install-trunk.sh /usr/local/bin \
+    && /usr/local/share/kai/install-wasm-tools.sh /usr/local/bin

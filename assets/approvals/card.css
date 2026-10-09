@@ -1,0 +1,51 @@
+/* The approval card (docs/design/2026-10-06-kai-design.md §11.1, WP19): Breeze's graphite and blue,
+   as the ring and the overlays (never pastel). The arguments scroll when the output is shorter than
+   the card; they are never shortened. */
+html, body { margin: 0; width: 100vw; height: 100vh; overflow: hidden; background: transparent; }
+.card {
+  box-sizing: border-box;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  padding: 14px 18px 12px;
+  color: #eff0f1;
+  background: rgba(35, 38, 41, 0.96);
+  border: 1px solid rgba(61, 174, 233, 0.7);
+  border-radius: 8px;
+  font: 15px/1.45 "Noto Sans", sans-serif;
+}
+h1 { margin: 0 0 2px; font-size: 17px; font-weight: 600; overflow-wrap: anywhere; }
+p { margin: 2px 0; overflow-wrap: anywhere; }
+#asked, #count, #hint, #arming { color: #bdc3c7; font-size: 13px; }
+#typed { color: #f67400; font-size: 13px; }
+#more { margin: -6px 0 6px; color: #3daee9; font-size: 13px; }
+#args {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  margin: 10px 0;
+  padding: 8px 10px;
+  background: rgba(20, 22, 24, 0.9);
+  border-radius: 4px;
+  font: 13px/1.4 "Hack", "Noto Sans Mono", monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+#args:empty::before { content: "No arguments."; color: #bdc3c7; }
+#args div + div { margin-top: 2px; }
+#note { color: #f67400; }
+#busy { color: #3daee9; }
+.buttons { display: flex; justify-content: flex-end; gap: 8px; margin: 8px 0 6px; }
+button {
+  font: inherit;
+  min-width: 96px;
+  padding: 5px 14px;
+  color: #eff0f1;
+  background: #31363b;
+  border: 1px solid #4d5357;
+  border-radius: 4px;
+}
+button:hover { border-color: #3daee9; }
+#approve { background: #2b5d7c; border-color: #3daee9; }
+button:disabled { opacity: 0.5; }
+.unarmed button { opacity: 0.6; }

@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 22 22">
+  <!-- Kai tray overlay (K9): the GPU hold, an amber badge drawn over whichever icon shows.
+       The tray host scales an overlay down into a corner, so the badge fills the canvas. -->
+  <circle cx="11" cy="11" r="9.5" fill="#E8A33D" stroke="#23272C" stroke-width="2.5"/>
+</svg>

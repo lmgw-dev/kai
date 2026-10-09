@@ -1,0 +1,6 @@
+target/
+
+# spike raw data stays out of the repository
+spikes/*/results/
+spikes/*/shots/
+ui/dist/

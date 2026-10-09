@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Name=Kai
+GenericName=Voice client for lmgw
+Comment=Voice at any time, tray state and overlays for lmgw
+Exec=@EXEC@ %u
+Icon=dev.rootshell.kai
+Terminal=false
+Categories=Utility;
+StartupNotify=false
+MimeType=x-scheme-handler/lmgw-pair;
+# Ruling 16, §13: the restricted interfaces Kai's tools use (WP14 window facts, WP15 captures,
+# WP16c typing and key presses).
+X-KDE-Wayland-Interfaces=org_kde_plasma_window_management,org_kde_kwin_fake_input
+X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2

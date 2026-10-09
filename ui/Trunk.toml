@@ -1,0 +1,6 @@
+# Built into dist/, which the kai binary embeds (release) or reads from disk (debug:
+# src/settings/window/assets.rs). Asset URLs are root-relative: the page is kai://settings/.
+[build]
+target = "index.html"
+dist = "dist"
+public_url = "/"

@@ -1,0 +1,88 @@
+# CI for Kai: build the RPM on every push to `main` and publish it, with the manifest Kai's updater
+# polls, to a GitLab generic package registry, this project's (lmgw's conventions: Fedora image, the
+# `docker` runner tag on every job, <Cargo.toml version>+<pipeline IID> as the version so a CI
+# build sorts after the release it follows). Kai's own updater reads its own registry feed
+# (2026-10-08, design §13).
+#
+# packaging/ci-build.sh builds the RPM (packaging/build-rpm.sh in place) with the updater's feed
+# compiled in, this registry's `latest/latest.json` (derived from the CI variables, no host in the
+# tree), and writes target/rpm/dist/ (the RPM, latest.json); packaging/ci-publish.sh uploads the RPM
+# under its version and latest.json under `latest/`, one pipeline at a time (resource_group).
+#
+# REQUIRED CI/CD variable (Settings → CI/CD → Variables):
+#   KAI_UPDATE_DEPLOY_TOKEN — masked; the token of a deploy token of THIS project (Settings →
+#     Repository → Deploy tokens) with ONLY the `read_package_registry` scope. It is compiled into
+#     the build with the feed, so an installed Kai can read the registry; it ends up in the
+#     RPM, hence read-only. A *protected* variable reaches only protected branches (`main` must be
+#     one). Missing, the build still succeeds with a warning, and its updater cannot reach the feed.
+#
+# lmgw-client and lmgw-update are path dependencies (Cargo.toml): ../lmgw/crates/<crate>; the
+# configuration window's page (ui/) takes lmgw-ui-kit the same way. The job builds the page with trunk
+# (packaging/install-trunk.sh, the wasm32 standard library) before the release build embeds it.
+# before_script clones lmgw's project (LMGW_PROJECT is the lmgw project's path on the CI's own
+# GitLab instance) next to this repository (LMGW_DIR) with the job's token and checks out the
+# commit LMGW_PIN names; packaging/build-rpm.sh stages the crates from its tree (LMGW_PIN's
+# lmgw_tree, which must be that commit's). The token reaches lmgw's project only if lmgw's CI/CD
+# settings allow this project (Job token permissions).
+default:
+  tags: [docker]
+
+stages:
+  - build
+  - publish
+
+workflow:
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+variables:
+  CARGO_HOME: "$CI_PROJECT_DIR/target/rpm/cargo-home"
+  CARGO_TARGET_DIR: "$CI_PROJECT_DIR/target/rpm/cargo-target"
+  # The lmgw checkout holding crates/lmgw-client, crates/lmgw-api-types and crates/lmgw-update,
+  # cloned at LMGW_PIN.
+  LMGW_DIR: "$CI_PROJECT_DIR/../lmgw"
+  LMGW_PROJECT: "lmgw-dev/lmgw"
+
+rpm:
+  stage: build
+  image: fedora:latest
+  interruptible: true
+  cache:
+    key: cargo-kai
+    paths:
+      - target/rpm/cargo-home/registry/
+      - target/rpm/cargo-target/
+      # The configuration window's page (ui/): its build directory and trunk's tool cache (it
+      # cache; wasm-bindgen and wasm-opt are pinned, from packaging/install-wasm-tools.sh).
+      - target/rpm/ui-target/
+      - target/rpm/cache/
+  before_script:
+    - dnf -y install rpm-build rpmlint desktop-file-utils rust cargo gcc gcc-c++ make pkgconf-pkg-config
+        clang clang-devel gtk3-devel webkit2gtk4.1-devel libsoup3-devel gtk-layer-shell-devel
+        pipewire-devel wayland-devel git tar gzip rust-std-static-wasm32-unknown-unknown curl
+    - bash packaging/install-trunk.sh /usr/local/bin
+    - bash packaging/install-wasm-tools.sh /usr/local/bin
+    - rm -rf "$LMGW_DIR"
+    - git clone --quiet --filter=blob:none --no-checkout
+        "${CI_SERVER_PROTOCOL}://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}:${CI_SERVER_PORT}/${LMGW_PROJECT}.git" "$LMGW_DIR"
+    - git -C "$LMGW_DIR" checkout --quiet --detach "$(bash scripts/lmgw-pin.sh commit)"
+    - bash scripts/lmgw-pin.sh check "$LMGW_DIR"
+  script:
+    - bash packaging/ci-build.sh
+    - rpmlint target/rpm/dist/kai-*.rpm || true
+  artifacts:
+    paths:
+      - target/rpm/dist/
+    expire_in: 1 week
+
+publish:
+  stage: publish
+  image: fedora:latest
+  needs: ["rpm"]
+  # One publish at a time, so the mutable `latest/latest.json` upload cannot race another
+  # pipeline's.
+  resource_group: registry-latest
+  before_script:
+    - dnf -y install curl >/dev/null
+  script:
+    - bash packaging/ci-publish.sh

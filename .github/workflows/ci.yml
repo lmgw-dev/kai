@@ -1,0 +1,161 @@
+# Format, lint and test gate for pull requests and pushes to main, on GitHub's own runners: the
+# same checks as `just check`, minus what needs a desktop session or lmgw's development history.
+# Runs in fedora:latest, the image the release build uses, because the build dependencies (GTK 3,
+# WebKitGTK 4.1, gtk-layer-shell, PipeWire, Wayland) are installed as Fedora packages.
+#
+# lmgw's crates are path dependencies (../lmgw/crates/<crate>): every job clones the public lmgw at
+# the release LMGW_PIN names (lmgw_tag) next to this checkout and fails unless its tree is the
+# pinned tree (scripts/lmgw-pin.sh verify-tree).
+#
+# Not run here, from `just check`: scripts/viz-check.sh. It reads the vendoring commit and main of
+# lmgw's development history, which the public repository does not carry, so on this clone it would
+# only skip itself (it says so in one line and exits 0, as it does in a contributor's `just check`
+# next to a public clone). Never run here: the live and owner checks (`just live-check-*`,
+# `just owner-check-*`), which need KWin (nested), PipeWire, a D-Bus session or a dev lmgw.
+#
+# Runner minutes are budgeted (2000 a month on GitHub's free plan), so changes that touch only
+# documentation run nothing, and a run can also be started by hand from the Actions tab.
+name: CI
+
+on:
+  pull_request:
+    paths-ignore: ["**.md", "docs/**", ".gitlab-ci.yml"]
+  push:
+    branches: [main]
+    paths-ignore: ["**.md", "docs/**", ".gitlab-ci.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push to the same branch / PR supersedes the running check.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+  # A fresh checkout every run: incremental state is never reused, only cached and restored at a
+  # cost.
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  fmt:
+    name: cargo fmt
+    runs-on: ubuntu-latest
+    container:
+      image: fedora:latest
+    timeout-minutes: 10
+    steps:
+      # git so actions/checkout makes a real clone instead of a REST tarball.
+      - name: Install rustfmt
+        run: dnf -y install git-core cargo rustfmt
+      - uses: actions/checkout@v7
+
+      # cargo-fmt reads the manifests, lmgw's path dependencies' too; nothing is downloaded or
+      # compiled.
+      - name: lmgw at the pinned release, next to the checkout
+        run: |
+          git clone --quiet --depth 1 --branch "$(bash scripts/lmgw-pin.sh tag)" \
+            https://github.com/lmgw-dev/lmgw.git ../lmgw
+          bash scripts/lmgw-pin.sh verify-tree ../lmgw
+
+      - name: cargo fmt --check --all
+        run: cargo fmt --check --all
+      - name: cargo fmt --check (ui)
+        run: cd ui && cargo fmt --check
+
+  test:
+    name: clippy and tests
+    runs-on: ubuntu-latest
+    container:
+      image: fedora:latest
+    # This bounds what a hung test can cost.
+    timeout-minutes: 60
+    env:
+      # No debug info: a panic still names its file and line, and target/ stays small enough to
+      # cache.
+      CARGO_PROFILE_DEV_DEBUG: none
+    steps:
+      # git for a real clone; tar + zstd for the cache inside the container.
+      - name: Install checkout and cache tools
+        run: dnf -y install git-core tar zstd
+      - uses: actions/checkout@v7
+
+      # Set via GITHUB_ENV: in a container job the `github.workspace` expression is the HOST path,
+      # $GITHUB_WORKSPACE the container's.
+      - name: Keep the cargo home and Trunk's tool cache in the workspace
+        run: |
+          echo "CARGO_HOME=$GITHUB_WORKSPACE/.cargo" >> "$GITHUB_ENV"
+          echo "XDG_CACHE_HOME=$GITHUB_WORKSPACE/.cache" >> "$GITHUB_ENV"
+          echo "$GITHUB_WORKSPACE/.cargo/bin" >> "$GITHUB_PATH"
+
+      # The spec's build dependencies (as .gitlab-ci.yml installs them), clippy, the wasm32
+      # standard library for the configuration window's page, desktop-file-utils for
+      # scripts/dev-grant-check.sh, python3 for scripts/publish_github_test.py, and Xvfb and
+      # dbus-run-session for the tests (below). Trunk, wasm-bindgen and wasm-opt are the pinned,
+      # hash-checked prebuilt ones.
+      - name: Install build dependencies
+        run: |
+          dnf -y install rust cargo clippy rustfmt gcc gcc-c++ make pkgconf-pkg-config \
+            clang clang-devel gtk3-devel webkit2gtk4.1-devel libsoup3-devel gtk-layer-shell-devel \
+            pipewire-devel wayland-devel rust-std-static-wasm32-unknown-unknown \
+            desktop-file-utils python3 curl xorg-x11-server-Xvfb xorg-x11-xauth dbus-daemon
+          mkdir -p "$CARGO_HOME/bin"
+          bash packaging/install-trunk.sh "$CARGO_HOME/bin"
+          bash packaging/install-wasm-tools.sh "$CARGO_HOME/bin"
+
+      - name: lmgw at the pinned release, next to the checkout
+        run: |
+          git clone --quiet --depth 1 --branch "$(bash scripts/lmgw-pin.sh tag)" \
+            https://github.com/lmgw-dev/lmgw.git ../lmgw
+          bash scripts/lmgw-pin.sh verify-tree ../lmgw
+
+      # The cargo registry and the compiled dependencies of both workspaces (the native one and
+      # ui/), keyed on the compiler and the lock files. After the toolchain install: the key reads
+      # `rustc -vV`. Saved even when a test fails (the compile is the expensive part), but only from
+      # main: PR runs restore main's cache instead of adding their own.
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            ui -> target
+          cache-directories: .cache/trunk
+          cache-bin: "false"
+          cache-on-failure: "true"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: cargo clippy
+        run: |
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo clippy --workspace --all-targets --locked --features live-test -- -D warnings
+
+      # The GTK tests need a display (GTK aborts without one) and some a session bus: Xvfb and a
+      # private bus of their own. Skipped: the one test that starts a routine in a real scope of the
+      # user's service manager (systemd --user, which a container has not), as the live checks do
+      # on the desktop.
+      - name: cargo test
+        run: |
+          dbus-run-session -- xvfb-run -a cargo test --workspace --locked -- \
+            --skip routines::tests::switches::an_edit_after_switching_on_takes_effect
+          cargo test --workspace --doc --locked
+
+      - name: Script checks
+        run: |
+          bash scripts/dev-grant-check.sh
+          python3 scripts/publish_github_test.py
+
+      # The configuration window's page: its own gates (just ui-check), then its build (just ui),
+      # offline with the pinned wasm-bindgen and wasm-opt.
+      - name: ui (clippy, tests, trunk build)
+        run: |
+          cd ui
+          cargo clippy --all-targets --locked -- -D warnings
+          cargo clippy --target wasm32-unknown-unknown --locked -- -D warnings
+          cargo test --locked
+          trunk build --offline --locked

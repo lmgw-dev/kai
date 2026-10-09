@@ -1,0 +1,18 @@
+/* The overlays' host page (docs/design/2026-10-06-kai-design.md §10.1): a transparent surface
+   holding either Kai's text card or the caller's sandboxed frame. Breeze's graphite and blue, as
+   the ring (never pastel). */
+html, body { margin: 0; width: 100vw; height: 100vh; overflow: hidden; background: transparent; }
+.text {
+  box-sizing: border-box;
+  padding: 12px 16px;
+  color: #eff0f1;
+  background: rgba(35, 38, 41, 0.94);
+  border: 1px solid rgba(61, 174, 233, 0.55);
+  border-radius: 8px;
+  font: 15px/1.45 "Noto Sans", sans-serif;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+/* Taller than the output allows: the card fills the surface and scrolls (the tool says so). */
+html.fit .text { height: 100vh; overflow-y: auto; }
+iframe { display: block; border: 0; width: 100vw; height: 100vh; background: transparent; }

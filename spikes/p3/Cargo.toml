@@ -1,0 +1,18 @@
+[package]
+name = "p3"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+gtk = "0.18"
+gdk = "0.18"
+glib = "0.18"
+gtk-layer-shell = { version = "0.8", features = ["v0_6"] }
+wayland-client = "0.31"
+wayland-backend = "0.3"
+wayland-scanner = "0.31"
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+tokio = { version = "1", features = ["rt", "macros", "time"] }
+
+[workspace]

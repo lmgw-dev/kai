@@ -1,0 +1,12 @@
+<!doctype html>
+<meta charset="utf-8">
+<!--CSP-->
+<div id="stage" style="width:100px;height:100px"><canvas></canvas></div>
+<script type="module" src="./esm-boot.js"></script>
+<script>
+  /* classic inline script: counts as inline for CSP; reports a failed module load */
+  window.__inline_ran = true;
+  const post = (o) => { try { webkit.messageHandlers.kai.postMessage(JSON.stringify(o)); } catch (e) {} };
+  document.querySelector("script[type=module]").addEventListener("error", () => post({ ev: "module-error" }));
+  post({ ev: "inline-ran", origin: location.origin });
+</script>

@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 22 22">
+  <!-- Kai tray, thinking (K9): the turn waits for its reply. Blue ring with three dots. -->
+  <circle cx="11" cy="11" r="10.5" fill="#23272C"/>
+  <circle cx="11" cy="11" r="7.25" fill="none" stroke="#3DAEE9" stroke-width="2"/>
+  <circle cx="7.6" cy="11" r="1.5" fill="#3DAEE9"/>
+  <circle cx="11" cy="11" r="1.5" fill="#3DAEE9"/>
+  <circle cx="14.4" cy="11" r="1.5" fill="#3DAEE9"/>
+</svg>

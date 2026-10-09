@@ -1,0 +1,16 @@
+[package]
+name = "kai-desktop"
+version = "0.1.0"
+edition = "2024"
+description = "Kai's tool contract (K22, K23): every hosted tool's name, description, plain parameters and MCP annotations, with no desktop, I/O or runtime dependency"
+license = "FSL-1.1-MIT"
+publish = false
+
+[dependencies]
+# The input schemas are rendered as JSON (`ToolSpec::input_schema`); nothing else.
+serde_json = "1"
+
+[features]
+# The live checks' own tool (`contract::live`), never in a default or release build of Kai (Kai's
+# `live-test` feature turns it on).
+live-test = []

@@ -1,0 +1,165 @@
+/* Kai's configuration window. The tokens, density and the shared widgets' rules (section, form
+   fields) are the kit's kit.css, linked before this file (index.html); this file is the window's
+   own: the rail, the page frame, controls and tables. Breeze-like graphite and blue, no pastel;
+   the desktop's own fonts (a fontconfig generic family is the desktop's choice). */
+
+:root { --sans: system-ui, sans-serif; --mono: monospace; }
+html, body { margin: 0; height: 100%; }
+[hidden] { display: none !important; }
+body { font-family: var(--sans); background: var(--bg1); color: var(--text);
+       font-size: 14px; -webkit-font-smoothing: antialiased; overflow: hidden; }
+
+/* Controls and the labels that name things are not text to select, as in any desktop app (lmgw's
+   rule, app.css; the classes it names are the kit's). What the window shows (values, errors, every
+   field) stays selectable, for copying. */
+.rail, .page-head h1, .rail-head, .rail-item,
+button, .btn, select, label, summary, [role="button"],
+.chip, table.data th, .sec-head, .sec-toggle, .select-btn, .select-opt {
+  -webkit-user-select: none; user-select: none; }
+input, textarea { -webkit-user-select: text; user-select: text; }
+
+.app { display: grid; grid-template-columns: 176px minmax(0, 1fr); height: 100vh; }
+
+/* ---------- rail ---------- */
+.rail { background: var(--bg0); border-right: 1px solid var(--border); padding: 12px 8px;
+        display: flex; flex-direction: column; gap: 2px; }
+.rail-head { font-weight: 600; font-size: 15px; padding: 4px 10px 12px; color: var(--text); }
+.rail-item { text-align: left; border: 0; background: none; color: var(--text-2);
+             font: inherit; padding: 0 10px; height: var(--row-h, 32px); border-radius: 6px;
+             cursor: pointer; }
+.rail-item:hover { background: var(--surface-hi); color: var(--text); }
+.rail-item.active { background: var(--accent-bg); color: var(--accent); }
+.rail-item:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+/* ---------- page frame: only the body scrolls ---------- */
+.content { display: flex; flex-direction: column; min-height: 0; min-width: 0; overflow: hidden; }
+.page-body { flex: 1; min-height: 0; overflow: auto; padding: 14px 24px 24px;
+             scrollbar-gutter: stable; }
+.page-head { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px;
+             margin-bottom: 12px; }
+.page-head h1 { font-size: 20px; font-weight: 600; letter-spacing: -.01em; margin: 0; }
+.page-head .sub { color: var(--text-2); font-size: 13px; min-width: 0; }
+.page-head .actions { margin-left: auto; display: flex; gap: 8px; }
+.page-foot { flex: none; border-top: 1px solid var(--border); background: var(--bg0);
+             padding: 8px 24px; color: var(--amber); font-size: var(--fs-sm); }
+.banner { padding: 10px 24px; font-size: var(--fs-sm); }
+.banner.err { background: var(--err-bg); color: var(--err); border-bottom: 1px solid var(--err); }
+.empty { color: var(--text-3); }
+
+/* ---------- controls ---------- */
+.input, select.select { height: var(--ctl-h); box-sizing: border-box; padding: 0 var(--pad);
+  border: 1px solid var(--border-strong); border-radius: 6px; background: var(--surface);
+  color: var(--text); font: inherit; font-size: var(--fs); min-width: 0; }
+/* A native <select>; the kit's own picker (div.select around a .select-btn) is kit.css's. */
+select.select { padding-right: 4px; max-width: 100%; }
+.input:focus, select.select:focus { outline: none; border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent); }
+.input.search { width: 220px; }
+.btn { height: var(--ctl-h); padding: 0 calc(var(--pad) + 2px); border-radius: 999px;
+  border: 1px solid var(--border-strong); background: var(--surface); color: var(--text);
+  font: inherit; font-size: var(--fs); cursor: pointer; }
+.btn.sm { height: 24px; padding: 0 9px; font-size: var(--fs-sm); }
+.btn.ghost { border-color: transparent; background: none; color: var(--text-2); }
+.btn:hover { background: var(--surface-hi); color: var(--text); }
+.btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+input[type="checkbox"] { accent-color: var(--accent); margin: 0; }
+.check-line { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px;
+  margin: 0 0 16px; font-size: var(--fs); }
+.check-line .hint { color: var(--text-3); font-size: var(--fs-sm); }
+.chip { display: inline-block; height: 18px; line-height: 18px; padding: 0 8px; border-radius: 999px;
+  font-size: 11px; color: var(--text-3); border: 1px solid var(--border); }
+.chip.set { color: var(--accent); border-color: var(--accent); background: var(--accent-bg); }
+.note { font-size: var(--fs-sm); }
+.note.ok { color: var(--ok); }
+.note.err { color: var(--err); overflow-wrap: anywhere; }
+.count { display: inline-block; min-width: 18px; padding: 0 6px; border-radius: 999px;
+  background: var(--surface-hi); color: var(--text-2); font-size: 11px; text-align: center; }
+
+/* ---------- tables ---------- */
+table.data { width: 100%; border-collapse: collapse; }
+table.data th { text-align: left; font-weight: 500; color: var(--text-3); font-size: 11px;
+  letter-spacing: .06em; text-transform: uppercase; padding: 4px 10px 6px 0;
+  border-bottom: 1px solid var(--border); }
+table.data td { padding: 6px 10px 6px 0; border-bottom: 1px solid var(--border);
+  vertical-align: middle; }
+table.data tr:last-child td { border-bottom: 0; }
+table.data tr.muted .tool { opacity: .55; }
+table.tools { table-layout: fixed; }
+table.tools th:nth-child(2) { width: 292px; }
+table.tools th:nth-child(3) { width: 84px; }
+table.providers { table-layout: fixed; }
+table.providers th:nth-child(2) { width: 200px; }
+table.providers th:nth-child(3) { width: 40%; }
+.pol { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 4px 8px; align-items: center; }
+.pol .cap { color: var(--text-3); font-size: var(--fs-sm); white-space: nowrap; }
+.pol select.select { width: 100%; }
+.tool-name { font-family: var(--mono); font-size: var(--fs); }
+.tool-desc { color: var(--text-2); font-size: var(--fs-sm); margin-top: 1px; }
+td.status { overflow-wrap: anywhere; }
+table.providers .tool-name { font-family: var(--sans); }
+
+/* ---------- settings: one field per key ---------- */
+.settings :is(.sec-body, .subsec) > .field { display: grid; grid-template-columns: minmax(190px, 32%) minmax(0, 1fr);
+  column-gap: 12px; align-items: center; padding: 3px 0; }
+.settings .field > label { font-family: var(--mono); font-size: var(--fs-sm); color: var(--text-2);
+  overflow-wrap: anywhere; }
+.settings .field .field-err { grid-column: 2; margin-top: 2px; overflow-wrap: anywhere; }
+/* A table under the section (`[overlay.weather]`): its name over its keys. */
+.settings .subsec { margin-top: 10px; }
+.settings .subsec-head { font-family: var(--mono); font-size: var(--fs-sm); font-weight: 600;
+  color: var(--text); padding: 2px 0 4px; border-bottom: 1px solid var(--border); margin-bottom: 2px; }
+.ctl select.select { flex: 0 1 220px; }
+.ctl { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.ctl .input { flex: 0 1 360px; min-width: 100px; }
+.readonly { font-family: var(--mono); font-size: var(--fs-sm); color: var(--text-2);
+  overflow-wrap: anywhere; }
+
+/* ---------- Personality: the kit's profile editor (ProfilesPanel; its own layout is the kit's
+   profiles.css). The controls it uses that the kit leaves to its host, as lmgw-ui's app.css draws
+   them, in the same tokens. ---------- */
+.btn:disabled { opacity: .5; cursor: default; }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+.btn.primary:hover:not(:disabled) { background: var(--accent-hi); border-color: var(--accent-hi); }
+.btn.primary:disabled { background: var(--surface); border-color: var(--border-strong);
+  color: var(--text); }
+.btn.danger { color: var(--err); border-color: var(--err); background: none; }
+.btn.danger:hover:not(:disabled) { background: var(--err-bg); }
+.btn.ghost:hover:not(:disabled) { background: var(--surface-hi); color: var(--text); }
+.spacer { flex: 1 1 auto; }
+.chip.info { color: var(--accent); border-color: transparent; background: var(--accent-bg); }
+.chip.off { color: var(--text-3); border-color: transparent; background: var(--surface-hi); }
+.input.ta { height: auto; min-height: 72px; width: 100%; padding: 8px 10px; resize: vertical;
+  font-size: var(--fs-sm); line-height: 1.45; }
+.seg { display: inline-flex; border: 1px solid var(--border-strong); border-radius: 999px;
+  overflow: hidden; }
+.seg-btn { border: 0; background: none; color: var(--text-2); cursor: pointer;
+  font: 500 var(--fs-sm) var(--sans); padding: 4px 12px; }
+.seg-btn.active { background: var(--accent); color: var(--accent-ink); }
+.facet { height: 24px; padding: 0 9px; border-radius: 999px; border: 1px solid var(--border-strong);
+  background: none; color: var(--text-2); font: 500 var(--fs-sm) var(--sans); cursor: pointer;
+  display: inline-flex; align-items: center; white-space: nowrap; }
+.facet:hover { color: var(--text); background: var(--surface-hi); }
+.facet.on { border-color: var(--accent); background: var(--accent-bg); color: var(--accent); }
+.field-grid { display: grid; gap: 10px 14px; align-items: end;
+  grid-template-columns: repeat(auto-fill, minmax(min(var(--field-min, 220px), 100%), 1fr)); }
+.field-grid > .field { margin-top: 0; min-width: 0; }
+.field-hint { font-size: 11.5px; color: var(--text-3); margin-top: 4px; line-height: 1.4; }
+.field-warn { font-size: 11.5px; color: var(--amber); margin-top: 4px; }
+
+/* The page's header: what Kai's conversation talks with, above the editor. */
+.conv { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; margin: 0 0 14px;
+  padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg0); }
+.conv .now { font-size: var(--fs); }
+.conv .now b { color: var(--accent); font-weight: 600; }
+.conv .facts { color: var(--text-2); font-size: var(--fs-sm); }
+.conv .how { flex-basis: 100%; color: var(--text-3); font-size: var(--fs-sm); }
+.unpaired { padding: 12px; border: 1px solid var(--border); border-radius: 8px;
+  color: var(--text-2); }
+.pf-panel .field label { display: block; font-size: var(--fs-sm); font-weight: 500;
+  color: var(--text-2); margin-bottom: 4px; }
+.pf-panel .field + .field { margin-top: 8px; }
+
+/* The Desktop page's remote-control permission (WP16c). */
+.remote-control { display: flex; flex-direction: column; gap: 6px; }
+.remote-control p { margin: 0; }
+.remote-control .hint { color: var(--text-3); font-size: var(--fs-sm); }

@@ -1,0 +1,1 @@
+export CARGO_BUILD_JOBS=8

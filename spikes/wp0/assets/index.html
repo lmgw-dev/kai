@@ -1,0 +1,76 @@
+<!doctype html>
+<meta charset="utf-8">
+<style>
+  html, body { margin: 0; background: transparent; overflow: hidden; width: 100vw; height: 100vh; font: 13px sans-serif; color: #dce3ea; }
+  #stage { position: relative; width: 100vw; height: 100vh; }
+  .ringbox { position: absolute; }
+  canvas { display: block; width: 100%; height: 100%; }
+  #btn { position: absolute; left: 10px; bottom: 10px; width: 120px; height: 40px; border: 0; border-radius: 8px;
+         background: #3daee9; color: #06121a; font-weight: 600; font-size: 14px; }
+  #btn.on { background: #e8a33d; }
+  .sw { position: absolute; width: 40px; height: 40px; }
+</style>
+<div id="stage"></div>
+<script type="module">
+import { mount } from "./viz/ring.js";
+import { FakeAnalyser } from "./adapter.js";
+const q = new URLSearchParams(location.search);
+const mode = q.get("mode") || "ring";
+const transport = q.get("transport") || "eval";
+const post = (o) => { try { webkit.messageHandlers.kai.postMessage(JSON.stringify(o)); } catch (e) {} };
+const stage = document.getElementById("stage");
+const W = innerWidth, H = innerHeight;
+const out = new FakeAnalyser(), inp = new FakeAnalyser();
+// spike glue (alpha): ring.js verbatim, one origin-anchored fillRect becomes clearRect
+function transparentCanvas(c) {
+  const real = HTMLCanvasElement.prototype.getContext;
+  c.getContext = (type, opts) => {
+    const x = real.call(c, type, { ...opts, alpha: true });
+    const fr = x.fillRect.bind(x);
+    x.fillRect = (a, b, w, h) => (a === 0 && b === 0 ? x.clearRect(a, b, w, h) : fr(a, b, w, h));
+    return x;
+  };
+}
+const box = document.createElement("div");
+box.className = "ringbox";
+Object.assign(box.style, { left: "0px", top: "0px", width: W + "px", height: H + "px" });
+const c = document.createElement("canvas");
+transparentCanvas(c);
+box.appendChild(c); stage.appendChild(box);
+const handle = mount(c, { output: out, input: inp, palette: {}, reducedMotion: false });
+handle.resize(W, H, window.devicePixelRatio || 1);
+window.addEventListener("resize", () => { handle.resize(innerWidth, innerHeight, window.devicePixelRatio || 1); post({ ev: "resize", w: innerWidth, h: innerHeight }); });
+
+if (mode === "swatch") {
+  // opaque swatches of known sRGB colours (corners and edges) around the transparent ring
+  const cols = ["#ff0000", "#00ff00", "#0000ff", "#ffffff", "#3daee9", "#808080", "#000000", "#e8a33d"];
+  const pos = [[0, 0], [W - 40, 0], [0, H - 40], [W - 40, H - 40], [140, 0], [140, H - 40], [0, 140], [W - 40, 140]];
+  cols.forEach((col, i) => { const d = document.createElement("div"); d.className = "sw";
+    Object.assign(d.style, { left: pos[i][0] + "px", top: pos[i][1] + "px", background: col }); stage.appendChild(d); });
+}
+if (mode === "click") {
+  const b = document.createElement("button"); b.id = "btn"; b.textContent = "click me: 0"; stage.appendChild(b);
+  let n = 0;
+  b.addEventListener("click", (e) => { n++; b.textContent = "clicked: " + n; b.classList.toggle("on"); post({ ev: "click", n, x: e.clientX, y: e.clientY }); });
+  let moves = 0;
+  addEventListener("pointermove", (e) => { if (++moves % 5 === 1) post({ ev: "pointermove", moves, x: e.clientX, y: e.clientY }); });
+  addEventListener("pointerdown", (e) => post({ ev: "pointerdown", x: e.clientX, y: e.clientY }));
+  addEventListener("pointerenter", () => post({ ev: "pointerenter" }));
+}
+const hs = (s) => handle.setState(s, { muted: false, since: performance.now(), loading: null, held: false });
+const feedArr = (a) => { out.set(a[0], a.slice(2, 50)); inp.set(a[1], a.slice(50, 98)); };
+window.__kai = {
+  setState: hs,
+  feed: (ol, il, ob, ib) => { out.set(ol, ob); inp.set(il, ib); },
+  feedB64: (s) => { const bin = atob(s); const u = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
+    feedArr(new Float32Array(u.buffer)); },
+  feedArgs: (o) => feedArr(o.a),
+  stats: () => JSON.stringify(handle.stats()),
+};
+if (transport === "fetch") {
+  setInterval(async () => { try { const r = await fetch("kai://app/feed"); feedArr(new Float32Array(await r.arrayBuffer())); } catch (e) { post({ ev: "fetch-error", e: String(e) }); } }, 1000 / 30);
+}
+post({ ev: "ready", w: W, h: H, dpr: devicePixelRatio, t: performance.now() });
+// first ring frame: the engine's own frame counter, polled each rAF
+(function wait() { if (handle.stats().frames >= 1) { requestAnimationFrame(() => post({ ev: "frame1", t: performance.now() })); } else requestAnimationFrame(wait); })();
+</script>

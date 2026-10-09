@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 22 22">
+  <!-- Kai tray, muted (K9, §5.4): Kai hears silence. Grey ring, struck through in Breeze red. -->
+  <circle cx="11" cy="11" r="10.5" fill="#23272C"/>
+  <circle cx="11" cy="11" r="6.5" fill="none" stroke="#8A9199" stroke-width="2.5"/>
+  <line x1="5.5" y1="16.5" x2="16.5" y2="5.5" stroke="#DA4453" stroke-width="2.5" stroke-linecap="round"/>
+</svg>
