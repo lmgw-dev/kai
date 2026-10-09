@@ -1,8 +1,9 @@
 <p align="center">
-  <img src="assets/icons/hicolor/scalable/apps/dev.rootshell.kai.svg" width="96" alt="Kai's icon">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/logo-dark.svg">
+    <img src="docs/images/logo-light.svg" width="381" alt="Kai, voice assistant">
+  </picture>
 </p>
-
-<h1 align="center">Kai</h1>
 
 <p align="center">
   A voice assistant for the KDE Plasma desktop, running on your own models through lmgw.

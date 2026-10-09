@@ -115,19 +115,25 @@ mod tests {
     #[test]
     fn the_colours_are_k9s() {
         let at44 = |name| pixmaps(name).into_iter().find(|i| i.width == 44).unwrap();
-        // idle: the blue dot in the centre (#3DAEE9)
-        assert_eq!(argb_at(&at44(ICON_IDLE), 22, 22), [255, 0x3d, 0xae, 0xe9]);
-        // offline: graphite in the centre (#23272C), the grey ring at radius 6.5 of 22 (#8A9199)
+        // idle: the voice ring on the graphite disc; the middle (blue, #3DAEE9) bar in the centre,
+        // the violet (#A56EF6) and teal (#2DC9A6) bars either side, the white ring (#F4F6F8) at radius 8
+        let idle = at44(ICON_IDLE);
+        assert_eq!(argb_at(&idle, 22, 22), [255, 0x3d, 0xae, 0xe9]);
+        assert_eq!(argb_at(&idle, 13, 22), [255, 0xa5, 0x6e, 0xf6]);
+        assert_eq!(argb_at(&idle, 30, 22), [255, 0x2d, 0xc9, 0xa6]);
+        assert_eq!(argb_at(&idle, 22 + 16, 22), [255, 0xf4, 0xf6, 0xf8]);
+        // offline: ring and bars all grey (#8A9199), graphite (#23272C) between bar and ring
         let offline = at44(ICON_OFFLINE);
-        assert_eq!(argb_at(&offline, 22, 22), [255, 0x23, 0x27, 0x2c]);
-        assert_eq!(argb_at(&offline, 22 + 13, 22), [255, 0x8a, 0x91, 0x99]);
+        assert_eq!(argb_at(&offline, 22, 22), [255, 0x8a, 0x91, 0x99]);
+        assert_eq!(argb_at(&offline, 22 + 16, 22), [255, 0x8a, 0x91, 0x99]);
+        assert_eq!(argb_at(&offline, 34, 22), [255, 0x23, 0x27, 0x2c]);
         // held: amber (#E8A33D)
         assert_eq!(argb_at(&at44(BADGE_HELD), 22, 22), [255, 0xe8, 0xa3, 0x3d]);
         // listening: a solid blue disc, blue well off the centre too
         let listening = at44(ICON_LISTENING);
         assert_eq!(argb_at(&listening, 22, 22), [255, 0x3d, 0xae, 0xe9]);
         assert_eq!(argb_at(&listening, 22 + 12, 22), [255, 0x3d, 0xae, 0xe9]);
-        // thinking: the middle of three dots; speaking: the middle bar; both blue
+        // thinking: the middle of three dots; speaking: the middle bar of the blue ring; both blue
         assert_eq!(
             argb_at(&at44(ICON_THINKING), 22, 22),
             [255, 0x3d, 0xae, 0xe9]

@@ -402,7 +402,12 @@ pixmaps rendered from the same SVGs. In the live check, plasmashell resolved nei
 installed into a hicolor directory created after it started nor names under `IconThemePath`, and
 showed its unknown icon. Plasma's tray falls back to `IconPixmap` when a name does not resolve. The
 status icons are named `kai-tray-*`, not `dev.rootshell.kai-*`, so that a missing one cannot fall
-back to the app icon by the naming spec's dash rule.
+back to the app icon by the naming spec's dash rule. *Changed, 2026-10-10 (the owner's
+decision):* the icons join lmgw's family. The app icon is the voice ring: lmgw's graphite tile, a
+white ring (lmgw's gate white) and lmgw's three lanes as level bars, violet, blue (local, the middle
+and tallest) and teal. The tray states recolour it on the graphite disc: idle the ring with the lane
+bars, thinking the lane colours as dots, speaking a blue ring with risen bars, listening the blue
+disc, offline and muted the idle icon in grey.
 
 **K10. Overlay assets are served from a custom `kai://` URI scheme**, embedded in the binary, as in
 the spike. `file://` works only with `allow_file_access_from_file_urls`, which lets every page read

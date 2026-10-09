@@ -14,7 +14,7 @@ use crate::audio::{Device, DeviceList, EchoMode, EchoStatus};
 use crate::lmgw_link::{AdminLevel, admin_note};
 use crate::voice::VoiceMode;
 
-/// Icon names (K9): Kai's own hicolor set, graphite and blue; grey when Kai cannot serve.
+/// Icon names (K9): Kai's own hicolor set, the voice ring in lmgw's colours; grey when Kai cannot serve.
 pub const ICON_OFFLINE: &str = "kai-tray-offline";
 pub const ICON_IDLE: &str = "kai-tray-idle";
 /// Listening (the owner speaks, the talk key is held, or listening is on and quiet, K11).

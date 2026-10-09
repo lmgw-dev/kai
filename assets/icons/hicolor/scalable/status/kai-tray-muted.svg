@@ -1,6 +1,10 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 22 22">
-  <!-- Kai tray, muted (K9, §5.4): Kai hears silence. Grey ring, struck through in Breeze red. -->
+  <!-- Kai tray, muted (K9, §5.4): Kai hears silence. The grey idle icon, struck through in Breeze red over a graphite gap. -->
   <circle cx="11" cy="11" r="10.5" fill="#23272C"/>
-  <circle cx="11" cy="11" r="6.5" fill="none" stroke="#8A9199" stroke-width="2.5"/>
-  <line x1="5.5" y1="16.5" x2="16.5" y2="5.5" stroke="#DA4453" stroke-width="2.5" stroke-linecap="round"/>
+  <circle cx="11" cy="11" r="8.1" fill="none" stroke="#8A9199" stroke-width="2.2"/>
+  <rect x="5.8" y="8.8" width="2.2" height="4.4" rx="1.1" fill="#8A9199"/>
+  <rect x="9.9" y="6.7" width="2.2" height="8.6" rx="1.1" fill="#8A9199"/>
+  <rect x="14" y="8.8" width="2.2" height="4.4" rx="1.1" fill="#8A9199"/>
+  <line x1="5" y1="17" x2="17" y2="5" stroke="#23272C" stroke-width="4.4" stroke-linecap="round"/>
+  <line x1="5" y1="17" x2="17" y2="5" stroke="#DA4453" stroke-width="2.2" stroke-linecap="round"/>
 </svg>
