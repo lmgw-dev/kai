@@ -8,7 +8,7 @@
 //! - **Environment:** the session's (the user manager's, as every program Kai starts gets it), with
 //!   `KAI_CLI_SOCKET` (where `kai tool` and `kai model` reach this Kai), `KAI_ROUTINE` (its name),
 //!   and Kai's own binary's folder first on `PATH` when `kai` there is not this one (a dev build).
-//!   No secret: the device key never leaves Kai; the script's model calls go through `kai model`.
+//!   No secret: the device's key never leaves Kai; the script's model calls go through `kai model`.
 //! - **Working directory:** the routine's folder. **stdin:** empty.
 //! - **stdout** is the result (K22: compact; never cut: a result larger than the call's room is the
 //!   call's error naming the room: lmgw's message limit for a tool call, a notification's for the

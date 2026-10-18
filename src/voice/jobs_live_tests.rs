@@ -36,14 +36,13 @@ use tokio::sync::{mpsc, watch};
 use super::Notice;
 use super::link::ServerEvent;
 use super::lmgw_live_tests::{
-    Lmgw, Mic, Report, Tap, Tapped, URL, env, is_server, log_is_clean, notice, set_up_mocks,
+    Lmgw, Mic, Report, Tap, Tapped, URL, device, env, is_server, log_is_clean, notice, set_up_mocks,
 };
 use crate::audio::live_tests::{MIC, MIC_IN, SINK, out_dir, private_or_skip, read_wav, settings};
 use crate::audio::{Audio, RATE};
 use crate::config::Config;
 use crate::core::{Command, Core};
 use crate::lmgw_link::{FeedLink, FeedSettings, RealtimeLink, RealtimeSettings};
-use crate::pairing::DeviceKey;
 use crate::paths::Paths;
 use crate::secret::MemoryStore;
 use crate::tray::model::{Link, Pairing, TrayModel};
@@ -219,17 +218,9 @@ async fn live_jobs() {
         .await["id"]
         .as_i64()
         .unwrap();
-    let key = lmgw
-        .op(
-            "key_create",
-            json!({"kind": "device", "name": "kai-live", "url": URL, "hosts_label": LABEL}),
-        )
-        .await["key"]
-        .as_str()
-        .unwrap()
-        .to_owned();
+    let kai = device(&lmgw, "kai-live", json!({"hosts_label": LABEL})).await;
     r.line(format!(
-        "dev lmgw up in {} ms; device key kai-live (hosts {LABEL}); folder {folder}",
+        "dev lmgw up in {} ms; device kai-live (hosts {LABEL}); folder {folder}",
         boot.as_millis()
     ));
 
@@ -249,7 +240,7 @@ async fn live_jobs() {
     std::fs::write(
         &paths.config_file,
         format!(
-            "[lmgw]\nurl = \"{URL}\"\nretry_max_s = 2\n[audio]\ninput = \"{MIC}\"\noutput = \"{SINK}\"\n\
+            "[lmgw]\nretry_max_s = 2\n[audio]\ninput = \"{MIC}\"\noutput = \"{SINK}\"\n\
              [conversation]\nfolder_id = {folder}\n[voice]\ngrace_s = 15\nmode = \"push_to_talk\"\n\
              [shortcuts]\nbind = false\n[jobs]\nquiet_ms = 1500\n\
              [policy]\ntrusted_callers = [\"device:phone\"]\n[policy.tools]\nlive_slow = \"allow\"\n"
@@ -258,14 +249,11 @@ async fn live_jobs() {
     .unwrap();
     let config = Config::load(&paths.config_file).unwrap();
     let store = Arc::new(MemoryStore::default());
-    store.items.lock().unwrap().insert(
-        URL.into(),
-        ("kai-live".into(), DeviceKey::parse(&key).unwrap()),
-    );
-    let feed = FeedLink::new(FeedSettings::from_config(&config)).unwrap();
+    kai.store(&paths, &store);
+    let feed = FeedLink::new(FeedSettings::from_config(&config));
     let tap = Tap::default();
     let voice_link = Tapped {
-        link: RealtimeLink::new(RealtimeSettings::from_config(&config), feed.client()),
+        link: RealtimeLink::new(RealtimeSettings::from_config(&config)),
         tap: tap.clone(),
     };
     let (model_tx, mut model) = watch::channel(TrayModel::starting(false));
@@ -542,21 +530,18 @@ async fn live_jobs() {
     // ---- 5. a deleted device's job: the phone (a second paired device) runs a 600 s job in a
     // thread of its own; the owner deletes the phone's key; lmgw tells Kai, the host of the open
     // task, `device.revoked`, and Kai ends the job. Kai's own key stays.
-    let phone = lmgw
-        .op(
-            "key_create",
-            json!({"kind": "device", "name": "phone", "url": URL,
-                "tool_scope_mode": "allow", "tool_scope_patterns": format!("{LABEL}__*")}),
-        )
-        .await;
-    let phone_key = phone["key"].as_str().unwrap().to_owned();
-    let phone_id = phone["id"].as_i64().unwrap();
-    let (st, text) = lmgw
+    let phone = device(
+        &lmgw,
+        "phone",
+        json!({"tool_scope_mode": "allow", "tool_scope_patterns": format!("{LABEL}__*")}),
+    )
+    .await;
+    let phone_id = phone.enrolled.paired.credentials.device_id;
+    let (st, text) = phone
         .call(
             "POST",
             "/chat/api/threads",
             Some(json!({"model_alias": "kai-chat"})),
-            &phone_key,
         )
         .await;
     assert_eq!(st, 200, "the phone creates a thread: {text}");
@@ -565,12 +550,11 @@ async fn live_jobs() {
         .unwrap();
     // The thread's tools: the phone's tool scope allows Kai's label, the owner sets them.
     with_kai_tools(&lmgw, phone_thread).await;
-    let (st, text) = lmgw
+    let (st, text) = phone
         .call(
             "POST",
             &format!("/chat/api/threads/{phone_thread}/send"),
             Some(json!({"content": "run the long one"})),
-            &phone_key,
         )
         .await;
     assert_eq!(st, 200, "the phone sends: {text}");
@@ -609,7 +593,7 @@ async fn live_jobs() {
     cmds.send(Command::Quit).unwrap();
     let _ = tokio::time::timeout(Duration::from_secs(20), task).await;
     lmgw.stop().await;
-    let mut line = log_is_clean(&log_path, &[&key, &phone_key]);
+    let mut line = log_is_clean(&log_path, &[&kai.secret(), &phone.secret()]);
     let text = std::fs::read_to_string(&log_path).unwrap_or_default();
     for m in &marks {
         assert!(

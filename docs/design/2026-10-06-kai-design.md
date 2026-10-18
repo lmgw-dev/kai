@@ -525,6 +525,10 @@ it. *(WP0, 2026-10-06)*
 
 **K13. Pairing uses a `lmgw-pair:` link** (api §1.4), handled by Kai's `.desktop` scheme handler or
 pasted (§3.1).
+*(changed 2026-10-15: the link is v2, lmgw's device link §3.1, parsed by `lmgw-client`: https URLs,
+`fp` and a one-time `token` instead of a key; a v1 link is refused as "from a pairing before TLS".
+Everything below about the key on argv holds for the token while it lives. A confirmed link no
+longer stores anything itself: it starts the enrolment, §3.1's note.)*
 - The handler never logs its argv, which carries the key.
 - It hands the link to a running Kai over D-Bus only.
 - When no Kai runs, it stores the key and URL itself, starts Kai through its desktop file
@@ -1367,6 +1371,17 @@ was silent, the builder's decisions, marked *draft*):
   raise an unlock prompt. "Retries when the wallet opens" is a check every `wallet.retry_s`
   (default 5), since KWallet's change signals are unverified. Each call is bounded by
   `wallet.timeout_s` (default 10). Both are named in the tooltip or the error.
+  *(changed 2026-10-15: lmgw's device link (its design §6.2, D14): the secret is the device's own
+  P-256 key, generated in software with aws-lc-rs at pairing; lmgw never sees it, only its public
+  half in the device's certificate. The item stays Kai's one item in the default collection, its
+  `kind` now `device-tls-key`, its `lmgw` attribute the fingerprint of lmgw's device CA (`fp`,
+  `sha256:<64 hex>`), which names the gateway whatever URLs it is reached at; the secret is the
+  key's PKCS#8 as PEM text (`PRIVATE KEY`, `text/plain`), so the item reads as a key in KWallet
+  and no Secret Service provider has to carry binary bytes. The public half of a pairing (the
+  certificate, lmgw's CA, the dates, the URLs, the confirmation code) is in
+  `$XDG_CONFIG_HOME/kai/device-link.json` (`crate::pairing::Paired`). A pairing from before TLS
+  left `lmgw.url` and an item of `kind: device-key`: Kai says "pair again" for it, and the next
+  pairing deletes both.)*
 - **Single instance:** the D-Bus name `dev.rootshell.kai` (K13).
 - **Logs** go to stderr through tracing, into the autostart unit's journal. Argv is never logged.
   *Changed during the build, 2026-10-07 (review KAI-2 K2-1, K2-10, the owner's decision):* the
@@ -1436,6 +1451,83 @@ was silent, the builder's decisions, marked *draft*):
    certificate, every link that carries `fp` is refused with the reason (fail closed). `fp` with an
    `http://` url is always refused.
 
+*(changed 2026-10-15: pairing is lmgw's device link (its design §3, §6.2). Steps 1 to 4 become:*
+1. *On the Devices card the owner pairs a device (for Kai on the same machine, "this computer":
+   the link's URL is `https://127.0.0.1:<device port>`); the card shows a v2 link with the URLs,
+   `fp` (the SHA-256 of lmgw's device CA's key) and a one-time token.*
+2. *Kai gets it as before (the scheme handler, the paste dialog) and the owner confirms it in Kai's
+   dialog, whose lines are `lmgw-client`'s `PairFacts` (the URLs, the device, lmgw's identity
+   shortened, what it replaces). The `http://` warning is gone with `http://` links.*
+3. *Confirmed, Kai ends what the pairing it replaces runs (the feed, the tool link, the voice
+   session: lmgw ends the old key's links once the token is used, which must not read as a
+   revocation) and drops its requests on their way (the folder's, the profiles', the personality's,
+   asked again at the next `hello`; a key refusal also counts only for the pairing it went under,
+   by the certificate's hash, so a 401 for the old key never revokes a same-lmgw re-pair: the
+   security review's S1, 2026-10-15). While the enrolment runs nothing loads the stored pairing
+   (the wallet's retry, Try again: S2). Kai then makes a new P-256 key and enrols its public half:
+   `POST /devices/enrol` over TLS pinned to `fp` (`lmgw_client::tls::enrol_config`), tried on the
+   link's URLs by lmgw's rule
+   (the next one `lmgw.url_stagger_ms` after the previous one unless that one's TCP and TLS are up,
+   the first answer wins; *changed 2026-10-15 after the security review: the stagger first ran
+   until the previous one's response head; each try now has its own HTTP client whose connector
+   says when its connection is made, `tls::race`*), bounded by
+   `lmgw.timeout_s`. The enrolment's `client`, which lmgw's Devices card shows, is `Kai <version>
+   on <host name> (<PRETTY_NAME>)` (*changed 2026-10-15, the review's decision 9: the host name
+   added*). `read_enrolment` checks lmgw's answer against the link and the key. Then
+   the key goes into the wallet (§2) and the rest into `device-link.json`; a failure on the way is
+   said, and the pairing Kai had connects again. A wallet that locked between the dialog and the
+   store keeps the enrolment in memory until it opens (lmgw has used the token).*
+   *(changed 2026-10-15, the owner's decision on the review's decision 5, and its S4: an
+   enrolment Kai could not store, the wallet locked or failing, or `device-link.json` not written
+   after the wallet took the key, connects at once from memory instead of waiting. A notification
+   and a tooltip line say why it is not stored and that quitting Kai before then loses it; Kai
+   stores what is missing every `wallet.retry_s` and says when it is stored; a quit before then
+   tries once more and otherwise says the pairing is lost. What the replaced pairing leaves
+   (another lmgw's key item, the bearer and `lmgw.url` from before TLS) goes only once the new one
+   is stored, so a restart before then finds the old pairing as it was. Try again uses the key in
+   memory; a further pairing is refused until this one is stored, naming why.)*
+   *(changed 2026-10-15, lmgw's WP3 (its D8's lost answer): the key goes with the link's token,
+   one per token, kept in memory until another link's enrolment replaces it. Trying the same link
+   again (the paste dialog's Pair after a failure, the link clicked again) enrols the same key,
+   and while the token lives lmgw answers that key what it answered it, the same certificate with
+   `confirmed` as it stands, so an answer lost on the way (a connection that broke after the
+   request, `lmgw.timeout_s` passing) comes back instead of a new key meeting 410
+   `pairing_token_used` and marking the row contested. The race's tries each send that key, so a
+   second POST that reaches lmgw is such a repeat. Decided in the build: no enrolment is retried by
+   itself; a failure is said, and trying again is the owner's. The key is not stored before lmgw
+   answered, so a Kai restarted in between enrols a new key.)*
+4. *Kai says the confirmation code ("confirm the code 7F3A-91C2 on lmgw's Devices card"); until
+   the owner confirms, lmgw answers the feed 403 `device_unconfirmed`, and the tray shows "waiting
+   for your confirmation on lmgw" with the code while the feed asks again on its backoff. Every
+   connection after that is mutual TLS from one `rustls::ClientConfig`
+   (`lmgw_client::tls::client_config`: lmgw's CA as the only root, the device's certificate),
+   which `lmgw_link::tls::Tls` hands to reqwest (`tls_backend_preconfigured`, https only) and to
+   both WebSockets (`Connector::Rustls`); no request carries a credential header. A re-pair to the
+   same lmgw replaces the wallet item; to another lmgw (another `fp`) it deletes the old one.
+   With lmgw on the same machine, Kai still goes through the device listener on loopback: lmgw
+   authenticates no device on its plain listener (its D12).)*
+   *(changed 2026-10-15, lmgw's WP3 as built: every route answers 403 `device_unconfirmed` until
+   the owner confirms, the feed and the tool link alike, and the owner confirms on lmgw's Devices
+   card by checking the code it shows against Kai's or entering Kai's (lmgw's `device_confirm {id,
+   confirm_code}`, the owner's op; Kai never calls it). The notification says both: "confirm the
+   code 7F3A-91C2 on lmgw's Devices card (check that the card shows 7F3A-91C2, or enter it where
+   the card asks for it)". A re-pair no longer ends the old key when its token is used: lmgw keeps
+   it working until the new key is confirmed and ends it then (`Rotated`, kind `key_unknown`), and
+   the same key enrolling again keeps its confirmation. Kai's order is unchanged: it leaves the old
+   pairing's links before it enrols, and a same-lmgw re-pair replaces the old key in the wallet when
+   it stores the new one, so Kai waits on the new key's confirmation without the old one.)*
+   *(changed 2026-10-15, the security review's nits on D15: the WebSockets no longer take a
+   connector. `Tls::websocket` refuses anything but `wss://` before connecting, makes the TCP and
+   TLS stream itself with tokio-rustls from the same configuration and runs tokio-tungstenite's
+   client handshake over it; tokio-tungstenite has none of its TLS features, so it cannot make a
+   TLS connection by itself. A refused upgrade's body is read to its end before its code decides
+   (a 403 `device_unconfirmed` whose body came after the head read as "not granted" on the tool
+   link). lmgw's HTTP client follows no redirects. `clippy.toml`'s `disallowed-methods` refuses
+   `reqwest::Client::new` and `builder`, `reqwest::ClientBuilder::new`, `reqwest::get` and
+   tokio-tungstenite's `connect_async` and `connect_async_with_config` outside `lmgw_link::tls`;
+   the widgets' web fetch, the updater and the live tests' owner requests to a dev lmgw each carry
+   an `#[allow]` saying why.)*
+
 An unpaired Kai shows the grey icon with "not paired" and offers only "Pair with lmgw…" and Quit.
 
 ### 3.2 The feed
@@ -1468,10 +1560,21 @@ Kai keeps one `GET /chat/api/feed` open (api §2). It resumes with `Last-Event-I
 | `revoked` | §3.3 |
 | `approval.requested`, `approval.decided` (phase 3) | approval overlay opens, or closes (§11.1) |
 
+*(changed 2026-10-15: the approval card follows the feed's open set (lmgw's device link design
+§7.3), not the `approval.*` events themselves. `lmgw-client`'s reader hands over the whole set at
+`caught_up` on every connection, `hello.open_approvals` as the catch-up left it, and then says what
+each later `approval.*`, `state` or deletion added or withdrew. `caught_up` itself is logged at
+debug.)*
+
 *Built in WP2, 2026-10-07* (`src/lmgw_link.rs`, `src/lmgw_link/feed.rs`):
 - **The client.** reqwest (rustls with the system's trust store, for a gateway behind https; no
   proxy), the request from `lmgw-client`'s `requests::feed` with the device key as a bearer, the
-  body through its `FeedReader`. The cursor lives in memory for one run of the link: a reconnect
+  body through its `FeedReader`. *(changed 2026-10-15: the device link's client, §3.1's note: no
+  bearer, lmgw's CA as the only root; with several URLs the feed tries them by lmgw's rule and every
+  other connection goes to the one that answered. A handshake that fails on lmgw's side (another
+  CA, a name, the clock) is said in `lmgw-client`'s words and tried again: the next URL, or the
+  next try, may reach the owner's lmgw. So is an alert refusing the device's certificate, in Kai's
+  own words: it never ends the link, §3.3's note.)* The cursor lives in memory for one run of the link: a reconnect
   resumes with it, a new pairing or a restart of Kai starts from now (`hello` brings the live
   state). `hello`'s principal gives Kai's own `by` (`FeedPrincipal::by`).
 - **Bounds.** `lmgw.timeout_s` (default 10, new) for the request's answer and for the `hello`; two
@@ -1526,6 +1629,21 @@ twice `lmgw.timeout_s` can cut a run's first feed short while a level change goe
 `LinkEvent::Fact` (`Live` for `hello`'s and `state`'s `voice` and `turns`, `VoiceBound`,
 `VoiceEnded`, `TurnStarted`, `TurnDone`, `FolderCurrent` for Kai's folder), each `by` marked `own`
 when it is Kai's own principal.
+
+*(changed 2026-10-15, lmgw's device link WP5 (its §7.2): a device's `hello` says what lmgw holds
+about the device, and Kai takes it as `lmgw-client`'s reader keeps it, passed on as
+`LinkEvent::Device` right before `Connected`:*
+- *`urls` (`FeedReader::urls`: the `https` ones, each once) replace the pairing's list in
+  `device-link.json` and the link's reach (`tls::Reach::set_urls`, shared by the feed, the voice
+  and the host link), and the tooltip names the first; the URL that last connected still goes
+  first while the list holds it. A `hello` with none usable keeps Kai's list.*
+- *`cert` (`FeedReader::certificate`, `CertDates`) replaces the stored dates, so the tooltip's
+  notice and Kai's own lapse check before each try go by lmgw's record of the certificate
+  (`tls::Tls::set_not_after_ms`, shared by the clones).*
+- *Both are written to `device-link.json` when they change; a pairing Kai runs from memory keeps
+  them with the rest and stores them with it. A write that fails is logged and notified (Kai uses
+  the new facts now; the next start, the old ones until lmgw sends them again).*
+- *`dashboard_url` is what Open in lmgw opens (§4's note).)*
 
 ### 3.3 Revocation and expiry
 
@@ -1593,6 +1711,56 @@ says it by its code (`requests::key_refused`). lmgw's sentence is shown without 
   thread"), asks `current`, and where listening was on binds the answer with its own bind (never a
   takeover, K5); a press session's thread is only remembered for the next press. A refusal of that
   `current` decides as any does, a 401 by its code. A 4004 never says "pair again".
+
+*(changed 2026-10-15: lmgw's device link adds refusals of the device, each said in the design's words
+(its §3.4, §4.7, §5.3, §6.3):*
+- *403 `device_unconfirmed` is no loss: the owner has not confirmed the code yet. The tray says
+  "Confirm <code> on lmgw's Devices card" with Kai's own code (lmgw's message is for people), and
+  the feed asks again on its backoff.*
+- *401 `device_certificate_expired` and the `revoked` kind `certificate_expired`, both over the
+  authenticated link, and Kai's own date (`device-link.json`'s `not_after`, checked before each of
+  the feed's tries): "this device's certificate lapsed on <date>; pair it again", the date Kai's
+  own, and Kai stops. At its start Kai does not try a certificate past its date and says the same;
+  from `notice_after` on the tooltip says "this device's certificate lapses on <date>; pair it again
+  before then" (`lmgw_client::requests::Credentials::state`). Renewal without a pairing is lmgw's
+  WP8.* *(changed 2026-10-15: lmgw's WP3 types the kind, `RevokeKind::CertificateExpired`, which Kai
+  matches instead of the token's text.)*
+- *401 `client_certificate_required` and 400 `credential_on_device_listener`: "pair again" with
+  lmgw's message (a pairing Kai holds should never meet these).*
+- *A TLS alert refusing the device's certificate (`certificate_expired`, `bad_certificate`,
+  `unknown_ca`, …) never stops Kai (changed 2026-10-15 after the security review's B1; the build
+  first stopped on it): rustls takes a fatal alert in any state of the handshake, a plaintext one
+  sent right after the ClientHello included, before the server proved anything, so a process
+  squatting on lmgw's port (Kai autostarts before lmgw) or a host behind a LAN URL could switch Kai
+  off with one. The feed and the tool link say the alert by its TLS name in the tooltip ("the
+  server refused this device's certificate with TLS's bad_certificate alert, before it proved to
+  be your lmgw: Kai keeps the pairing and tries again") and try again on their backoff; a
+  `certificate_expired` while Kai's date holds the certificate adds that date and asks to check
+  the clocks. lmgw's real refusals come over the authenticated link (the 401s, the feed's
+  `revoked`), so none is lost.*
+- *A handshake that fails on lmgw's side is no loss (§3.2's note): "lmgw's device authority
+  changed, or this is not your lmgw: pair again", a name the certificate lacks, or the clock, said
+  in the tooltip while the feed tries again.*
+- *At enrolment: an ended link (lmgw's `certificate_required` alert) is "this pairing link has
+  ended (closed on lmgw's Devices card, expired or used): make a new one there"; a server that
+  does not hold the key `fp` pins is "this is not the lmgw this link pairs with", and nothing was
+  sent to it; 410 `pairing_token_used` is "someone else used this code: delete the device on lmgw's
+  Devices card"; any other refusal is lmgw's message with its code.*
+  *(changed 2026-10-15: lmgw-client no longer concludes "the link ended" from the
+  `certificate_required` alert (lmgw's device link §3.3, its owner's note of 2026-10-15): an alert
+  is unauthenticated and may come before the server proved anything, so a process squatting on the
+  address can send it as well as lmgw while no token lives. It reads as `TlsRefusal::Unproven`, and
+  Kai says it as a failed handshake to try again: "the server answered with TLS's
+  certificate_required alert before it proved to be the lmgw this link pairs with, so something
+  else may be answering at that address, or the pairing link may have ended (…). Try again; if it
+  keeps failing, make a new link on lmgw's Devices card" — a new link suggested, never stated. The
+  try again sends the same key, §3.1's note.)*
+- *A pairing from before TLS (`lmgw.url` in the configuration, no `device-link.json`): "Kai was
+  paired with lmgw at <url> before TLS, which lmgw no longer accepts: pair it again with a new link
+  from lmgw's Devices card".*
+- *A talk press or a tray click while the pairing must be made again, was revoked, or the wallet
+  is locked or failing says that reason in its notification, not "Kai is not paired" (changed
+  2026-10-15 after the security review).)*
 
 Kai writes no thread settings, messages or folder defaults: it creates its folder with its name
 only and asks `current`. So lmgw's 403 `chat_toolset_needs_full` cannot meet it, and no mapping is
@@ -1750,6 +1918,19 @@ Without it no session starts, and the note names the key.
 - **A 401** on `current`, the folder routes or the bind is §3.3's revocation.
 - **Open in lmgw** opens `<lmgw.url>/chat?t=<thread id>` (the dashboard's own deep link), or
   `<lmgw.url>/chat` while no thread is known. It is handed to `xdg-open` and not waited for.
+  *(changed 2026-10-15: on `lmgw.dashboard_url`, the dashboard's own address: the URLs a pairing
+  holds are lmgw's device listener, which serves no dashboard and no browser (lmgw's device link
+  §4.6). Unset, Open in lmgw says to set it. The link v2 does not carry the dashboard's address; a
+  later lmgw could state it in `hello`.)*
+  *(changed 2026-10-15, the owner's decision: the address comes from lmgw over the device link, so
+  the setting `lmgw.dashboard_url` is gone (a configuration that still names it is refused as any
+  unknown key is). Open in lmgw opens the feed's last `hello.dashboard_url` on this pairing (lmgw's
+  device link §7.2, WP5): lmgw sends it to a device paired as "this computer" always, to another
+  only when its `bind_addr` is not loopback. Kai hands it to `xdg-open` only as an `http` or
+  `https` URL with a host and no user info, query or fragment; anything else is said and opens
+  nothing. When lmgw sent none, Open in lmgw says "lmgw's dashboard is only reachable on lmgw's own
+  machine: open it there"; before the first `hello` on a pairing, that Kai has not connected to
+  lmgw yet.)*
 - **An untitled thread** is "New chat" in the tray, the dashboard's name for a new one.
 - **`voice.on_at_start`** on a first run waits until the folder is ready.
 
@@ -2691,6 +2872,29 @@ URL:** a build without a feed (every local `just rpm`) has none.
 - **`lmgw-client`:** native unit tests.
 - **Kai runs only against a dev lmgw** (`scripts/dev-instance.sh`), never the real data directory and
   never `127.0.0.1:8001`.
+  *(changed 2026-10-15: the unit tests' lmgw is a mock behind TLS: `lmgw_link::test_pki` makes a
+  device CA, loopback server leaves and device certificates with rcgen as lmgw makes them, and its
+  `Gateway` serves TLS 1.3 asking for a client certificate under that CA (or optionally, as while
+  a token is pending, for the enrolment's tests). Every test server of Kai's lmgw-facing code runs
+  behind it. One test (`lmgw_link::tls::tests`, and the host link's in `host::tests::closes`)
+  holds each connection, the requests, the feed, the voice session's WebSocket, Kai's `/mcp`
+  client, the settings window's proxy and the tool link, to refusing a server under another CA
+  before it sends anything (lmgw's device link D15). The live checks that pair (`live-check-link`
+  and those that build on a pairing) need lmgw's pairing ops (its WP3) and wait for them.)*
+  *(changed 2026-10-15, lmgw's WP3 on its main: the live checks that pair do what the owner does,
+  on the dev lmgw's `/api` with its owner bearer: the device listener on (`settings_set`'s
+  `devices.listener`, 127.0.0.1:8898 beside the dev lmgw's 8897), `key_create` with `local_only`
+  for the v2 link, Kai's enrolment, then `device_confirm {id, confirm_code}` with the code Kai shows
+  (`scripts/live-device-link.sh`, shared). `live-check-link` and `live-check-host` hand the link to
+  the live-test Kai and read the code from its tooltip, checking it against lmgw's Devices card
+  (the Keys list's `pairing`); `live-check-window` and `live-check-widgets` enrol with the test
+  binary's ignored `pairing::tests::live_enrol` (the link in a file of mode 600, never in argv) and
+  hand the pairing to their live test; the Rust live tests pair with
+  `voice::lmgw_live_tests::device`. `live-check-link` now also checks the row's URLs reaching
+  `device-link.json` through a `hello`, Open in lmgw on the `hello`'s dashboard address, a key ended
+  at once by a new token in place of `key_rotate` (which a device row refuses), and a re-pair that
+  keeps the old key until the new one is confirmed; the refusal it had while it still paired with
+  a v1 link is gone.)*
 - **Speech:** only TTS-generated clips or locally kept recordings, never committed; checks with a
   real voice are manual.
 - **Overlay checks:** crops only; nothing of the owner's screen leaves the machine or enters the
@@ -4426,7 +4630,18 @@ disjoint files, so they can run side by side:
     the bound session's `mcp_approval_request`, one call per `approval_request_id`. The feed's
     `approval.decided` (an approved call that never ran counts as not approved), the session's
     `lmgw.approval.decided`, a deleted thread and leaving the gateway take calls away. Calls that
-    waited before Kai's feed started are not shown (the feed starts without a cursor). *(Review,
+    waited before Kai's feed started are not shown (the feed starts without a cursor).
+    *(changed 2026-10-15: with lmgw's device link (§7.3) the feed hands over every call that waits
+    at each connection, at `caught_up`, so calls that waited before Kai started are shown too. Kai
+    reconciles against that set: a call it lacks was decided, or its reply or thread went, while the
+    feed was down, and goes, unless the live session showed it, which says its decision itself;
+    after `caught_up` the reader's `Added` and `Withdrawn` replace the raw `approval.requested` and
+    `approval.decided`. Kai has no "dismiss", so it asks the reader for the plain set
+    (`FeedReader::knowing` is for a client that keeps dismissed ids). A call lmgw said was decided
+    (the live session's `lmgw.approval.decided`, the route's answer) is kept out of a later open
+    set or `Added` until the feed withdraws it or its next `caught_up`, so a set read at a head
+    before the decision does not show it again for a moment (added 2026-10-15 after the security
+    review).)* *(Review,
     2026-10-09:)* a `resync` reads the waiting calls of every thread Kai knows calls of, and of
     its own conversation, again (`GET /chat/api/threads/{id}`, the messages' `pending_approvals`;
     lmgw-client has no request for it, so Kai builds it) and rebuilds them: a call decided

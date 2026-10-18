@@ -144,6 +144,73 @@ fn the_card_shows_a_call_and_goes_when_it_is_decided_elsewhere() {
     assert_eq!(cards.lock().unwrap().len(), 3);
 }
 
+/// Device link §7.3: the feed's open set, at every connection, is what Kai reconciles against. A
+/// call it lacks was decided while the feed was down and goes, unless the live session showed it
+/// (the session says its decision itself); a call Kai did not show yet is shown, one it shows stays
+/// as it is. The feed's withdrawal takes a call away like a decision.
+#[test]
+fn the_feeds_open_set_is_reconciled_against() {
+    let (mut a, cards) = approvals();
+    let feed = |id: &str, thread_id: i64| Requested {
+        thread_id,
+        request: req(id, "window_close", "{}"),
+    };
+    a.observe(vec![], Some(1));
+    a.requested(7, req("mcpr_1", "window_close", "{}"), None);
+    a.requested(7, req("mcpr_2", "window_close", "{}"), None);
+    a.requested(8, req("mcpr_3", "window_close", "{}"), Some(1));
+    assert_eq!(last(&cards), Some(Some("mcpr_1".into())));
+    a.open_set(vec![feed("mcpr_2", 7), feed("mcpr_4", 9)]);
+    let mut ids: Vec<&str> = a.calls.iter().map(|c| c.id.as_str()).collect();
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        ["mcpr_2", "mcpr_3", "mcpr_4"],
+        "mcpr_1 went, the session's mcpr_3 stayed, mcpr_4 came"
+    );
+    assert_eq!(last(&cards), Some(Some("mcpr_2".into())));
+    // The session ended: its call is the feed's to say from now on.
+    a.observe(vec![], None);
+    a.open_set(vec![feed("mcpr_2", 7)]);
+    a.withdrawn(&["mcpr_2".into(), "mcpr_9".into()]);
+    assert!(!a.waiting());
+    assert_eq!(last(&cards), Some(None));
+}
+
+/// A call lmgw said was decided (the live session's `lmgw.approval.decided`) does not come back
+/// for a moment from a stale open set or a late `Added` read before the decision; the feed's
+/// withdrawal, or the next open set, ends the guard.
+#[test]
+fn a_call_decided_here_does_not_flicker_back() {
+    let (mut a, cards) = approvals();
+    let feed = |id: &str| Requested {
+        thread_id: 7,
+        request: req(id, "window_close", "{}"),
+    };
+    a.observe(vec![], Some(1));
+    a.requested(7, req("mcpr_1", "window_close", "{}"), Some(1));
+    a.requested(7, req("mcpr_2", "window_close", "{}"), None);
+    a.decided("mcpr_1", true, Some("device 'desktop'"));
+    let shown = cards.lock().unwrap().len();
+    // The feed reconnects; its set was read before the decision.
+    a.open_set(vec![feed("mcpr_1"), feed("mcpr_2")]);
+    let ids: Vec<&str> = a.calls.iter().map(|c| c.id.as_str()).collect();
+    assert_eq!(ids, ["mcpr_2"], "the decided call is not shown again");
+    assert_eq!(last(&cards), Some(Some("mcpr_2".into())));
+    assert_eq!(cards.lock().unwrap().len(), shown, "the card never changed");
+    // Decided again in the session; the feed's late Added, then its withdrawal.
+    a.requested(7, req("mcpr_3", "window_close", "{}"), Some(1));
+    a.decided("mcpr_3", false, None);
+    a.requested(7, req("mcpr_3", "window_close", "{}"), None);
+    assert!(!a.calls.iter().any(|c| c.id == "mcpr_3"), "a late Added");
+    a.withdrawn(&["mcpr_3".into()]);
+    assert!(a.decided_here.is_empty(), "the withdrawal ends the guard");
+    // The next open set ends it too: a call that waits again (a new one) shows.
+    a.decided("mcpr_2", true, None);
+    a.open_set(vec![]);
+    assert!(a.decided_here.is_empty());
+}
+
 /// lmgw takes a reply's verdicts together (api §6.3): the card asks each call, then one request.
 #[test]
 fn a_reply_with_two_calls_is_sent_once_both_have_a_verdict() {

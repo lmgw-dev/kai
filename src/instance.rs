@@ -69,12 +69,11 @@ impl PairingService {
 #[zbus::interface(name = "dev.rootshell.kai.Pairing1")]
 impl PairingService {
     /// Takes a `lmgw-pair:` link and answers at once that it awaits the owner's confirmation. A
-    /// link that does not parse, or carries a fingerprint Kai cannot check, is refused with the
-    /// reason; so is every link while another one waits ([`WAITING`]).
+    /// link that does not parse (a v1 link from before TLS among them) is refused with the reason;
+    /// so is every link while another one waits ([`WAITING`]).
     async fn pair(&self, link: String) -> zbus::fdo::Result<String> {
         let link =
             PairingLink::parse(&link).map_err(|e| zbus::fdo::Error::InvalidArgs(e.to_string()))?;
-        crate::pairing::verify_fingerprint(&link).map_err(zbus::fdo::Error::InvalidArgs)?;
         if !self.gate.claim() {
             tracing::warn!("a pairing link was handed over on D-Bus while another waits: refused");
             return Err(zbus::fdo::Error::Failed(WAITING.to_owned()));
@@ -153,7 +152,7 @@ mod tests {
     use std::process::{Child, Command as Process, Stdio};
 
     use super::*;
-    use crate::pairing::tests::{KEY, good, link};
+    use crate::pairing::tests::{TOKEN, good};
 
     /// A private `dbus-daemon` for the test, killed on drop. Nothing touches the session bus.
     struct PrivateBus {
@@ -225,7 +224,7 @@ mod tests {
             let mut got = Vec::new();
             while let Some(cmd) = rx.recv().await {
                 if let Command::Arrived(link) = cmd {
-                    assert_eq!(link.key.expose(), KEY);
+                    assert_eq!(link.token.expose(), TOKEN);
                     got.push(link.name);
                 }
             }
@@ -261,19 +260,21 @@ mod tests {
             Ok(AWAITING.to_owned())
         );
 
-        // A bad link is refused by the running Kai, with a reason that does not echo the key.
-        let bad = link(&format!("v=2&url=http%3A%2F%2Fh&name=n&key={KEY}"));
+        // A link from before TLS is refused by the running Kai, with a reason that does not echo
+        // its key.
+        let key = "lmgw-device-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let bad = format!("lmgw-pair:?v=1&url=http%3A%2F%2Fh&name=n&key={key}");
         match hand_off(&second, &bad, timeout).await {
             Err(HandoffError::Refused(msg)) => {
-                assert!(msg.contains("unsupported link version"), "{msg}");
-                assert!(!msg.contains(&KEY[12..]), "{msg}");
+                assert!(msg.contains("from a pairing before TLS"), "{msg}");
+                assert!(!msg.contains(&key[12..]), "{msg}");
             }
             other => panic!("{other:?}"),
         }
-        // So is a link with a fingerprint this build cannot check (it fails closed).
-        let fp = format!("{}&fp=sha256:{}", good(), "0".repeat(64));
-        match hand_off(&second, &fp, timeout).await {
-            Err(HandoffError::Refused(msg)) => assert!(msg.contains("refusing"), "{msg}"),
+        // So is a link to a plain http address (the device link is TLS only).
+        let plain = good().replace("https%3A", "http%3A");
+        match hand_off(&second, &plain, timeout).await {
+            Err(HandoffError::Refused(msg)) => assert!(msg.contains("https"), "{msg}"),
             other => panic!("{other:?}"),
         }
 

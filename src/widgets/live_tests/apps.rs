@@ -8,9 +8,9 @@
 //!    `ui/resource-teardown` first (its answer is seen). A message posted by the host page's own
 //!    main world, and an `overlay_html` document's message to its parent, reach no bridge.
 //! 2. **Against a dev lmgw** (scripts/live-check-widgets.sh starts it on 127.0.0.1:8897 with
-//!    `scripts/mcp-apps-fixture.py` registered under the prefix `fx`, and hands the URL and a
-//!    device key over in the file `KAI_LIVE_APPS`): `overlay_app`'s open reads the fixture's view
-//!    through `/mcp` under the key, the view loads its data through the bridge (an app-only tool),
+//!    `scripts/mcp-apps-fixture.py` registered under the prefix `fx`, and names a pairing with it
+//!    in the file `KAI_LIVE_APPS`): `overlay_app`'s open reads the fixture's view through `/mcp` as
+//!    Kai's device, the view loads its data through the bridge (an app-only tool),
 //!    its state-changing call asks the owner (scripted: no), and every refusal of K18 holds; its
 //!    own resources are listed in its own terms; the refused CSP origin and permission are named
 //!    in the answer and `overlay_list`; a crop; hidden, it gets `ui/resource-teardown`.
@@ -32,7 +32,6 @@ use crate::host::confirm::{ConfirmRequest, Confirmer};
 use crate::lmgw_link::Credentials;
 use crate::lmgw_link::mcp::{Bound, McpError};
 use crate::overlay::placement::Anchor;
-use crate::pairing::DeviceKey;
 use crate::voice::link::Pending;
 use crate::widgets::app_bridge::{AppBody, Apps, Bridge, Calls, Rules, TEARDOWN_ID, Upstream};
 use crate::widgets::gtk_host::Probe;
@@ -271,16 +270,20 @@ async fn proof(r: &mut Run, rt: &tokio::runtime::Runtime) {
     );
 }
 
-/// The dev lmgw's URL and the device key, from the file the script wrote (two lines).
+/// Kai's pairing with the dev lmgw, from the files the script names in the file it wrote (two
+/// lines: a `device-link.json`, and the device's key as PEM).
 fn lmgw() -> Option<Credentials> {
     let path = std::env::var_os("KAI_LIVE_APPS")?;
     let text = std::fs::read_to_string(path).ok()?;
     let mut lines = text.lines();
-    let url = lines.next()?.trim().to_owned();
-    let key = lines.next()?.trim().to_owned();
+    let paired =
+        crate::pairing::Paired::load(std::path::Path::new(lines.next()?.trim())).ok()??;
+    let pem = std::fs::read_to_string(lines.next()?.trim()).ok()?;
+    let key = crate::pairing::TlsKey::from_pem(&pem).ok()?;
     Some(Credentials {
-        url,
-        key: DeviceKey::from_store(key),
+        reach: crate::lmgw_link::tls::Reach::new(paired.credentials.urls.clone()),
+        tls: crate::lmgw_link::tls::Tls::paired(&paired.credentials, &key, Duration::from_secs(10))
+            .ok()?,
     })
 }
 
@@ -296,11 +299,6 @@ async fn fixture(r: &mut Run, rt: &tokio::runtime::Runtime) {
     let owner = Arc::new(No::default());
     let apps = Apps {
         creds: watch::channel(Some(creds)).1,
-        client: reqwest::Client::builder()
-            .no_proxy()
-            .connect_timeout(Duration::from_secs(10))
-            .build()
-            .unwrap(),
         connect: Duration::from_secs(10),
         bound: bound(),
         calls: calls(),
@@ -336,7 +334,7 @@ async fn fixture(r: &mut Run, rt: &tokio::runtime::Runtime) {
     };
     r.check(
         true,
-        "the fixture's view is read through lmgw's /mcp under the device key",
+        "the fixture's view is read through lmgw's /mcp as Kai's device",
     );
     let notes = body.notes.clone();
     r.check(
@@ -514,11 +512,6 @@ async fn thread_call(r: &mut Run, rt: &tokio::runtime::Runtime) {
     let (ui, from_ui) = async_channel::unbounded::<crate::ui::UiCmd>();
     let apps = Apps {
         creds: watch::channel(Some(creds)).1,
-        client: reqwest::Client::builder()
-            .no_proxy()
-            .connect_timeout(Duration::from_secs(10))
-            .build()
-            .unwrap(),
         connect: Duration::from_secs(10),
         bound: bound(),
         calls: calls(),

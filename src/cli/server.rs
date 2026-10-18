@@ -33,7 +33,6 @@ const OUT_PIECES: usize = 4;
 pub struct Backend {
     pub local: Local,
     pub creds: watch::Receiver<Option<Credentials>>,
-    pub client: Option<reqwest::Client>,
     /// The peer's cgroup file (`/proc/<pid>/cgroup`; the tests give theirs).
     pub cgroup_of: fn(i32) -> Option<String>,
     /// The routine scopes Kai started that still run (`crate::routines::script`).
@@ -478,18 +477,16 @@ async fn model(backend: &Backend, alias: &str, prompt: &str, cancel: Cancellatio
     let Some(creds) = backend.creds.borrow().clone() else {
         return Answer::failed("Kai is not linked to lmgw (pair it first)");
     };
-    let Some(client) = backend.client.clone() else {
-        return Answer::failed("Kai could not build its HTTP client (see its log)");
-    };
     let body = json!({
         "model": alias,
         "stream": false,
         "messages": [{"role": "user", "content": prompt}],
     })
     .to_string();
-    let req = chat_completions(body).bearer(creds.key.expose());
+    let req = chat_completions(body);
+    let (http, url) = (creds.http(), creds.url());
     let sent = tokio::select! {
-        s = send_full(&client, &creds.url, req) => s,
+        s = send_full(&http, &url, req) => s,
         () = cancel.cancelled() => return Answer::failed("cancelled"),
     };
     let sent = match sent {

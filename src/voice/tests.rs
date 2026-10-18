@@ -25,8 +25,6 @@ use crate::config::Config;
 use crate::core::{Command, Core};
 use crate::lmgw_link::{Credentials, FolderEvent, LinkEvent, LmgwLink};
 use crate::overlay::{OverlayCmd, RingInput, RingState};
-use crate::pairing::DeviceKey;
-use crate::pairing::tests::KEY;
 use crate::paths::Paths;
 use crate::secret::MemoryStore;
 use crate::tray::model::{
@@ -70,7 +68,9 @@ fn assert_heard(audio_end_ms: u64, played_ms: u64) {
 }
 /// The microphone's constant sample.
 const MIC: i16 = 1200;
-const URL: &str = "http://127.0.0.1:1";
+/// Where the paired gateway is (its device listener), and its dashboard (Open in lmgw).
+const URL: &str = "https://127.0.0.1:1";
+const DASHBOARD: &str = "http://127.0.0.1:1";
 
 #[derive(Default)]
 struct Pw {
@@ -195,18 +195,14 @@ async fn rig_with(config: &str, mock: MockLink) -> Rig {
     std::fs::write(
         &paths.config_file,
         if config.contains("[conversation]") {
-            format!("[lmgw]\nurl = \"{URL}\"\n{config}")
+            config.to_owned()
         } else {
-            format!("[lmgw]\nurl = \"{URL}\"\n[conversation]\nfolder_id = 3\n{config}")
+            format!("[conversation]\nfolder_id = 3\n{config}")
         },
     )
     .unwrap();
     let store = Arc::new(MemoryStore::default());
-    store
-        .items
-        .lock()
-        .unwrap()
-        .insert(URL.into(), ("d".into(), DeviceKey::parse(KEY).unwrap()));
+    crate::pairing::tests::store_pairing(&crate::lmgw_link::test_pki::PKI, &paths, &store, URL);
     let feed = Feed::default();
     let audio = FakeAudio::default();
     let pw = audio.0.clone();
@@ -229,6 +225,7 @@ async fn rig_with(config: &str, mock: MockLink) -> Rig {
         ui_tx,
         None,
     );
+    core.set_enroller(crate::pairing::tests::enroller());
     core.notify_into(ntx);
     core.open_into(otx);
     let jobs = crate::jobs::Jobs::default();
@@ -262,6 +259,12 @@ async fn rig_with(config: &str, mock: MockLink) -> Rig {
     };
     r.until(|m| matches!(m.pairing, Pairing::Paired { .. }))
         .await;
+    r.feed
+        .raise(LinkEvent::Device(crate::lmgw_link::DeviceFacts {
+            urls: None,
+            cert: None,
+            dashboard: Some(format!("{DASHBOARD}/")),
+        }));
     r.feed.raise(LinkEvent::Connected {
         device: "desktop".into(),
         held: false,
@@ -1049,7 +1052,7 @@ async fn a_4003_close_for_a_disabled_device_asks_to_enable_it() {
     let mut r = rig("").await;
     r.listening_on().await;
     r.mock
-        .revoke_socket("key_unknown: device 'kai' was rotated — pair it again");
+        .revoke_socket("key_unknown: the key of device 'kai' was replaced — pair it again");
     r.notice("Kai: pair again").await;
     r.until(|m| matches!(m.pairing, Pairing::Revoked { .. }))
         .await;
@@ -1574,10 +1577,12 @@ async fn the_hold_badge_and_one_notification_per_hold_period() {
     );
     r.mock.model_state("tts", "mock/tts", "held", None);
     // K21: a fallback that answered is said once per hold period.
-    let timing = json!({"to_first_audio_ms": 900,
+    let timing: lmgw_client::realtime::VoiceTiming = serde_json::from_value(json!({
+        "to_first_audio_ms": 900,
         "models": {"asr": {"alias": "mock/asr", "answered_by": "cloud/asr"},
-                   "chat": {"alias": "mock/chat"}, "tts": {"alias": "mock/tts"}}});
-    r.mock.emit(ServerEvent::Timing(timing.clone()));
+                   "chat": {"alias": "mock/chat"}, "tts": {"alias": "mock/tts"}}}))
+    .unwrap();
+    r.mock.emit(ServerEvent::Timing(Box::new(timing.clone())));
     let n = r.notice("Kai: a fallback answered").await;
     assert_eq!(
         n.body,
@@ -1592,11 +1597,13 @@ async fn the_hold_badge_and_one_notification_per_hold_period() {
         })
         .await;
     assert!(render(&m).notes[0].contains("ASR answered by cloud/asr"));
-    r.mock.emit(ServerEvent::Timing(timing.clone()));
+    r.mock.emit(ServerEvent::Timing(Box::new(timing.clone())));
     // K21 is per stage: another fallback alias for the ASR in the same period says nothing new.
-    r.mock
-        .emit(ServerEvent::Timing(json!({"to_first_audio_ms": 900,
-        "models": {"asr": {"alias": "mock/asr", "answered_by": "cloud/asr-2"}}})));
+    r.mock.emit(ServerEvent::Timing(Box::new(
+        serde_json::from_value(json!({"to_first_audio_ms": 900,
+                "models": {"asr": {"alias": "mock/asr", "answered_by": "cloud/asr-2"}}}))
+        .unwrap(),
+    )));
     sleep(Duration::from_millis(100)).await;
     r.no_notice("Kai: GPU hold");
     r.no_notice("Kai: a fallback answered");
@@ -1604,7 +1611,7 @@ async fn the_hold_badge_and_one_notification_per_hold_period() {
     r.feed.raise(LinkEvent::Hold { active: false });
     let m = r.until(|m| !m.voice.held).await;
     assert_eq!(render(&m).badge, None);
-    r.mock.emit(ServerEvent::Timing(timing));
+    r.mock.emit(ServerEvent::Timing(Box::new(timing)));
     r.notice("Kai: a fallback answered").await;
     r.quit().await;
 }
@@ -1691,9 +1698,7 @@ async fn a_confirmed_re_pair_ends_the_session_bound_on_the_old_gateway() {
     assert!(!r.mock.socket(0, |s| s.closed_by_client), "in its grace");
     assert_eq!(r.mock.with(|s| s.creds.clone()).as_deref(), Some(URL));
     // A link for another gateway arrives and the owner confirms it.
-    let link = crate::pairing::tests::link(&format!(
-        "v=1&url=http%3A%2F%2F127.0.0.1%3A2&name=desktop&key={KEY}"
-    ));
+    let link = crate::pairing::tests::other_at("https://127.0.0.1:2");
     r.send(Command::Arrived(
         crate::pairing::PairingLink::parse(&link).unwrap(),
     ));
@@ -1717,7 +1722,9 @@ async fn a_confirmed_re_pair_ends_the_session_bound_on_the_old_gateway() {
     })
     .await;
     let m = r
-        .until(|m| matches!(&m.pairing, Pairing::Paired { url, .. } if url == "http://127.0.0.1:2"))
+        .until(
+            |m| matches!(&m.pairing, Pairing::Paired { url, .. } if url == "https://127.0.0.1:2"),
+        )
         .await;
     assert!(!m.voice.on);
     assert_eq!(
@@ -1736,7 +1743,7 @@ async fn a_confirmed_re_pair_ends_the_session_bound_on_the_old_gateway() {
     );
     assert_eq!(
         r.mock.with(|s| s.creds.clone()).as_deref(),
-        Some("http://127.0.0.1:2"),
+        Some("https://127.0.0.1:2"),
         "the voice link now holds the new gateway's credentials"
     );
     assert_eq!(

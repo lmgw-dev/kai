@@ -67,7 +67,7 @@ pub enum Caller {
     Owner,
     /// lmgw's own runs on the owner's behalf (the dashboard's threads, in-process agents).
     Gateway,
-    /// Kai's own device key: its voice session and its own requests.
+    /// Kai's own device: its voice session and its own requests.
     Own,
     /// Another device, a client key, an agent, a routine (K28): `kind:name` as the trust lists name
     /// them; `cli` (no name) for a `kai tool` from outside any routine.

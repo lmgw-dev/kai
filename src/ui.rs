@@ -36,8 +36,8 @@ use crate::pairing::{FactLine, PairFacts, PairingLink};
 use crate::settings::window::SettingsWindow;
 
 pub enum UiCmd {
-    /// The paste dialog; `current` is the configured `lmgw.url` (what a pairing would replace). An
-    /// open one is raised and shows its facts against `current`.
+    /// The paste dialog; `current` names the pairing Kai has (its first URL: what a pairing would
+    /// replace). An open one is raised and shows its facts against `current`.
     ShowPairDialog { current: Option<String> },
     /// Ask the owner to confirm a link the scheme handler brought.
     ConfirmPair(ConfirmRequest),
@@ -74,8 +74,10 @@ pub struct ConfirmRequest {
 /// The confirmation dialog's lines, in order.
 pub fn confirm_lines(r: &ConfirmRequest) -> Vec<FactLine> {
     let mut lines = vec![FactLine::Plain(
-        "A pairing link asks Kai to use this gateway with the device key it carries. Pair only if \
-         you just opened the link from lmgw's Devices card; Cancel changes nothing."
+        "A pairing link asks Kai to pair with this gateway: Kai makes a key of its own and enrols \
+         it with the link's one-time token, then you confirm the code Kai shows on lmgw's Devices \
+         card. Pair only if you just opened the link from lmgw's Devices card; Cancel changes \
+         nothing."
             .into(),
     )];
     lines.extend(r.facts.lines());
@@ -129,7 +131,7 @@ pub fn run(
                 UiCmd::ConfirmPair(req) if req.live_accept => {
                     tracing::warn!(
                         id = req.id,
-                        url = %req.facts.url,
+                        urls = ?req.facts.urls,
                         "live-test: the pairing link is confirmed without a dialog (the live \
                          script minted it)"
                     );
@@ -462,10 +464,7 @@ pub fn paste_lines(text: &str, current: Option<&str>) -> (Vec<FactLine>, bool) {
         return (Vec::new(), false);
     }
     match PairingLink::parse(text) {
-        Ok(link) => match crate::pairing::verify_fingerprint(&link) {
-            Ok(()) => (PairFacts::new(&link, current).lines(), true),
-            Err(why) => (vec![FactLine::Warning(why)], false),
-        },
+        Ok(link) => (PairFacts::new(&link, current).lines(), true),
         Err(e) => (vec![FactLine::Warning(e.to_string())], false),
     }
 }
@@ -479,18 +478,19 @@ fn build_paste_dialog(
 
     let intro = line_label(&FactLine::Plain(
         "Paste the pairing link that lmgw shows when you pair a device (Usage → Keys → Devices). \
-         It starts with lmgw-pair: and carries the device key, which Kai keeps only in the wallet. \
-         Check the gateway and the device below before you press Pair. Once paired, Kai clears the \
-         link from the clipboard; Klipper's history may still hold a copy."
+         It starts with lmgw-pair: and carries a one-time token: Kai makes a key of its own, which \
+         stays in the wallet, and enrols it with lmgw. Check the gateway and the device below \
+         before you press Pair, then confirm the code Kai shows on lmgw's Devices card. Once \
+         paired, Kai clears the link from the clipboard; Klipper's history may still hold a copy."
             .into(),
     ));
     intro.set_selectable(false);
 
-    // The link carries a key: masked like a password, so it does not show on a shared screen.
+    // The link carries a token: masked like a password, so it does not show on a shared screen.
     let entry = gtk::Entry::new();
     entry.set_visibility(false);
     entry.set_input_purpose(gtk::InputPurpose::Password);
-    entry.set_placeholder_text(Some("lmgw-pair:?v=1&url=…"));
+    entry.set_placeholder_text(Some("lmgw-pair:?v=2&name=…"));
 
     let facts = gtk::Box::new(gtk::Orientation::Vertical, 6);
     let message = gtk::Label::new(None);
@@ -553,7 +553,7 @@ fn build_paste_dialog(
             return show_error(&message, "Kai is quitting");
         }
         button.set_sensitive(false);
-        message.set_text("Storing the key in the wallet…");
+        message.set_text("Pairing with lmgw…");
         let (w, c, r, button, message, entry) = (
             w.clone(),
             c.clone(),
@@ -616,7 +616,7 @@ fn show_error(label: &gtk::Label, text: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pairing::tests::{KEY, good, link};
+    use crate::pairing::tests::{TOKEN, good};
 
     fn request(current: Option<&str>) -> ConfirmRequest {
         ConfirmRequest {
@@ -631,44 +631,48 @@ mod tests {
     fn the_confirmation_says_what_the_link_does() {
         let lines = confirm_lines(&request(None));
         assert!(matches!(&lines[0], FactLine::Plain(t) if t.contains("Cancel changes nothing")));
+        assert!(matches!(&lines[0], FactLine::Plain(t) if t.contains("confirm the code")));
         assert_eq!(
             lines[1],
-            FactLine::Plain("Gateway: http://127.0.0.1:8001".into())
+            FactLine::Plain("Gateway: https://127.0.0.1:8002".into())
         );
         assert_eq!(lines[2], FactLine::Plain("Device name: desktop".into()));
-        assert_eq!(lines.len(), 3);
-        let lines = confirm_lines(&request(Some("http://gateway.example:8001")));
+        assert!(
+            matches!(&lines[3], FactLine::Plain(t) if t.starts_with("Gateway identity: sha256:"))
+        );
+        assert_eq!(lines.len(), 4);
+        let lines = confirm_lines(&request(Some("https://gateway.example:8002")));
         assert!(
             !format!("{lines:?}").contains("newer pairing link"),
             "no link replaces another (K2-4)"
         );
         assert!(
-            matches!(lines.last(), Some(FactLine::Warning(t)) if t.contains("http://gateway.example:8001"))
+            matches!(lines.last(), Some(FactLine::Warning(t)) if t.contains("https://gateway.example:8002"))
         );
         assert!(
-            !format!("{lines:?}").contains(&KEY[12..]),
-            "the key is never shown"
+            !format!("{lines:?}").contains(&TOKEN[11..]),
+            "the token is never shown"
         );
     }
 
     #[test]
     fn the_paste_dialog_shows_the_facts_before_pair() {
         assert_eq!(paste_lines("  ", None), (vec![], false));
-        let (lines, ok) = paste_lines(&good(), Some("http://old:1"));
+        let (lines, ok) = paste_lines(&good(), Some("https://old:1"));
         assert!(ok);
         assert_eq!(
             lines[0],
-            FactLine::Plain("Gateway: http://127.0.0.1:8001".into())
+            FactLine::Plain("Gateway: https://127.0.0.1:8002".into())
         );
-        assert!(matches!(&lines[2], FactLine::Warning(t) if t.contains("http://old:1")));
-        let (lines, ok) = paste_lines("lmgw-pair:?v=2", None);
+        assert!(matches!(lines.last(), Some(FactLine::Warning(t)) if t.contains("https://old:1")));
+        let (lines, ok) = paste_lines("lmgw-pair:?v=3", None);
         assert!(!ok, "a link that does not parse cannot be paired");
-        assert!(matches!(&lines[0], FactLine::Warning(t) if t.contains("v=2")));
-        let fp = format!("{}&fp=sha256:{}", good(), "0".repeat(64));
-        let (lines, ok) = paste_lines(&fp, None);
-        assert!(!ok && matches!(&lines[0], FactLine::Warning(t) if t.contains("refusing")));
-        let bad = link(&format!("v=1&url=ftp%3A%2F%2Fh&name=n&key={KEY}"));
-        assert!(!format!("{:?}", paste_lines(&bad, None)).contains(&KEY[12..]));
+        assert!(matches!(&lines[0], FactLine::Warning(t) if t.contains("v=3")));
+        let key = "lmgw-device-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let v1 = format!("lmgw-pair:?v=1&url=http%3A%2F%2Fh&name=n&key={key}");
+        let (lines, ok) = paste_lines(&v1, None);
+        assert!(!ok && matches!(&lines[0], FactLine::Warning(t) if t.contains("before TLS")));
+        assert!(!format!("{lines:?}").contains(&key[12..]));
     }
 
     /// Shows the confirmation dialog once on the desktop, checks it mapped with its buttons, and

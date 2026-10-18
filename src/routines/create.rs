@@ -317,14 +317,10 @@ pub async fn run(inner: &Arc<Inner>, local: &Local, dir: &Path, call: &Call) -> 
     let Some(creds) = inner.creds.borrow().clone() else {
         return failed("Kai is not linked to lmgw, so routine_create has no model".into());
     };
-    let Some(client) = inner.client.clone() else {
-        return failed("Kai could not build its HTTP client (see its log)".into());
-    };
     let alias = match &inner.config.routines.create_alias {
         Some(a) => a.clone(),
         None => {
             let conversation = Conversation {
-                client: &client,
                 creds: &creds,
                 folder_name: &inner.config.conversation.folder_name,
                 folder_id: inner.config.conversation.folder_id,
@@ -392,7 +388,7 @@ pub async fn run(inner: &Arc<Inner>, local: &Local, dir: &Path, call: &Call) -> 
         max_turns: inner.config.delegate.max_turns,
         max_turns_key: "delegate.max_turns".into(),
     };
-    let model = LmgwModel::new(client, creds.url.clone(), creds.key.clone(), alias.clone());
+    let model = LmgwModel::new(creds.clone(), alias.clone());
     tracing::info!(caller = %call.caller.describe(), %alias, "routines: routine_create started");
     let answer = kai_delegate::run(
         &CREATE,

@@ -44,6 +44,29 @@ impl<S: SecretStore, L: LmgwLink, A: AudioPort, V: VoiceLink> Core<S, L, A, V> {
         self.apply_request_from(request, settings::Source::Owner)
     }
 
+    /// The confirmation's "always allow" box: the tool runs unasked for trusted callers from now
+    /// on, written as the settings window would. A refusal (the file does not load, it cannot be
+    /// written) is said, since the owner expects no dialog next time.
+    pub(super) fn allow_always(&mut self, tool: &str) {
+        let request = settings::Request::ToolState {
+            tool: tool.to_owned(),
+            state: Some(crate::host::settings::ToolState::AllowTrusted),
+        };
+        match self.apply_request(request) {
+            Ok(_) => tracing::info!(
+                tool,
+                "policy.tools: allow_trusted, from the confirmation's \"always allow\""
+            ),
+            Err(refusal) => {
+                tracing::warn!(tool, "\"always allow\" was not saved: {refusal}");
+                self.notify(
+                    "Kai: \"always allow\" was not saved",
+                    format!("{tool} is still asked about: {refusal}"),
+                );
+            }
+        }
+    }
+
     fn apply_request_from(
         &mut self,
         request: settings::Request,

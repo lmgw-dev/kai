@@ -32,14 +32,10 @@ pub async fn run(
             "Kai is not linked to lmgw, so the routine {name} has no model"
         ));
     };
-    let Some(client) = inner.client.clone() else {
-        return failed("Kai could not build its HTTP client (see its log)".into());
-    };
     let alias = match alias {
         Some(a) => a.to_owned(),
         None => {
             let conversation = Conversation {
-                client: &client,
                 creds: &creds,
                 folder_name: &inner.config.conversation.folder_name,
                 folder_id: inner.config.conversation.folder_id,
@@ -113,7 +109,7 @@ pub async fn run(
         max_turns: inner.config.delegate.max_turns,
         max_turns_key: "delegate.max_turns".into(),
     };
-    let model = LmgwModel::new(client, creds.url.clone(), creds.key.clone(), alias.clone());
+    let model = LmgwModel::new(creds.clone(), alias.clone());
     tracing::info!(routine = name, %alias, "routines: a goal started");
     match kai_delegate::run(
         &def,

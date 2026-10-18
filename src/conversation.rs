@@ -307,6 +307,17 @@ impl Conversation {
         self.after_create = None;
     }
 
+    /// The lookup or create on its way was dropped (the pairing paused for a re-pair, or was
+    /// revoked): no answer comes for it, and the next `hello` looks the folder up again. The folder
+    /// known so far stays.
+    pub fn dropped(&mut self) {
+        if matches!(self.stage, Stage::Looking { .. } | Stage::Creating) {
+            self.stage = Stage::Settled;
+        }
+        self.after_create = None;
+        self.checking = None;
+    }
+
     // ------------------------------------------------------------------ what lmgw says
 
     /// The feed's `hello`: Kai looks its folder up (each connected start). A create on its way is

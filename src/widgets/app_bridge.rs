@@ -1329,13 +1329,12 @@ fn lines(args: &Map<String, Value>) -> Vec<String> {
         .collect()
 }
 
-/// What `overlay_app` needs besides its arguments: the pairing's credentials, the HTTP client, the
-/// owner's dialog, K15's policy and the bounds. The views shown for a call in Kai's conversation
+/// What `overlay_app` needs besides its arguments: the pairing's credentials (the HTTP client is
+/// theirs, the device link's), the owner's dialog, K15's policy and the bounds. The views shown for a call in Kai's conversation
 /// (`super::thread_apps`) open through it too.
 #[derive(Clone)]
 pub struct Apps {
     pub creds: watch::Receiver<Option<Credentials>>,
-    pub client: reqwest::Client,
     /// `lmgw.timeout_s`, for connecting.
     pub connect: std::time::Duration,
     pub bound: Bound,
@@ -1418,10 +1417,9 @@ impl Apps {
         let Some(creds) = self.creds.borrow().clone() else {
             return Err("overlay_app: Kai is not paired with lmgw".into());
         };
-        let session =
-            McpSession::open(self.client.clone(), creds, self.connect, self.bound.clone())
-                .await
-                .map_err(|e| format!("overlay_app: {}", e.text()))?;
+        let session = McpSession::open(creds, self.connect, self.bound.clone())
+            .await
+            .map_err(|e| format!("overlay_app: {}", e.text()))?;
         // Dropped from here on (this open cancelled: the show's deadline, the call's), the session
         // ends itself (`McpSession`'s drop sends the DELETE).
         Ok(Arc::new(session))

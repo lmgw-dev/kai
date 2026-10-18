@@ -402,6 +402,54 @@ async fn open_in_lmgw_opens_the_threads_dashboard_page() {
     r.quit().await;
 }
 
+/// The owner's decision (2026-10-15): Open in lmgw opens the dashboard address lmgw sends in the
+/// feed's `hello` (lmgw's device link §7.2), and no setting names it. lmgw sends none to a device
+/// that is not this computer while its dashboard listens on loopback: Open in lmgw says it is
+/// reachable on lmgw's own machine only. An address that is no web address opens nothing.
+#[tokio::test(start_paused = true)]
+async fn open_in_lmgw_follows_the_dashboard_lmgw_sends() {
+    let mut r = rig("").await;
+    for (dashboard, summary, says) in [
+        (
+            None,
+            "Kai: lmgw's dashboard is not reachable from here",
+            "lmgw's dashboard is only reachable on lmgw's own machine",
+        ),
+        (
+            Some("file:///etc/passwd"),
+            "Kai: Open in lmgw",
+            "does not read as a web address (the scheme must be http or https)",
+        ),
+    ] {
+        r.feed
+            .raise(LinkEvent::Device(crate::lmgw_link::DeviceFacts {
+                urls: None,
+                cert: None,
+                dashboard: dashboard.map(str::to_owned),
+            }));
+        // The link's events and the commands come on channels of their own.
+        sleep(Duration::from_millis(50)).await;
+        r.send(Command::OpenInLmgw);
+        let n = r.notice(summary).await;
+        assert!(n.body.contains(says), "{}", n.body);
+        assert!(r.opened.try_recv().is_err(), "nothing opened");
+    }
+    // Another address in the next hello: opened there.
+    r.feed
+        .raise(LinkEvent::Device(crate::lmgw_link::DeviceFacts {
+            urls: None,
+            cert: None,
+            dashboard: Some("http://198.51.100.20:8787/".into()),
+        }));
+    sleep(Duration::from_millis(50)).await;
+    r.send(Command::OpenInLmgw);
+    assert_eq!(
+        r.opened.recv().await.unwrap(),
+        "http://198.51.100.20:8787/chat?t=812"
+    );
+    r.quit().await;
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_401_on_current_says_pair_again_with_the_servers_words() {
     let mut r = rig("").await;

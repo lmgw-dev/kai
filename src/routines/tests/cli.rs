@@ -1,6 +1,6 @@
 //! The CLI over a socket under target/: a script's call (a peer in a routine's scope) reaches K15
 //! as the routine, a terminal's is the caller `cli`; the socket's mode; arguments by type; a
-//! client that goes cancels its call; `kai model` through Kai's key.
+//! client that goes cancels its call; `kai model` through Kai's pairing.
 
 use std::os::unix::fs::PermissionsExt;
 
@@ -27,7 +27,6 @@ pub(super) fn serve(
     let backend = Backend {
         local: rig.local.clone(),
         creds: rig.creds.subscribe(),
-        client: Some(reqwest::Client::builder().no_proxy().build().unwrap()),
         cgroup_of,
         scopes: rig.scopes.clone(),
     };
@@ -309,10 +308,10 @@ async fn a_client_that_goes_cancels_its_call() {
 }
 
 #[tokio::test]
-async fn kai_model_asks_lmgw_under_kais_key() {
+async fn kai_model_asks_lmgw_as_kais_device() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let lmgw = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}", lmgw.local_addr().unwrap());
+    let lmgw = crate::lmgw_link::test_pki::Gateway::bind().await;
+    let url = lmgw.url.clone();
     let fake = tokio::spawn(async move {
         let (mut s, _) = lmgw.accept().await.unwrap();
         let mut got = Vec::new();
@@ -373,8 +372,10 @@ async fn kai_model_asks_lmgw_under_kais_key() {
     assert_eq!(a.notes, ["(model: gemma, answered by cloud/x)"]);
     let sent = fake.await.unwrap();
     assert!(sent.starts_with("POST /v1/chat/completions"), "{sent}");
-    let key = DeviceKey::parse(KEY).unwrap();
-    assert!(sent.contains(&format!("Bearer {}", key.expose())));
+    assert!(
+        !sent.to_ascii_lowercase().contains("authorization"),
+        "the device's certificate authenticates it: {sent}"
+    );
     let body: Value = serde_json::from_str(sent.split_once("\r\n\r\n").unwrap().1).unwrap();
     assert_eq!(body["model"], "gemma");
     assert_eq!(body["messages"][0]["content"], "2+2?");
@@ -382,7 +383,7 @@ async fn kai_model_asks_lmgw_under_kais_key() {
 }
 
 /// The log names the operation, the tool or alias and the caller: never an argument, a prompt, an
-/// answer or the key.
+/// answer or a credential.
 #[test]
 fn a_trace_log_carries_nothing_private() {
     let _ = tracing_log::LogTracer::init();
@@ -439,8 +440,7 @@ fn a_trace_log_carries_nothing_private() {
     for want in ["cli: a tool call", "cli: a model call", "host: answered"] {
         assert!(text.contains(want), "'{want}' missing: {text}");
     }
-    let secret = &KEY["lmgw-device-".len()..];
-    for private in [secret, "ARG-4711", "PROMPT-0815", "ANSWER-31337"] {
+    for private in ["PRIVATE KEY", "ARG-4711", "PROMPT-0815", "ANSWER-31337"] {
         assert!(!text.contains(private), "{private} is in the log");
     }
 }

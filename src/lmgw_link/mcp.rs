@@ -1,6 +1,7 @@
 //! Kai's own MCP client of lmgw's `/mcp` (api §7, WP12): the MCP Apps bridge's `resources/read`
-//! and `tools/call`, under Kai's device key, so lmgw's scope for that key decides what Kai reaches
-//! (a tool out of scope is lmgw's `-32601`, a resource out of reach its `-32002`, each with why).
+//! and `tools/call`, as Kai's device over the device link, so lmgw's scope for the device decides
+//! what Kai reaches (a tool out of scope is lmgw's `-32601`, a resource out of reach its `-32002`,
+//! each with why).
 //!
 //! - **One session per view** ([`McpSession::open`]): `initialize` declares the MCP Apps
 //!   extension (`capabilities.extensions["io.modelcontextprotocol/ui"]`), without which `/mcp`
@@ -15,9 +16,9 @@
 //!   answer: lmgw bounds each server by its row's `timeout_ms`, and the caller's own deadline (the
 //!   tool call's, the view's hide) drops the request.
 //! - **Errors:** a JSON-RPC error lmgw answers (its own or a server's, passed on with its code) is
-//!   [`McpError::Rpc`]; anything else (unreachable, a refusal of the key, an answer that does not
-//!   read or is too large) is [`McpError::Link`] in Kai's words. Neither carries the key; no
-//!   request or answer is logged.
+//!   [`McpError::Rpc`]; anything else (unreachable, a refusal of the device, an answer that does
+//!   not read or is too large) is [`McpError::Link`] in Kai's words. No request or answer is
+//!   logged.
 
 use std::sync::Mutex;
 use std::time::Duration;
@@ -67,7 +68,6 @@ pub struct Bound {
 
 /// One session with `/mcp`.
 pub struct McpSession {
-    client: reqwest::Client,
     creds: Credentials,
     connect: Duration,
     bound: Bound,
@@ -92,7 +92,9 @@ impl Drop for McpSession {
             return;
         };
         let req = self
-            .authorized(self.client.delete(self.url()))
+            .creds
+            .http()
+            .delete(self.url())
             .header("Mcp-Session-Id", session.as_str());
         let connect = self.connect;
         rt.spawn(async move {
@@ -107,7 +109,7 @@ impl std::fmt::Debug for McpSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Never the key.
         f.debug_struct("McpSession")
-            .field("url", &self.creds.url)
+            .field("url", &self.creds.url())
             .finish_non_exhaustive()
     }
 }
@@ -125,13 +127,11 @@ enum Answer {
 impl McpSession {
     /// Opens a session as an MCP Apps host. `connect` is `lmgw.timeout_s`.
     pub async fn open(
-        client: reqwest::Client,
         creds: Credentials,
         connect: Duration,
         bound: Bound,
     ) -> Result<McpSession, McpError> {
         let s = McpSession {
-            client,
             creds,
             connect,
             bound,
@@ -226,7 +226,7 @@ impl McpSession {
         if session.is_empty() {
             return;
         }
-        let req = self.authorized(self.client.delete(self.url()));
+        let req = self.creds.http().delete(self.url());
         let sent = tokio::time::timeout(
             self.connect,
             req.header("Mcp-Session-Id", session.as_str()).send(),
@@ -238,22 +238,7 @@ impl McpSession {
     }
 
     fn url(&self) -> String {
-        format!("{}{PATH}", self.creds.url.trim_end_matches('/'))
-    }
-
-    fn authorized(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        let h = requests::Header {
-            name: "Authorization".into(),
-            value: format!("Bearer {}", self.creds.key.expose()),
-        };
-        match super::header(&h) {
-            Ok((name, value)) => rb.header(name, value),
-            // `header` names the header, never the value; the request then fails as unauthorized.
-            Err(e) => {
-                tracing::warn!("mcp: {e}");
-                rb
-            }
-        }
+        format!("{}{PATH}", self.creds.url().trim_end_matches('/'))
     }
 
     /// POSTs one JSON-RPC message; the answer and the session id lmgw set.
@@ -263,7 +248,9 @@ impl McpSession {
         session: Option<&str>,
     ) -> Result<(Answer, Option<String>), McpError> {
         let mut rb = self
-            .authorized(self.client.post(self.url()))
+            .creds
+            .http()
+            .post(self.url())
             .header("Content-Type", "application/json")
             .header("Accept", "application/json, text/event-stream")
             .body(body.to_string());
@@ -279,10 +266,13 @@ impl McpSession {
             if e.is_connect() || e.is_timeout() {
                 McpError::Link(format!(
                     "lmgw is not reachable within {secs} s (lmgw.timeout_s): {}",
-                    describe(&e)
+                    super::tls::why(&e)
                 ))
             } else {
-                McpError::Link(format!("lmgw's /mcp did not answer: {}", describe(&e)))
+                McpError::Link(format!(
+                    "lmgw's /mcp did not answer: {}",
+                    super::tls::why(&e)
+                ))
             }
         })?;
         let status = resp.status().as_u16();
@@ -380,14 +370,16 @@ fn result(mut m: Value) -> Result<Value, McpError> {
 
 #[cfg(test)]
 pub(crate) mod fake {
-    //! A loopback `/mcp` for the tests: one JSON-RPC message per POST, answered by a closure;
-    //! every request kept (method, params, the session header, the bearer).
+    //! A loopback `/mcp` for the tests behind the tests' device listener
+    //! (`crate::lmgw_link::test_pki`): one JSON-RPC message per POST, answered by a closure; every
+    //! request kept (method, params, the session header, an Authorization header should one come).
 
     use std::sync::{Arc, Mutex};
 
     use serde_json::{Value, json};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
+
+    use crate::lmgw_link::test_pki::Gateway;
 
     /// One request as the fake saw it.
     #[derive(Debug, Clone)]
@@ -445,15 +437,16 @@ pub(crate) mod fake {
     }
 
     pub async fn serve(answer: Answer) -> Fake {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let listener = Gateway::bind().await;
+        let url = listener.url.clone();
         let seen: Arc<Mutex<Vec<Seen>>> = Arc::default();
         let sessions = Arc::new(Mutex::new(0u32));
         let (log, counter) = (seen.clone(), sessions.clone());
         let task = tokio::spawn(async move {
             loop {
+                // A handshake that failed (a client that went) ends only its connection.
                 let Ok((mut sock, _)) = listener.accept().await else {
-                    return;
+                    continue;
                 };
                 let (log, counter, answer) = (log.clone(), counter.clone(), answer.clone());
                 tokio::spawn(async move {
@@ -557,7 +550,7 @@ pub(crate) mod fake {
             }
         });
         Fake {
-            url: format!("http://127.0.0.1:{port}"),
+            url,
             seen,
             sessions,
             task,
@@ -573,17 +566,7 @@ mod tests {
 
     use super::fake::{Reply, serve};
     use super::*;
-    use crate::pairing::DeviceKey;
-
-    const KEY: &str =
-        "lmgw-device-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-
-    fn creds(url: &str) -> Credentials {
-        Credentials {
-            url: url.to_owned(),
-            key: DeviceKey::from_store(KEY.into()),
-        }
-    }
+    use crate::lmgw_link::test_pki::creds;
 
     fn bound(bytes: u64) -> Bound {
         Bound {
@@ -593,17 +576,11 @@ mod tests {
     }
 
     async fn open(url: &str, b: u64) -> Result<McpSession, McpError> {
-        McpSession::open(
-            reqwest::Client::builder().no_proxy().build().unwrap(),
-            creds(url),
-            Duration::from_secs(5),
-            bound(b),
-        )
-        .await
+        McpSession::open(creds(url), Duration::from_secs(5), bound(b)).await
     }
 
     #[tokio::test]
-    async fn a_session_declares_the_apps_extension_under_kais_key() {
+    async fn a_session_declares_the_apps_extension_as_kais_device() {
         let f = serve(Arc::new(|m, p| match m {
             "tools/list" => Reply::Ok(json!({"tools": []})),
             "resources/read" if p["uri"] == "ui://fx__a/b" => {
@@ -648,11 +625,10 @@ mod tests {
         assert_eq!(seen[0].session, None);
         assert!(seen[1..].iter().all(|s| s.session.as_deref() == Some("s1")));
         assert!(
-            seen.iter()
-                .all(|s| s.bearer.as_deref() == Some(&*format!("Bearer {KEY}")))
+            seen.iter().all(|s| s.bearer.is_none()),
+            "the device's certificate authenticates it"
         );
         assert_eq!(seen[4].http, "DELETE");
-        assert!(!format!("{s:?}").contains(KEY), "no key in Debug");
     }
 
     #[tokio::test]
@@ -755,7 +731,7 @@ mod tests {
             let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             l.local_addr().unwrap().port()
         };
-        let e = open(&format!("http://127.0.0.1:{port}"), 1 << 20)
+        let e = open(&format!("https://127.0.0.1:{port}"), 1 << 20)
             .await
             .unwrap_err();
         assert!(
@@ -763,7 +739,6 @@ mod tests {
             "{}",
             e.text()
         );
-        assert!(!e.text().contains(KEY));
     }
 
     #[test]

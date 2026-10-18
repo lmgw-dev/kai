@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 pub struct Paths {
     /// `$XDG_CONFIG_HOME/kai/config.toml`
     pub config_file: PathBuf,
+    /// `$XDG_CONFIG_HOME/kai/device-link.json`: the pairing's public data (`crate::pairing::Paired`).
+    pub device_link_file: PathBuf,
     /// `$XDG_CONFIG_HOME/autostart/dev.rootshell.kai.desktop` ("Start with Plasma", §13)
     pub autostart_file: PathBuf,
     /// `$XDG_STATE_HOME/kai`: Kai's state (the AEC record, the portal's restore token).
@@ -33,6 +35,7 @@ impl Paths {
     pub fn under_config_home(config_home: &Path) -> Self {
         Self {
             config_file: config_home.join("kai").join("config.toml"),
+            device_link_file: config_home.join("kai").join("device-link.json"),
             autostart_file: config_home
                 .join("autostart")
                 .join(format!("{}.desktop", crate::APP_ID)),

@@ -3,6 +3,10 @@
 //! in as the notification server's `ActionInvoked` would, in tokio's paused time. The real feed's
 //! requests (`FeedUpdates`) run against a minimal HTTP server on loopback.
 
+// The updater's own requests (to a loopback feed), never lmgw's: device link D15's rule
+// (`clippy.toml`) is lmgw's connections'.
+#![allow(clippy::disallowed_methods)]
+
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
@@ -102,6 +106,8 @@ struct Said {
 struct FakeDesk {
     next: Mutex<u32>,
     said: UnboundedSender<Said>,
+    /// The notifications the updater closed, in order.
+    closed: Arc<Mutex<Vec<Shown>>>,
 }
 
 impl Desk for FakeDesk {
@@ -122,6 +128,9 @@ impl Desk for FakeDesk {
         });
         Some(shown)
     }
+    async fn close(&self, shown: &Shown) {
+        self.closed.lock().unwrap().push(shown.clone());
+    }
 }
 
 struct Rig {
@@ -130,6 +139,7 @@ struct Rig {
     actions: UnboundedSender<Invoked>,
     said: UnboundedReceiver<Said>,
     cmds: UnboundedReceiver<Command>,
+    closed: Arc<Mutex<Vec<Shown>>>,
     dest: PathBuf,
     _dir: tempfile::TempDir,
 }
@@ -151,9 +161,11 @@ fn rig_with(feed: Result<FakeFeed, String>, background_check: bool) -> Rig {
     let (cmds_tx, cmds) = unbounded_channel();
     let (requests, requests_rx) = unbounded_channel();
     let (actions, actions_rx) = unbounded_channel();
+    let closed = Arc::new(Mutex::new(Vec::new()));
     let desk = FakeDesk {
         next: Mutex::new(0),
         said: said_tx,
+        closed: closed.clone(),
     };
     let fake = feed.clone().unwrap_or_else(|_| FakeFeed::new(true));
     tokio::spawn(
@@ -165,6 +177,7 @@ fn rig_with(feed: Result<FakeFeed, String>, background_check: bool) -> Rig {
         actions,
         said,
         cmds,
+        closed,
         dest,
         _dir: dir,
     }
@@ -184,6 +197,9 @@ impl Rig {
     /// Lets everything that is ready run, in paused time.
     async fn settle(&self) {
         tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    fn closed(&self) -> Vec<Shown> {
+        self.closed.lock().unwrap().clone()
     }
     fn nothing_said(&mut self) {
         assert!(self.said.try_recv().is_err(), "no notification expected");
@@ -487,11 +503,67 @@ async fn the_tray_check_always_answers() {
     let e = r.tray_check().await;
     assert_eq!(e.note.summary, "Kai couldn't check for updates");
     assert_eq!(e.note.body, "HTTP status client error (401 Unauthorized)");
+    assert_eq!(e.replaces, None, "the tray's answer shows fresh");
+    assert_eq!(r.closed(), [s.shown], "after closing the last one");
+}
+
+/// A tray check pops up even when the background's offer already expired into the history: the
+/// offer is closed and the answer is a new notification, which the buttons then belong to.
+#[tokio::test(start_paused = true)]
+async fn a_tray_check_closes_the_background_offer_and_shows_fresh() {
+    let mut r = rig(true);
+    r.feed.answer(Ok(Some(info("0.1.0+9", ""))));
+    r.feed.answer(Ok(Some(info("0.1.0+9", ""))));
+    let background = r.said().await;
+    assert_eq!(background.replaces, None);
+    assert!(r.closed().is_empty());
+
+    let tray = r.tray_check().await;
+    assert_eq!(tray.note.actions, [INSTALL, LATER]);
+    assert_eq!(tray.replaces, None, "fresh, not a replacement");
+    assert_eq!(r.closed(), std::slice::from_ref(&background.shown));
+
+    r.click(&background.shown, "install");
+    r.settle().await;
+    r.nothing_said();
     assert_eq!(
-        e.replaces,
-        Some(s.shown),
-        "an outcome takes the place of the last one"
+        r.feed.log().len(),
+        2,
+        "the closed offer's button is ignored"
     );
+    r.click(&tray.shown, "install");
+    let installing = r.said().await;
+    assert_eq!(installing.note.summary, "Installing Kai 0.1.0+9");
+    assert_eq!(
+        installing.replaces,
+        Some(tray.shown),
+        "an action's follow-up replaces in place"
+    );
+}
+
+/// The background's repeat stays quiet: in place, nothing closed.
+#[tokio::test(start_paused = true)]
+async fn a_background_repeat_replaces_in_place() {
+    let mut r = rig(true);
+    r.feed.answer(Ok(Some(info("0.1.0+9", ""))));
+    r.feed.answer(Ok(Some(info("0.1.0+9", ""))));
+    let first = r.said().await;
+    tokio::time::sleep(Duration::from_secs(6 * 60 * 60)).await;
+    let second = r.said().await;
+    assert_eq!(second.replaces, Some(first.shown));
+    assert!(r.closed().is_empty());
+}
+
+/// An "up to date" answer after an earlier note closes it and shows fresh.
+#[tokio::test(start_paused = true)]
+async fn a_tray_up_to_date_after_an_earlier_note_closes_it_and_shows_fresh() {
+    let mut r = rig_with(Ok(FakeFeed::new(true)), false);
+    r.feed.answer(Ok(Some(info("0.1.0+9", ""))));
+    let offer = r.tray_check().await;
+    let latest = r.tray_check().await;
+    assert_eq!(latest.note.summary, "Kai is up to date");
+    assert_eq!(latest.replaces, None);
+    assert_eq!(r.closed(), [offer.shown]);
 }
 
 /// The whole flow: offered, Install, the download to the fixed path, the install that found it, the

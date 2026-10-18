@@ -1,8 +1,8 @@
 //! What a request to `kai://…` in the window's context gets, as a function of the request alone
 //! (no GTK, no core): the page's files, `GET /api/tools`, `POST /api/apply`, which hands the
 //! operation to the core, `GET /api/conversation` (the core's facts about Kai's conversation), and
-//! the profile editor's requests to lmgw under `/lmgw/` (`profiles`), which the core forwards with
-//! the device key, and the remote-control permission (`remote`: `GET /api/remote-control`, `POST
+//! the profile editor's requests to lmgw under `/lmgw/` (`profiles`), which the core forwards over
+//! the device link, and the remote-control permission (`remote`: `GET /api/remote-control`, `POST
 //! /api/remote-control/forget`), which the core looks at or forgets. Anything else is refused. The window's WebContext serves this scheme and nothing
 //! else, so the page reaches Kai, and through it lmgw, through these things only.
 //!
@@ -86,7 +86,7 @@ pub enum Routed {
     Apply(Request),
     /// The core's facts about Kai's conversation ([`profiles::Conversation`]).
     Conversation,
-    /// A profile-editor request the core sends to lmgw with the device key; lmgw's answer is the
+    /// A profile-editor request the core sends to lmgw over the device link; lmgw's answer is the
     /// page's.
     Proxy(Forward),
     /// The remote-control permission (`remote`): looked at, or forgotten (`forget`).

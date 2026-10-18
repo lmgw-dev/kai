@@ -284,6 +284,9 @@ impl FeedUpdates {
     /// The system's proxy settings apply: the feed is a registry, not the gateway. A feed with a
     /// token follows redirects only within the origin they start from ([`same_origin_redirects`]),
     /// one without follows them to any origin ([`any_origin_redirects`]).
+    // Kai's release feed and its downloads, never lmgw: device link D15's rule (`clippy.toml`) is
+    // lmgw's connections'.
+    #[allow(clippy::disallowed_methods)]
     pub fn new(feed: Feed, timeout: Duration) -> Result<Self, String> {
         Self::with(reqwest::Client::builder(), feed, timeout)
     }
@@ -443,6 +446,10 @@ pub trait Desk: Send + Sync + 'static {
         note: Note,
         replaces: Option<Shown>,
     ) -> impl Future<Output = Option<Shown>> + Send;
+
+    /// Closes `shown`, which also takes it out of the notification history. Best effort: one the
+    /// server no longer knows, or a failed call, is logged and changes nothing.
+    fn close(&self, shown: &Shown) -> impl Future<Output = ()> + Send;
 }
 
 /// The desktop's notification server.
@@ -463,6 +470,31 @@ impl Desk for BusDesk {
             self.timeout,
         )
         .await
+    }
+
+    async fn close(&self, shown: &Shown) {
+        crate::notify::close(&self.bus, shown, self.timeout).await;
+    }
+}
+
+/// Where a notification of the updater goes: in the place of the last one, or as a new one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Place {
+    /// In the place of the last one, quietly: a background check's repeat, an action's follow-up.
+    Replace,
+    /// The last one is closed first and this one shows fresh. A notification that replaces one
+    /// that already expired into the history changes the entry there and pops up nothing, so the
+    /// answer to a tray click would go unseen.
+    Fresh,
+}
+
+impl Place {
+    /// The tray's answer always pops up; the background's is quiet.
+    fn of(origin: Origin) -> Self {
+        match origin {
+            Origin::Tray => Self::Fresh,
+            Origin::Background => Self::Replace,
+        }
     }
 }
 
@@ -601,7 +633,7 @@ impl<U: Updates, D: Desk> Updater<U, D> {
                         (None, Ok(u)) => check = Some((Origin::Tray, self.checking(u.clone()))),
                         (None, Err(why)) => {
                             let why = why.clone();
-                            self.say("Kai cannot check for updates", why, &[]).await;
+                            self.say(Place::Fresh, "Kai cannot check for updates", why, &[]).await;
                         }
                     },
                 },
@@ -647,18 +679,20 @@ impl<U: Updates, D: Desk> Updater<U, D> {
 
     async fn on_checked(&mut self, origin: Origin, result: Result<Option<UpdateInfo>, String>) {
         let tray = origin == Origin::Tray;
+        let place = Place::of(origin);
         match result {
             Err(e) => {
                 tracing::warn!("update check failed: {e}");
                 if tray {
-                    self.say("Kai couldn't check for updates", e, &[]).await;
+                    self.say(place, "Kai couldn't check for updates", e, &[])
+                        .await;
                 }
             }
             Ok(None) => {
                 tracing::info!("update check: up to date ({})", self.current);
                 if tray {
                     let body = format!("Kai {} is the latest version.", self.current);
-                    self.say("Kai is up to date", body, &[]).await;
+                    self.say(place, "Kai is up to date", body, &[]).await;
                 }
             }
             Ok(Some(info)) => self.found(origin, info).await,
@@ -667,12 +701,14 @@ impl<U: Updates, D: Desk> Updater<U, D> {
 
     async fn found(&mut self, origin: Origin, info: UpdateInfo) {
         let tray = origin == Origin::Tray;
+        let place = Place::of(origin);
         let v = info.manifest.version.clone();
         if let Stage::Installing { version } = &self.stage {
             tracing::info!("update check: Kai {v} is available; Kai {version} is being installed");
             if tray {
                 let body = format!("Kai {version} is being installed.");
-                self.say("Kai is installing an update", body, &[]).await;
+                self.say(place, "Kai is installing an update", body, &[])
+                    .await;
             }
             return;
         }
@@ -684,7 +720,7 @@ impl<U: Updates, D: Desk> Updater<U, D> {
                 "update check: Kai {version} is installed; Kai restarts into it on Restart"
             );
             if tray {
-                self.say_installed(version).await;
+                self.say_installed(place, version).await;
             }
             return;
         }
@@ -710,7 +746,7 @@ impl<U: Updates, D: Desk> Updater<U, D> {
                      installed it, e.g. rebuild from source (git pull, then cargo build --release).",
                     self.current
                 );
-                self.say("Kai update available", body, &[]).await;
+                self.say(place, "Kai update available", body, &[]).await;
             }
             return;
         }
@@ -721,16 +757,16 @@ impl<U: Updates, D: Desk> Updater<U, D> {
             self.current
         );
         if let Some(note) = self
-            .say("Kai update available", body, &[INSTALL, LATER])
+            .say(place, "Kai update available", body, &[INSTALL, LATER])
             .await
         {
             self.stage = Stage::Offered { info, note };
         }
     }
 
-    /// The installed version's notification, with Restart, in the place of an earlier one of its
-    /// own; the next outcome does not take its place.
-    async fn say_installed(&mut self, version: String) {
+    /// The installed version's notification, with Restart, per `place` relative to an earlier one
+    /// of its own; the next outcome does not take its place.
+    async fn say_installed(&mut self, place: Place, version: String) {
         let note = Note {
             summary: format!("Updated to Kai {version}"),
             body: "Restart Kai to use the new version.".to_owned(),
@@ -742,7 +778,7 @@ impl<U: Updates, D: Desk> Updater<U, D> {
             .take()
             .and_then(|i| i.note)
             .or_else(|| self.said.take());
-        let note = self.desk.show(note, earlier).await;
+        let note = self.put(place, note, earlier).await;
         self.installed = Some(Installed { version, note });
     }
 
@@ -797,6 +833,7 @@ impl<U: Updates, D: Desk> Updater<U, D> {
             version: version.clone(),
         };
         self.say(
+            Place::Replace,
             format!("Installing Kai {version}"),
             "Kai downloads the update, then asks for your password to install the package."
                 .to_owned(),
@@ -831,22 +868,39 @@ impl<U: Updates, D: Desk> Updater<U, D> {
         match result {
             Ok(()) => {
                 tracing::info!("update: Kai {version} is installed");
-                self.say_installed(version).await;
+                self.say_installed(Place::Replace, version).await;
             }
             Err((step, e)) => {
                 tracing::error!(
                     "update: {} of Kai {version} failed: {e}",
                     step.to_lowercase()
                 );
-                self.say("Kai's update failed", format!("{step} failed: {e}"), &[])
-                    .await;
+                self.say(
+                    Place::Replace,
+                    "Kai's update failed",
+                    format!("{step} failed: {e}"),
+                    &[],
+                )
+                .await;
             }
         }
     }
 
-    /// Shows a notification in the place of the updater's last one.
+    /// Shows `note` per `place`, relative to `earlier`: the updater's notification it follows.
+    async fn put(&self, place: Place, note: Note, earlier: Option<Shown>) -> Option<Shown> {
+        match (place, earlier) {
+            (Place::Fresh, Some(earlier)) => {
+                self.desk.close(&earlier).await;
+                self.desk.show(note, None).await
+            }
+            (_, earlier) => self.desk.show(note, earlier).await,
+        }
+    }
+
+    /// Shows a notification per `place` relative to the updater's last one.
     async fn say(
         &mut self,
+        place: Place,
         summary: impl Into<String>,
         body: String,
         actions: &'static [Action],
@@ -856,7 +910,8 @@ impl<U: Updates, D: Desk> Updater<U, D> {
             body,
             actions,
         };
-        let shown = self.desk.show(note, self.said.take()).await;
+        let earlier = self.said.take();
+        let shown = self.put(place, note, earlier).await;
         self.said = shown.clone();
         shown
     }

@@ -59,8 +59,10 @@ async fn a_goal_runs_the_delegate_loop_with_its_tools_as_the_routines_calls() {
     assert_eq!(rig.ran.all(), ["echo by routine 'greet_goal': hi"]);
     let sent = lmgw.completions();
     assert_eq!(sent.len(), 2);
-    let key = DeviceKey::parse(KEY).unwrap();
-    assert_eq!(sent[0].auth, format!("Bearer {}", key.expose()));
+    assert_eq!(
+        sent[0].auth, "",
+        "the device's certificate authenticates it"
+    );
     let body: serde_json::Value = serde_json::from_str(&sent[0].body).unwrap();
     assert_eq!(body["model"], "gemma", "the Kai conversation's alias");
     let system = body["messages"][0]["content"].as_str().unwrap();

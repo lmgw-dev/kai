@@ -7,6 +7,10 @@
 //! closing). From WP19 a thread call carrying `lmgw/approval` is decided by F; the dialog stays for
 //! callers without F.
 //!
+//! A trusted caller's dialog ends with an "always allow" box (`server::Shared::always_option`): a
+//! [`DialogOption`] like the tools' own, which the host reads after Allow and hands to the core,
+//! which sets `policy.tools.<tool> = "allow_trusted"`.
+//!
 //! The arguments are scrolled, never shortened: their part of the dialog is at most as tall as the
 //! smallest monitor's workarea leaves beside the rest of the dialog and a held MCP Apps view's strip
 //! above and below ([`args_max_height`]), and the buttons stay outside it. What the dialog does is [`DialogModel`], tested here without a display;

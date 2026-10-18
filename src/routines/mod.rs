@@ -102,7 +102,6 @@ pub struct Inner {
     pub(crate) policy: SharedPolicy,
     pub(crate) confirmer: Arc<dyn Confirmer>,
     pub(crate) creds: tokio_watch::Receiver<Option<Credentials>>,
-    pub(crate) client: Option<reqwest::Client>,
     /// The configuration as read at the start (the conversation's folder, `lmgw.timeout_s`,
     /// `delegate.max_turns`, `routines.create_alias`); the switches are read live ([`State`]).
     pub(crate) config: Arc<Config>,
@@ -180,22 +179,6 @@ pub fn provider(deps: &Deps) -> Routines {
     };
     #[cfg(test)]
     let (dir, publish) = (None, false);
-    let timeout = deps.config.lmgw.timeout();
-    let client = match reqwest::Client::builder()
-        .no_proxy()
-        .connect_timeout(timeout)
-        .build()
-    {
-        Ok(c) => Some(c),
-        Err(e) => {
-            tracing::error!(
-                "routines: cannot build the HTTP client: {}; goals, routine_create and kai model \
-                 will fail",
-                crate::lmgw_link::describe(&e)
-            );
-            None
-        }
-    };
     Routines::new(Inner {
         dir,
         state: RwLock::new(State {
@@ -209,7 +192,6 @@ pub fn provider(deps: &Deps) -> Routines {
         policy: deps.policy.clone(),
         confirmer: Arc::new(Dialog(deps.ui.clone())),
         creds: deps.creds.clone(),
-        client,
         config: deps.config.clone(),
         drafting: Default::default(),
     })
@@ -981,7 +963,6 @@ pub async fn serve(local: Local, rt: Runtime, socket: PathBuf, timeout: Duration
         crate::cli::server::Backend {
             local: local.clone(),
             creds: inner.creds.clone(),
-            client: inner.client.clone(),
             cgroup_of: crate::cli::server::proc_cgroup,
             scopes,
         },

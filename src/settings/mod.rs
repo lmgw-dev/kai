@@ -17,7 +17,7 @@
 //! and spacing stay) and [`crate::config::write_atomically`] puts it in place atomically and
 //! durably. Nothing is written if the result does not load.
 //!
-//! **Secrets** (keys, tokens, passwords) are not in the configuration: the device key lives in the
+//! **Secrets** (keys, tokens, passwords) are not in the configuration: the device's key lives in the
 //! Secret Service. A key whose name says it would be one is neither read, listed nor written
 //! ([`secret_key`]); `a_default_configuration_holds_no_secret` is the tripwire for a future one.
 //!
@@ -166,7 +166,8 @@ fn refuse<T>(why: impl Into<String>) -> Result<T, Refusal> {
     Err(Refusal(why.into()))
 }
 
-/// Keys Kai's own flows write; setting them by hand would unpair or misdirect it.
+/// Keys Kai's own flows write; setting them by hand would unpair or misdirect it (`lmgw.url`: a
+/// pairing from before TLS, which the next pairing removes).
 const PAIRING_KEYS: &[&str] = &["lmgw.url"];
 
 /// Words in a key's name that make it a secret.
@@ -365,13 +366,13 @@ fn writable(key: &str) -> Result<(&str, &str), Refusal> {
     if secret_key(key) {
         return refuse(format!(
             "{key}: keys, tokens and passwords are not part of the configuration; Kai keeps its \
-             device key in the Secret Service and never reads or writes it here"
+             device's key in the Secret Service and never reads or writes it here"
         ));
     }
     if PAIRING_KEYS.contains(&key) {
         return refuse(format!(
-            "{key} is written by pairing (it selects which Secret Service item holds the key); pair \
-             Kai with the other gateway instead"
+            "{key} is written by pairing (by a pairing from before TLS; a pairing lives in \
+             device-link.json and the Secret Service now); pair Kai from the tray instead"
         ));
     }
     Ok((table, leaf))

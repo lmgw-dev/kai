@@ -1,0 +1,12 @@
+# lmgw's device link D15: every connection Kai makes to lmgw is built from one pinned configuration,
+# `lmgw_link::tls::Tls` (its module doc). Building an HTTP client or a WebSocket connection anywhere
+# else is refused here; the few that are not lmgw's say why with an `#[allow]` (the widgets' fetch
+# of web images, the updater's feed and downloads, the live tests' owner requests to a dev lmgw).
+disallowed-methods = [
+  { path = "reqwest::Client::new", reason = "lmgw's connections come from lmgw_link::tls::Tls (device link D15)" },
+  { path = "reqwest::Client::builder", reason = "lmgw's connections come from lmgw_link::tls::Tls (device link D15)" },
+  { path = "reqwest::ClientBuilder::new", reason = "lmgw's connections come from lmgw_link::tls::Tls (device link D15)" },
+  { path = "reqwest::get", reason = "lmgw's connections come from lmgw_link::tls::Tls (device link D15)" },
+  { path = "tokio_tungstenite::connect_async", reason = "lmgw's WebSockets come from lmgw_link::tls::Tls::websocket (device link D15)" },
+  { path = "tokio_tungstenite::connect_async_with_config", reason = "lmgw's WebSockets come from lmgw_link::tls::Tls::websocket (device link D15)" },
+]

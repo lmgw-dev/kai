@@ -1,5 +1,5 @@
-//! The delegate's model: lmgw's `/v1/chat/completions` under Kai's device key (a device key holds
-//! `Inference`, api §1.2), not streamed. The request is lmgw-client's `Request` (its URL and bearer
+//! The delegate's model: lmgw's `/v1/chat/completions` as Kai's device (a device holds `Inference`,
+//! api §1.2), over the device link, not streamed. The request is lmgw-client's `Request` (its URL
 //! rules); the body is OpenAI's chat completion with the static part first.
 //!
 //! **The body's order** is the prompt's: `model`, `stream`, `tools`, then `messages` with the
@@ -18,13 +18,14 @@ use std::sync::Mutex;
 
 use kai_delegate::{CancellationToken, Message, Part, Request, ToolCall, Turn};
 use lmgw_client::requests::{Header, Method, Request as LmgwRequest};
+use lmgw_client::types::capabilities::ModelCapabilities;
 use serde::Serialize;
 use serde_json::{Value, json};
 
+use crate::lmgw_link::Credentials;
 use crate::lmgw_link::describe;
-use crate::pairing::DeviceKey;
 
-/// `POST /v1/chat/completions`, the bearer added by the caller.
+/// `POST /v1/chat/completions`.
 pub fn chat_completions(body: String) -> LmgwRequest {
     LmgwRequest {
         method: Method::Post,
@@ -37,7 +38,7 @@ pub fn chat_completions(body: String) -> LmgwRequest {
     }
 }
 
-/// `GET /v1/models`, the bearer added by the caller.
+/// `GET /v1/models`.
 pub fn models() -> LmgwRequest {
     LmgwRequest {
         method: Method::Get,
@@ -51,13 +52,15 @@ pub fn models() -> LmgwRequest {
 /// listing does not read, lacks the alias or states nothing ("absent means unknown").
 pub fn vision_of(body: &str, alias: &str) -> Option<bool> {
     let v: Value = serde_json::from_str(body).ok()?;
-    v.get("data")?
+    let entry = v
+        .get("data")?
         .as_array()?
         .iter()
-        .find(|m| m.get("id").and_then(Value::as_str) == Some(alias))?
-        .get("capabilities")?
-        .get("vision")?
-        .as_bool()
+        .find(|m| m.get("id").and_then(Value::as_str) == Some(alias))?;
+    // The strict type: an entry whose capabilities do not parse states nothing (unknown).
+    let caps: ModelCapabilities =
+        serde_json::from_value(entry.get("capabilities")?.clone()).ok()?;
+    caps.vision
 }
 
 /// The body in the prompt's order (module doc).
@@ -233,22 +236,18 @@ pub fn refusal(status: u16, body: &str) -> String {
     }
 }
 
-/// One alias at one lmgw under one key.
+/// One alias at the paired lmgw.
 pub struct LmgwModel {
-    pub client: reqwest::Client,
-    pub url: String,
-    pub key: DeviceKey,
+    pub creds: Credentials,
     pub alias: String,
     /// The aliases that answered in its place (`x-lmgw-fallback`), in order, once each.
     answered_by: Mutex<Vec<String>>,
 }
 
 impl LmgwModel {
-    pub fn new(client: reqwest::Client, url: String, key: DeviceKey, alias: String) -> Self {
+    pub fn new(creds: Credentials, alias: String) -> Self {
         Self {
-            client,
-            url,
-            key,
+            creds,
             alias,
             answered_by: Mutex::default(),
         }
@@ -273,8 +272,8 @@ impl kai_delegate::Model for LmgwModel {
         request: &Request<'_>,
         _cancel: &CancellationToken,
     ) -> Result<Turn, String> {
-        let req = chat_completions(body(&self.alias, request)).bearer(self.key.expose());
-        let sent = send_full(&self.client, &self.url, req)
+        let req = chat_completions(body(&self.alias, request));
+        let sent = send_full(&self.creds.http(), &self.creds.url(), req)
             .await
             .map_err(|e| format!("lmgw did not answer: {e}"))?;
         if let Some(fallback) = sent.fallback {
@@ -327,7 +326,7 @@ pub async fn send_full(
     if let Some(body) = req.body {
         b = b.body(body);
     }
-    let resp = b.send().await.map_err(|e| describe(&e))?;
+    let resp = b.send().await.map_err(|e| crate::lmgw_link::tls::why(&e))?;
     let status = resp.status().as_u16();
     let fallback = resp
         .headers()
@@ -351,13 +350,14 @@ mod tests {
     #[test]
     fn the_listing_says_whether_an_alias_sees_images() {
         let list = r#"{"data":[
-            {"id":"eyes","capabilities":{"vision":true}},
-            {"id":"blind","capabilities":{"vision":false,"tools":true}},
-            {"id":"unsure","capabilities":{"tools":true}},
+            {"id":"eyes","capabilities":{"task":"chat","endpoints":[],"source":"config","vision":true}},
+            {"id":"blind","capabilities":{"task":"chat","endpoints":[],"source":"config","vision":false}},
+            {"id":"unsure","capabilities":{"task":"chat","endpoints":[],"source":"config"}},
+            {"id":"odd","capabilities":{"vision":true,"shape":"unknown to this build"}},
             {"id":"bare"}]}"#;
         assert_eq!(vision_of(list, "eyes"), Some(true));
         assert_eq!(vision_of(list, "blind"), Some(false));
-        for unknown in ["unsure", "bare", "missing"] {
+        for unknown in ["unsure", "odd", "bare", "missing"] {
             assert_eq!(vision_of(list, unknown), None, "{unknown}");
         }
         assert_eq!(vision_of("<html>", "eyes"), None);

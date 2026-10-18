@@ -30,8 +30,7 @@ use crate::host::registry::{Changes, Entry, Provider, Reply, SessionBus};
 use crate::host::settings::PolicyConfig;
 use crate::host::{HostLink, ToolHost};
 use crate::lmgw_link::Credentials;
-use crate::pairing::DeviceKey;
-use crate::pairing::tests::KEY;
+use crate::lmgw_link::test_pki::creds as test_creds;
 
 pub const T: Duration = Duration::from_secs(10);
 
@@ -191,7 +190,6 @@ pub fn inner(
         policy,
         confirmer: asks,
         creds,
-        client: Some(reqwest::Client::builder().no_proxy().build().unwrap()),
         config: Arc::new(Config::default()),
         drafting: Default::default(),
     }
@@ -312,22 +310,13 @@ impl Rig {
 
     /// Kai's credentials for a fake lmgw at `url`.
     pub fn link(&mut self, url: &str) {
-        self.creds.send_replace(Some(Credentials {
-            url: url.into(),
-            key: DeviceKey::parse(KEY).unwrap(),
-        }));
+        self.creds.send_replace(Some(test_creds(url)));
     }
 
     #[allow(dead_code)]
     pub fn start(&mut self, url: &str) -> mpsc::UnboundedReceiver<crate::host::HostEvent> {
         let (tx, rx) = mpsc::unbounded_channel();
-        self.host.start(
-            Credentials {
-                url: url.into(),
-                key: DeviceKey::parse(KEY).unwrap(),
-            },
-            tx,
-        );
+        self.host.start(test_creds(url), tx);
         rx
     }
 }

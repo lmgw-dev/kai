@@ -7,10 +7,12 @@
 # the providers, an accepted and a refused setting, the zoom, KWin's frame, what the page cannot
 # reach; spectacle's captures of the window land in target/live-window/shots/. The Personality
 # page runs against a dev lmgw on 127.0.0.1:8897 (the checkout's headless example on its own data
-# dir and container prefix; never the owner's lmgw): a device key minted there goes to the stand-in
-# core in a file of mode 600, which forwards the page's profile-editor requests with it as Kai's core
-# does; the page lists, creates, saves and deletes a profile. Its capture is copied to
-# target/window-shots/.
+# dir and container prefix; never the owner's lmgw): a device paired there over lmgw's device link
+# (scripts/live-device-link.sh: the device listener on 127.0.0.1:8898, a v2 link for this computer,
+# Kai's enrolment of its own key by the test binary, the owner's Confirm) goes to the stand-in core
+# as its device-link.json and its key in a file of mode 600, which forwards the page's
+# profile-editor requests over that pairing as Kai's core does; the page lists, creates, saves and
+# deletes a profile. Its capture is copied to target/window-shots/.
 #
 # usage: scripts/live-check-window.sh [lmgw checkout]   (report and shots in target/live-window/;
 #        the checkout, default ../lmgw, needs its headless example built:
@@ -49,13 +51,16 @@ stop_lmgw() {
 }
 cleanup() {
     stop_lmgw
-    # The dev lmgw's log carries its owner login link, its data dir and the key file the key.
-    rm -rf "$out/lmgw-data" "$out/lmgw.log" "$out/headless" "$lmgw_file"
+    # The dev lmgw's log carries its owner login link, its data dir the device CA, the pairing
+    # directory the device's key.
+    rm -rf "$out/lmgw-data" "$out/lmgw.log" "$out/headless" "$lmgw_file" "$out/window-pairing"
 }
 trap cleanup EXIT
 [[ -x $LMGW/target/debug/examples/headless ]] \
     || { echo "FAIL no dev lmgw build: cargo build -p lmgw-core --example headless in $LMGW"; exit 1; }
-if ss -ltnH "sport = :8897" | grep -q .; then echo "FAIL something listens on 8897 already"; exit 1; fi
+for port in 8897 8898; do
+    if ss -ltnH "sport = :$port" | grep -q .; then echo "FAIL something listens on $port already"; exit 1; fi
+done
 scripts/lmgw-pin.sh check "$LMGW" || true
 rm -rf "$out/lmgw-data"
 cp --reflink=auto "$LMGW/target/debug/examples/headless" "$out/headless"
@@ -71,13 +76,19 @@ done
 token=$(grep -o 'dashboard login: [^ ]*token=[^ ]*' "$out/lmgw.log" | tail -1 | sed 's/.*token=//')
 [[ -n $token ]] || { echo "FAIL no owner login line in the dev lmgw's log"; exit 1; }
 # The owner's bearer from a pipe, never in curl's argv.
-created=$(printf 'Authorization: Bearer %s\n' "$token" | curl -sS --max-time 10 -X POST \
-    "$URL/api/op/key_create" -H @- -H 'Content-Type: application/json' \
-    -d "{\"kind\": \"device\", \"name\": \"kai-window-live\", \"url\": \"$URL\"}")
-key=$(echo "$created" | jq -r .key)
-[[ -n $key && $key != null ]] || { echo "FAIL no device key: $(echo "$created" | jq -c 'del(.. | .key?, .link?)')"; exit 1; }
-(umask 077; printf '%s\n%s\n' "$URL" "$key" >"$lmgw_file")
-unset key created token
+op() {
+    printf 'Authorization: Bearer %s\n' "$token" | curl -sS --max-time 10 -X POST \
+        "$URL/api/op/$1" -H @- -H 'Content-Type: application/json' -d "$2"
+}
+owner_get() { printf 'Authorization: Bearer %s\n' "$token" | curl -sS --max-time 10 "$URL$1" -H @-; }
+fail() { echo "FAIL $*"; exit 1; }
+# shellcheck source=scripts/live-device-link.sh
+source scripts/live-device-link.sh
+devices_on
+mint kai-window-live
+enrol_files "$test_bin" "$out/window-pairing"
+printf '%s\n%s\n' "$out/window-pairing/device-link.json" "$out/window-pairing/key.pem" >"$lmgw_file"
+unset token DEV_LINK
 echo "personality: dev lmgw on $URL ($(git -C "$LMGW" rev-parse --short HEAD))"
 
 nv=()

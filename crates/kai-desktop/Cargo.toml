@@ -1,9 +1,9 @@
 [package]
 name = "kai-desktop"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Kai's tool contract (K22, K23): every hosted tool's name, description, plain parameters and MCP annotations, with no desktop, I/O or runtime dependency"
-license = "FSL-1.1-MIT"
+license = "MIT"
 publish = false
 
 [dependencies]

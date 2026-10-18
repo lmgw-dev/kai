@@ -9,8 +9,14 @@
 //!
 //! ```toml
 //! [lmgw]
-//! # Written by pairing. Selects which Secret Service item (attribute `lmgw`) holds the key.
-//! url = "http://127.0.0.1:8001"
+//! # The pairing itself (lmgw's URLs, the certificates, the dates) is in device-link.json beside
+//! # this file, the key in the Secret Service (crate::pairing). lmgw's dashboard, which Open in
+//! # lmgw opens, is the address lmgw sends in the feed's hello (lmgw_link::DeviceFacts).
+//! url_stagger_ms = 250    # with several lmgw URLs, how long one may go without a connection
+//!                         # (TCP and TLS) before the next is tried beside it (the first answer
+//!                         # wins; 0: all at once)
+//! # url = "http://…"      # written by a pairing before TLS; Kai says "pair again", and the next
+//!                         # pairing removes it and the bearer key it named in the wallet
 //! retry_max_s = 30        # §3.2: the feed reconnects after 1 s, doubling up to this
 //! timeout_s = 10          # how long lmgw may take to answer the feed's request, and then to send
 //!                         # its first bytes (any byte counts, a keep-alive comment included); a
@@ -168,8 +174,13 @@ pub struct Config {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct LmgwConfig {
-    /// The base URL Kai is paired with. `None`: not paired.
+    /// The base URL a pairing before TLS wrote (lmgw's device link design §12): Kai no longer
+    /// connects with it. It says "pair again", and the next pairing removes it with the bearer key
+    /// it named in the wallet. `None`: no such pairing.
     pub url: Option<String>,
+    /// With several lmgw URLs, how long one may go without a connection (TCP and TLS) before the
+    /// next is tried beside it (lmgw's device link design §6.3; `crate::lmgw_link::tls::race`).
+    pub url_stagger_ms: u64,
     /// The feed's reconnect backoff: from 1 s, doubling up to this (§3.2).
     pub retry_max_s: u64,
     /// How long lmgw may take to answer the feed's request and send the body's first bytes (any
@@ -182,6 +193,7 @@ impl Default for LmgwConfig {
     fn default() -> Self {
         Self {
             url: None,
+            url_stagger_ms: 250,
             retry_max_s: 30,
             timeout_s: 10,
         }
@@ -194,6 +206,9 @@ impl LmgwConfig {
     }
     pub fn timeout(&self) -> Duration {
         Duration::from_secs(self.timeout_s)
+    }
+    pub fn url_stagger(&self) -> Duration {
+        Duration::from_millis(self.url_stagger_ms)
     }
 }
 
@@ -724,23 +739,8 @@ impl Config {
                 rule,
             })?;
         }
-        if let Some(url) = &self.lmgw.url {
-            let normalized =
-                crate::pairing::normalize_base_url(url).map_err(|rule| ConfigError::Invalid {
-                    path: path.to_owned(),
-                    key: "lmgw.url",
-                    value: format!("{url:?}"),
-                    rule,
-                })?;
-            self.lmgw.url = Some(normalized);
-        }
         Ok(())
     }
-}
-
-/// Writes `lmgw.url` into the file (see [`set_value`]).
-pub fn set_lmgw_url(path: &Path, url: &str) -> Result<(), ConfigError> {
-    set_value(path, "lmgw", "url", Some(url))
 }
 
 /// Writes `[table] key = "value"` into the file, or removes the key for `None` (see [`set_item`]).
@@ -1052,6 +1052,7 @@ mod tests {
         );
         assert_eq!(d.dbus.timeout_s, 5);
         assert_eq!(d.lmgw.url, None);
+        assert_eq!(d.lmgw.url_stagger_ms, 250);
         assert_eq!((d.lmgw.retry_max_s, d.lmgw.timeout_s), (30, 10), "§3.2");
         assert_eq!(d.audio.echo_mode, EchoMode::Device, "K8");
         assert_eq!(
@@ -1272,7 +1273,7 @@ folder_id = 12
         symlink(&real, &path).unwrap();
 
         set_value(&path, "audio", "echo_mode", Some("half_duplex")).unwrap();
-        set_lmgw_url(&path, "http://new:2").unwrap();
+        set_value(&path, "lmgw", "url", Some("http://new:2")).unwrap();
         let got = std::fs::read_to_string(&path).unwrap();
         assert_eq!(
             got,
@@ -1335,9 +1336,11 @@ folder_id = 12
     }
 
     #[test]
-    fn values_are_read_and_the_url_normalized() {
-        let c = parse("[lmgw]\nurl = \"http://127.0.0.1:8001/\"\n[wallet]\nretry_s = 2\ntimeout_s = 30\n[pairing]\nhandoff_timeout_s = 9\n").unwrap();
-        assert_eq!(c.lmgw.url.as_deref(), Some("http://127.0.0.1:8001"));
+    fn values_are_read() {
+        let c = parse("[lmgw]\nurl = \"http://127.0.0.1:8001/\"\nurl_stagger_ms = 400\n[wallet]\nretry_s = 2\ntimeout_s = 30\n[pairing]\nhandoff_timeout_s = 9\n").unwrap();
+        // A pairing from before TLS: read as written, only to say "pair again".
+        assert_eq!(c.lmgw.url.as_deref(), Some("http://127.0.0.1:8001/"));
+        assert_eq!(c.lmgw.url_stagger(), Duration::from_millis(400));
         assert_eq!(c.wallet.retry(), Duration::from_secs(2));
         assert_eq!(c.wallet.timeout(), Duration::from_secs(30));
         assert_eq!(c.pairing.handoff_timeout(), Duration::from_secs(9));
@@ -1481,39 +1484,38 @@ folder_id = 12
         }
     }
 
+    /// The owner's decision (2026-10-15): lmgw's dashboard is the address lmgw sends over the
+    /// device link, so the setting is gone, and a file that still names it is refused by name as
+    /// any unknown key is.
     #[test]
-    fn a_bad_url_is_an_error_that_names_the_key() {
-        for url in ["ftp://x", "not a url", "http://h/?q=1", "http://user:pw@h"] {
-            let e = parse(&format!("[lmgw]\nurl = {url:?}\n"))
-                .unwrap_err()
-                .to_string();
-            assert!(e.contains("lmgw.url"), "{url}: {e}");
-        }
+    fn lmgw_dashboard_url_is_no_setting() {
+        let e = parse("[lmgw]\ndashboard_url = \"http://127.0.0.1:8787\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("dashboard_url"), "{e}");
     }
 
     #[test]
-    fn set_lmgw_url_keeps_the_rest_of_the_file() {
+    fn a_set_value_keeps_the_rest_of_the_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("kai").join("config.toml");
-        set_lmgw_url(&path, "http://127.0.0.1:1").unwrap();
-        assert_eq!(
-            Config::load(&path).unwrap().lmgw.url.as_deref(),
-            Some("http://127.0.0.1:1")
-        );
+        set_int(&path, "lmgw", "url_stagger_ms", Some(100)).unwrap();
+        assert_eq!(Config::load(&path).unwrap().lmgw.url_stagger_ms, 100);
 
         std::fs::write(
             &path,
             "# mine\n[wallet]\nretry_s = 7 # keep\n\n[lmgw]\nurl = \"http://old:1\"\n",
         )
         .unwrap();
-        set_lmgw_url(&path, "http://new:2").unwrap();
+        // What the next pairing does to a pairing from before TLS.
+        set_value(&path, "lmgw", "url", None).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(
             text.contains("# mine") && text.contains("retry_s = 7 # keep"),
             "{text}"
         );
         let c = Config::load(&path).unwrap();
-        assert_eq!(c.lmgw.url.as_deref(), Some("http://new:2"));
+        assert_eq!(c.lmgw.url, None);
         assert_eq!(c.wallet.retry_s, 7);
     }
 }

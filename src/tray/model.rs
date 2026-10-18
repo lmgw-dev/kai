@@ -32,8 +32,15 @@ pub struct TrayModel {
     pub autostart: bool,
     /// The last pairing attempt's error, shown until the next attempt.
     pub pair_error: Option<String>,
-    /// A pairing link from the scheme handler on its way to the owner's confirmation (K13).
+    /// A pairing link from the scheme handler on its way to the owner's confirmation (K13), or a
+    /// confirmed one on its way to lmgw.
     pub link_wait: Option<LinkWait>,
+    /// The device's certificate lapses soon (lmgw's device link §5.3, from `notice_after`): the
+    /// tooltip's line saying when.
+    pub certificate: Option<String>,
+    /// The pairing Kai runs is not stored yet (a locked wallet, a failed write): the tooltip's
+    /// line saying why, and that quitting loses it (decision 5, the security review's S4).
+    pub unstored: Option<String>,
     /// The last "Start with Plasma" error, shown until the next switch.
     pub autostart_error: Option<String>,
     pub audio: AudioModel,
@@ -150,14 +157,18 @@ pub struct AudioModel {
 pub enum Pairing {
     /// Reading the pairing from the wallet at start.
     Checking,
-    /// No key for the configured `lmgw.url`, or no `lmgw.url`.
+    /// No pairing stored (`device-link.json`), or no key in the wallet for it.
     NotPaired,
     /// §2: the wallet is locked. Kai checks again every `retry_s`.
     WalletLocked { retry_s: u64 },
     /// The Secret Service failed (not running, timed out); tried again every `retry_s`.
     WalletError { message: String, retry_s: u64 },
-    /// A key is stored for `url`.
+    /// A pairing is stored, its key in the wallet; `url` names it (its first URL).
     Paired { url: String, link: Link },
+    /// The pairing opens nothing and Kai says why, in its own words: the device's certificate
+    /// lapsed (on a date Kai knows), a pairing from before TLS, stored data that does not read.
+    /// Kai stops retrying until it is paired again.
+    PairAgain { why: String },
     /// §3.3: the key was rotated or deleted (`key_unknown`, 401 `device_key_unknown`), or
     /// revoked as another kind of key; Kai stops retrying until it is paired again.
     Revoked { reason: String },
@@ -184,8 +195,16 @@ pub const EXPIRED: &str =
 /// it is meanwhile.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LinkWait {
-    Wallet { url: String },
-    Owner { url: String },
+    Wallet {
+        url: String,
+    },
+    Owner {
+        url: String,
+    },
+    /// The owner confirmed it: Kai enrols its new key with lmgw (lmgw's device link §3.4).
+    Enrolling {
+        url: String,
+    },
 }
 
 /// The lmgw link of a paired Kai (the feed, §3.2).
@@ -193,6 +212,9 @@ pub enum LinkWait {
 pub enum Link {
     /// Not connected; `note` says why, and when the link retries.
     Down { note: String },
+    /// lmgw waits for the owner to confirm this device's `code` on its Devices card (lmgw's device
+    /// link §3.5); `note` says when Kai asks again.
+    Unconfirmed { code: String, note: String },
     /// The feed is up: `hello` named the device, its hold, the label Kai's hosted tools go under
     /// (§10.1, phase 2; kept, not shown), and the device's level of lmgw's admin tools (shown
     /// when it is not off; `state` moves it).
@@ -211,6 +233,8 @@ impl TrayModel {
             autostart,
             pair_error: None,
             link_wait: None,
+            certificate: None,
+            unstored: None,
             autostart_error: None,
             audio: AudioModel::default(),
             overlay: OverlayModel::default(),
@@ -528,6 +552,24 @@ pub fn render(model: &TrayModel) -> TrayView {
         ),
         Pairing::Paired {
             url,
+            link: Link::Unconfirmed { code, note },
+        } => {
+            let mut menu = voice_menu(&model.voice, &model.personality);
+            menu.extend(paired_menu);
+            let notes = vec![
+                format!("Confirm {code} on lmgw's Devices card"),
+                format!("paired with lmgw at {url}; {note}"),
+            ];
+            (
+                ICON_OFFLINE,
+                None,
+                "waiting for your confirmation on lmgw".to_owned(),
+                notes,
+                menu,
+            )
+        }
+        Pairing::Paired {
+            url,
             link: Link::Down { note },
         } => {
             let mut menu = voice_menu(&model.voice, &model.personality);
@@ -578,6 +620,7 @@ pub fn render(model: &TrayModel) -> TrayView {
             vec![],
             unpaired_menu,
         ),
+        Pairing::PairAgain { why } => (ICON_OFFLINE, None, why.clone(), vec![], unpaired_menu),
         Pairing::Disabled { reason } => (
             ICON_OFFLINE,
             None,
@@ -628,7 +671,16 @@ pub fn render(model: &TrayModel) -> TrayView {
         Some(LinkWait::Owner { url }) => notes.push(format!(
             "a pairing link for {url} waits for your answer in Kai's dialog"
         )),
+        Some(LinkWait::Enrolling { url }) => notes.push(format!(
+            "pairing with lmgw at {url}: Kai enrols its new key"
+        )),
         None => {}
+    }
+    if let Some(u) = &model.unstored {
+        notes.push(u.clone());
+    }
+    if let (Pairing::Paired { .. }, Some(c)) = (&model.pairing, &model.certificate) {
+        notes.push(c.clone());
     }
     if let Some(e) = &model.pair_error {
         notes.push(format!("pairing failed: {e}"));
@@ -670,6 +722,8 @@ mod tests {
             autostart: true,
             pair_error: None,
             link_wait: None,
+            certificate: None,
+            unstored: None,
             autostart_error: None,
             audio: AudioModel::default(),
             overlay: OverlayModel::default(),
@@ -680,6 +734,57 @@ mod tests {
             desktop: Vec::new(),
             personality: PersonalityModel::default(),
         }
+    }
+
+    /// The device link (lmgw's device link §3.5, §5.3): waiting for the owner's Confirm shows the
+    /// code; a pairing that must be made again says why with only Pair and Quit; the certificate's
+    /// notice is a line while paired; an enrolment on its way is said.
+    #[test]
+    fn the_device_links_states_say_what_to_do() {
+        let v = render(&model(Pairing::Paired {
+            url: "https://127.0.0.1:8002".into(),
+            link: Link::Unconfirmed {
+                code: "7F3A-91C2".into(),
+                note: "Kai asks again in 2 s".into(),
+            },
+        }));
+        assert_eq!(v.status, "waiting for your confirmation on lmgw");
+        assert_eq!(v.notes[0], "Confirm 7F3A-91C2 on lmgw's Devices card");
+        assert!(
+            v.notes[1].contains("Kai asks again in 2 s"),
+            "{:?}",
+            v.notes
+        );
+        let why = "this device's certificate lapsed on 2027-10-14; pair it again";
+        let v = render(&model(Pairing::PairAgain { why: why.into() }));
+        assert_eq!(v.status, why);
+        assert_eq!(v.menu, [PairWithLmgw, Settings, CheckForUpdates, Quit]);
+        let mut m = model(Pairing::Paired {
+            url: "https://127.0.0.1:8002".into(),
+            link: Link::Down {
+                note: "connecting".into(),
+            },
+        });
+        m.certificate = Some("this device's certificate lapses on 2027-10-14".into());
+        m.link_wait = Some(LinkWait::Enrolling {
+            url: "https://127.0.0.1:8002".into(),
+        });
+        let notes = render(&m).notes;
+        assert!(
+            notes.iter().any(|n| n.contains("lapses on 2027-10-14")),
+            "{notes:?}"
+        );
+        assert!(
+            notes.iter().any(|n| n.contains("Kai enrols its new key")),
+            "{notes:?}"
+        );
+        m.unstored = Some("the pairing is not stored yet".into());
+        assert!(
+            render(&m)
+                .notes
+                .iter()
+                .any(|n| n == "the pairing is not stored yet")
+        );
     }
 
     /// The paired menu's last entries.
@@ -876,12 +981,12 @@ mod tests {
     #[test]
     fn revoked_says_pair_again_with_the_reason_and_keeps_only_pair() {
         let v = render(&model(Pairing::Revoked {
-            reason: "device 'desktop' was rotated — pair it again".into(),
+            reason: "the key of device 'desktop' was replaced — pair it again".into(),
         }));
         assert_eq!(v.icon, ICON_OFFLINE);
         assert_eq!(
             v.status,
-            "this device's key was revoked (device 'desktop' was rotated — pair it again); pair again"
+            "this device's key was revoked (the key of device 'desktop' was replaced — pair it again); pair again"
         );
         assert_eq!(v.menu, vec![PairWithLmgw, Settings, CheckForUpdates, Quit]);
     }

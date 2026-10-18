@@ -13,7 +13,9 @@
 #   scripts/publish-github.sh --ref vX.Y.Z -F <message> --tag vX.Y.Z
 #                                  GitHub: one squashed commit with the tag's tree, and the tag
 #                                  on it (.github/workflows/release.yml builds the release)
-# LMGW_PIN's lmgw_tag must be a published lmgw release by then: GitHub's build clones it.
+# It refuses unless LMGW_PIN's lmgw_tag is a published lmgw release with the pinned tree
+# (scripts/lmgw-pin.sh verify-published): GitHub's build clones it. Between lmgw releases the pin
+# says `unpublished`, which GitLab's builds take, a release never (docs/development.md).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -25,6 +27,8 @@ die() { echo "$*" >&2; exit 1; }
 [[ "$(git branch --show-current)" == main ]] || die "releases are cut from main"
 [[ -z "$(git status --porcelain --untracked-files=no)" ]] || die "commit or stash your changes first"
 if git rev-parse -q --verify "refs/tags/v$version" >/dev/null; then die "tag v$version already exists"; fi
+scripts/lmgw-pin.sh verify-published \
+    || die "a release needs lmgw's published release in LMGW_PIN first (docs/development.md, \"The lmgw pin\")"
 [[ -z "$notes" || -f "$notes" ]] || die "no notes file $notes"
 
 manifests=(Cargo.toml crates/*/Cargo.toml ui/Cargo.toml)

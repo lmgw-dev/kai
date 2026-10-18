@@ -76,7 +76,6 @@ async fn live_routine_in_a_real_scope() {
         Backend {
             local: rig.local.clone(),
             creds: rig.creds.subscribe(),
-            client: None,
             cgroup_of: proc_cgroup,
             scopes: rig.scopes.clone(),
         },

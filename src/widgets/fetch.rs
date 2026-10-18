@@ -180,6 +180,9 @@ async fn get_within(tool: &str, url: &str, policy: &Policy) -> Result<Fetched, S
 }
 
 /// One request to `url`, redirects not followed.
+// A picture on the open web a tool asked for, never lmgw: device link D15's rule (`clippy.toml`)
+// is lmgw's connections'.
+#[allow(clippy::disallowed_methods)]
 async fn hop(tool: &str, url: &Url, policy: &Policy) -> Result<reqwest::Response, String> {
     if !matches!(url.scheme(), "http" | "https") {
         return Err(format!(
@@ -592,11 +595,11 @@ mod tests {
             "127.0.0.1",
             "10.1.2.3",
             "172.16.0.1",
-            "192.168.1.1",
+            "192.168.200.1",
             "169.254.1.1",
             "::1",
             "fe80::1",
-            "fd00::1",
+            "fd12:3456::1",
             "::ffff:10.0.0.1",
             "0.0.0.0",
             "0.1.2.3",

@@ -1,9 +1,10 @@
-//! The realtime adapter (§5, K3): Kai's [`VoiceLink`] on lmgw's network API, with the device key
-//! as the bearer.
+//! The realtime adapter (§5, K3): Kai's [`VoiceLink`] on lmgw's network API, over the device link
+//! (lmgw's device link design §6.2: the device's certificate authenticates it, no request carries
+//! a credential).
 //!
 //! - **The conversation's thread and folder** (§4): `POST /chat/api/folders/{id}/current`
 //!   (`{new: true}` for a new conversation), `GET /chat/api/folders` and `POST /chat/api/folders
-//!   {name}` through reqwest, the HTTP client the feed uses, each bounded by `lmgw.timeout_s` for the
+//!   {name}` through the device link's reqwest client, each bounded by `lmgw.timeout_s` for the
 //!   answer and for its body; the answers read with `lmgw_client::requests`' readers, a refusal
 //!   with its status, code and message.
 //! - **A bound session**: `GET /v1/realtime?chat_thread=<id>` as a WebSocket
@@ -26,12 +27,9 @@
 //! - **No other limits of its own.** The socket takes messages of any size (tungstenite's 64 MiB
 //!   and 16 MiB defaults are lifted): the gateway is the owner's own, and how long a session may
 //!   take to start is `voice.connect_timeout_s`, which the voice session counts from the press.
-//! - **TLS** for a `wss:` gateway is the feed's: rustls on aws-lc-rs with the system's trust store
-//!   through the platform verifier.
-//!
-//! The key is never logged; neither are the requests that carry it: the bearer is a sensitive
-//! header, and tungstenite's trace of the handshake's request head is held back by the log cap
-//! (`crate::logging`, review KAI-2 K2-1).
+//! - **TLS** is the device link's ([`super::tls::Tls`]): the WebSocket's TLS stream is built from the
+//!   same configuration as every request, and a handshake lmgw refused reads in `lmgw-client`'s
+//!   words (`lmgw_client::tls::TlsRefusal`).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -41,7 +39,6 @@ use futures_util::{SinkExt, StreamExt};
 use lmgw_client::realtime::{self, ClientEvent};
 use lmgw_client::requests;
 use tokio::sync::{Notify, mpsc};
-use tokio_tungstenite::Connector;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
@@ -49,6 +46,7 @@ use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::{self, Message};
 
 use super::proxy::{Forward, Limits as ProxyLimits, Proxied};
+use super::tls::unreachable;
 use super::{Credentials, describe};
 use crate::audio::RATE;
 use crate::conversation::FolderInfo;
@@ -85,25 +83,19 @@ impl RealtimeSettings {
 /// Kai's realtime client (module doc).
 pub struct RealtimeLink {
     settings: RealtimeSettings,
-    client: reqwest::Client,
     creds: Option<Credentials>,
-    /// The TLS a `wss:` gateway gets, built at the first use.
-    tls: Option<Arc<rustls::ClientConfig>>,
 }
 
 impl RealtimeLink {
-    /// `client` is the feed's (`FeedLink::client`), so both talk to lmgw alike.
-    pub fn new(settings: RealtimeSettings, client: reqwest::Client) -> Self {
+    pub fn new(settings: RealtimeSettings) -> Self {
         Self {
             settings,
-            client,
             creds: None,
-            tls: None,
         }
     }
 
-    /// Sends `req` (it carries the key: never logged) and reads its answer with `read`, both
-    /// bounded by `lmgw.timeout_s`; `what` names the request in the errors.
+    /// Sends `req` and reads its answer with `read`, both bounded by `lmgw.timeout_s`; `what` names
+    /// the request in the errors.
     fn call<T: Send + 'static>(
         &self,
         req: requests::Request,
@@ -113,12 +105,11 @@ impl RealtimeLink {
         let Some(creds) = self.creds.clone() else {
             return Box::pin(async { Err(Refusal::no_answer("Kai is not paired")) });
         };
-        let client = self.client.clone();
+        let client = creds.http();
         let timeout = self.settings.timeout;
         Box::pin(async move {
             let secs = timeout.as_secs();
-            let req = req.bearer(creds.key.expose());
-            let url = req.url(&creds.url);
+            let url = req.url(&creds.url());
             let mut rb = match req.method {
                 requests::Method::Get => client.get(url),
                 requests::Method::Post => client.post(url),
@@ -137,12 +128,7 @@ impl RealtimeLink {
                          (lmgw.timeout_s)"
                     )));
                 }
-                Ok(Err(e)) => {
-                    return Err(Refusal::no_answer(format!(
-                        "lmgw is not reachable: {}",
-                        describe(&e)
-                    )));
-                }
+                Ok(Err(e)) => return Err(Refusal::no_answer(unreachable(&e))),
                 Ok(Ok(r)) => r,
             };
             let status = resp.status().as_u16();
@@ -169,43 +155,21 @@ impl RealtimeLink {
         })
     }
 
-    fn tls(&mut self) -> Result<Arc<rustls::ClientConfig>, String> {
-        if let Some(t) = &self.tls {
-            return Ok(t.clone());
-        }
-        use rustls_platform_verifier::BuilderVerifierExt;
-        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-        let config = rustls::ClientConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()
-            .and_then(|b| b.with_platform_verifier())
-            .map_err(|e| format!("cannot set up TLS for the voice session: {e}"))?
-            .with_no_client_auth();
-        let config = Arc::new(config);
-        self.tls = Some(config.clone());
-        Ok(config)
-    }
-
-    /// The handshake's request (the URL and the bearer) and its connector.
+    /// The handshake's request (the device link's WebSocket takes `wss:` only).
     fn handshake(
         &mut self,
         creds: &Credentials,
         thread: i64,
         take_over: bool,
-    ) -> Result<(tungstenite::handshake::client::Request, Connector), String> {
+    ) -> Result<tungstenite::handshake::client::Request, String> {
         let req = if take_over {
             requests::realtime(thread)
         } else {
             requests::realtime_unless_bound(thread)
         };
-        let req = req.bearer(creds.key.expose());
         let url = req
-            .ws_url(&creds.url)
+            .ws_url(&creds.url())
             .map_err(|e| format!("{} ({})", e.message, e.code))?;
-        let connector = if url.starts_with("wss://") {
-            Connector::Rustls(self.tls()?)
-        } else {
-            Connector::Plain
-        };
         let mut request = url
             .as_str()
             .into_client_request()
@@ -214,22 +178,21 @@ impl RealtimeLink {
             let (name, value) = super::header(h)?;
             request.headers_mut().insert(name, value);
         }
-        Ok((request, connector))
+        Ok(request)
     }
 }
 
-/// Sends `req` with the key (never logged) and `bytes` as its body when given (else the request's
-/// own), and waits `lmgw.timeout_s` for the answer's head; `what` names it in the errors.
+/// Sends `req` with `bytes` as its body when given (else the request's own), and waits
+/// `lmgw.timeout_s` for the answer's head; `what` names it in the errors.
 async fn send_head(
-    client: &reqwest::Client,
     creds: &Credentials,
     req: requests::Request,
     bytes: Option<Vec<u8>>,
     timeout: Duration,
     what: &str,
 ) -> Result<reqwest::Response, Refusal> {
-    let req = req.bearer(creds.key.expose());
-    let url = req.url(&creds.url);
+    let client = creds.http();
+    let url = req.url(&creds.url());
     let mut rb = match req.method {
         requests::Method::Get => client.get(url),
         requests::Method::Post => client.post(url),
@@ -248,10 +211,7 @@ async fn send_head(
             "lmgw did not answer the request for {what} within {} s (lmgw.timeout_s)",
             timeout.as_secs()
         ))),
-        Ok(Err(e)) => Err(Refusal::no_answer(format!(
-            "lmgw is not reachable: {}",
-            describe(&e)
-        ))),
+        Ok(Err(e)) => Err(Refusal::no_answer(unreachable(&e))),
         Ok(Ok(r)) => Ok(r),
     }
 }
@@ -277,10 +237,6 @@ async fn read_body(
 
 impl VoiceLink for RealtimeLink {
     fn set_credentials(&mut self, creds: Option<Credentials>) {
-        if creds.as_ref().map(|c| &c.url) != self.creds.as_ref().map(|c| &c.url) {
-            // Another gateway's TLS is built again (the same trust store; no state to carry).
-            self.tls = None;
-        }
         self.creds = creds;
     }
 
@@ -371,9 +327,9 @@ impl VoiceLink for RealtimeLink {
         let Some(creds) = self.creds.clone() else {
             return Box::pin(async { Err(Refusal::no_answer("Kai is not paired")) });
         };
-        let (client, timeout) = (self.client.clone(), self.settings.timeout);
+        let timeout = self.settings.timeout;
         Box::pin(async move {
-            let resp = send_head(&client, &creds, req, None, timeout, "the approval").await?;
+            let resp = send_head(&creds, req, None, timeout, "the approval").await?;
             let status = resp.status().as_u16();
             if !(200..300).contains(&status) {
                 let body = read_body(resp, timeout, "the approval").await?;
@@ -431,10 +387,10 @@ impl VoiceLink for RealtimeLink {
         let Some(creds) = self.creds.clone() else {
             return Box::pin(async { Err(Refusal::no_answer("Kai is not paired")) });
         };
-        let (client, timeout) = (self.client.clone(), self.settings.timeout);
+        let timeout = self.settings.timeout;
         Box::pin(async move {
             let what = "the spoken answer";
-            let resp = send_head(&client, &creds, req, Some(wav), timeout, what).await?;
+            let resp = send_head(&creds, req, Some(wav), timeout, what).await?;
             let status = resp.status().as_u16();
             let body = read_body(resp, timeout, what).await?;
             requests::read_transcription(status, &body)
@@ -453,8 +409,7 @@ impl VoiceLink for RealtimeLink {
                 Proxied::refused(503, "not_paired", "Kai is not paired with lmgw")
             });
         };
-        let client = self.client.clone();
-        Box::pin(async move { super::proxy::send(&client, &creds, forward, limits).await })
+        Box::pin(async move { super::proxy::send(&creds, forward, limits).await })
     }
 
     fn open(
@@ -480,7 +435,9 @@ impl VoiceLink for RealtimeLink {
         };
         let prepared = match self.creds.clone() {
             None => Err("Kai is not paired".to_owned()),
-            Some(creds) => self.handshake(&creds, thread, take_over),
+            Some(creds) => self
+                .handshake(&creds, thread, take_over)
+                .map(|r| (r, creds.tls)),
         };
         match prepared {
             Err(message) => {
@@ -490,11 +447,20 @@ impl VoiceLink for RealtimeLink {
                     message,
                 });
             }
-            Ok((request, connector)) => {
+            Ok((request, tls)) => {
                 tracing::info!(thread, take_over, url = %request.uri(), "voice: opening the session");
-                let keepalive = self.settings.keepalive;
+                let (keepalive, timeout) = (self.settings.keepalive, self.settings.timeout);
                 tokio::spawn(run(
-                    request, connector, rx, closing, queued, keepalive, events,
+                    request,
+                    Link {
+                        tls,
+                        keepalive,
+                        timeout,
+                    },
+                    rx,
+                    closing,
+                    queued,
+                    events,
                 ));
             }
         }
@@ -586,26 +552,31 @@ impl Drop for Socket {
     }
 }
 
+/// What a session's task connects with: the device link's TLS, `voice.keepalive_s` (module doc),
+/// and `lmgw.timeout_s` for a refusal's body after its head.
+struct Link {
+    tls: super::tls::Tls,
+    keepalive: Duration,
+    timeout: Duration,
+}
+
 /// The session's task: the handshake, then its frames both ways until the socket ends; exactly
-/// one `Closed` (or `Refused`) at the end. `keepalive` is `voice.keepalive_s` (module doc).
+/// one `Closed` (or `Refused`) at the end.
 async fn run(
     request: tungstenite::handshake::client::Request,
-    connector: Connector,
+    link: Link,
     mut out: mpsc::UnboundedReceiver<Out>,
     closing: Arc<Notify>,
     queued: Arc<AtomicUsize>,
-    keepalive: Duration,
     events: mpsc::UnboundedSender<SessionEvent>,
 ) {
+    let keepalive = link.keepalive;
     let config = WebSocketConfig::default()
         .max_message_size(None)
         .max_frame_size(None);
-    let connect = tokio_tungstenite::connect_async_tls_with_config(
-        request,
-        Some(config),
-        true,
-        Some(connector),
-    );
+    let connect = link
+        .tls
+        .websocket(request, Some(config), true, link.timeout);
     let connected = tokio::select! {
         r = connect => r,
         () = closing.notified() => {
@@ -623,9 +594,9 @@ async fn run(
             let status = resp.status().as_u16();
             let body = refusal_body(&resp);
             let e = requests::read_refusal(status, &body);
-            // tungstenite hands over only the body bytes that came with the head (review KAI-4
-            // K4-5): a body that came later, or none, carries no code (`read_refusal` says
-            // `http_<status>` then), and the voice decides by the status, which always came.
+            // The body was read to its end (`tls::ws`, review KAI-4 K4-5); one that never came, or
+            // a body without lmgw's error, carries no code (`read_refusal` says `http_<status>`
+            // then), and the voice decides by the status, which always came.
             let code = (e.code != format!("http_{status}")).then_some(e.code);
             let _ = events.send(SessionEvent::Refused {
                 status,
@@ -638,7 +609,7 @@ async fn run(
             let _ = events.send(SessionEvent::Refused {
                 status: 0,
                 code: None,
-                message: format!("lmgw is not reachable: {}", describe(&e)),
+                message: unreachable(&e),
             });
             return;
         }
@@ -857,5 +828,6 @@ pub(super) fn read_pending_approvals(
         .map_err(|e| requests::ApiError {
             code: "unreadable".into(),
             message: format!("the thread does not read: {e}"),
+            ..Default::default()
         })
 }

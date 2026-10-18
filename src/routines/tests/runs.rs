@@ -128,15 +128,15 @@ async fn the_scripts_environment_holds_no_secret() {
     );
     home.switch_on("env_dump");
     let (mut rig, _) = rig_with(home, PolicyConfig::default());
-    rig.link("http://127.0.0.1:9");
+    rig.link("https://127.0.0.1:9");
     rig.run_with(Some(launch.launch.manager.clone()));
     let r = run(&rig, "env_dump", json!({}), Caller::Owner).await;
     assert!(!r.error, "{}", text(&r));
     let dumped = std::fs::read_to_string(rig.home.routines().join("env_dump/env.txt")).unwrap();
-    let key = DeviceKey::parse(KEY).unwrap();
+    let key = crate::lmgw_link::test_pki::PKI.device_key.to_pem();
     assert!(
-        !dumped.contains(key.expose()),
-        "the device key never reaches a script"
+        !dumped.contains(key.lines().nth(1).unwrap()),
+        "the device's key never reaches a script"
     );
     assert!(
         !dumped.contains("KAI_LOG="),

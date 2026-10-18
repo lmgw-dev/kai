@@ -4,7 +4,7 @@
 //! current thread (§4, `POST /chat/api/folders/{id}/current`) and opens a session bound to it
 //! (`GET /v1/realtime?chat_thread=<id>`, chat-voice §8.1). The conversation's folder (§4,
 //! `crate::conversation`) is looked up and created through it too (`GET` and `POST
-//! /chat/api/folders`), so one HTTP client with the device key serves both. The events are `lmgw-client`'s own
+//! /chat/api/folders`), so the device link's one HTTP client serves both. The events are `lmgw-client`'s own
 //! (K3, api §4.1): [`ClientEvent`] is what the client owns in a bound session, built to its text
 //! frame by `ClientEvent::to_json`, and [`ServerEvent`] is what the session acts on, parsed from a
 //! text frame by `lmgw_client::realtime::parse`. So the adapter that implements this trait,
@@ -67,8 +67,9 @@ impl Refusal {
         self.code.as_deref().unwrap_or_default()
     }
 
-    /// A 401: the device key opens nothing now (§3.3): `device_key_unknown` (rotated or deleted),
-    /// `device_disabled`, `key_expired` (`lmgw_client::requests::key_refused`), or any other 401.
+    /// A 401: the pairing opens nothing now (§3.3): `device_key_unknown` (re-paired or deleted),
+    /// `device_disabled`, `key_expired`, `device_certificate_expired`
+    /// (`lmgw_client::requests::key_refused`), or any other 401.
     pub fn key_refused(&self) -> bool {
         self.status == 401
     }
@@ -152,16 +153,7 @@ pub const CHAT_THREAD_BOUND: &str = lmgw_client::requests::code::CHAT_THREAD_BOU
 
 /// A client event's `type`, for the log.
 pub fn event_kind(event: &ClientEvent) -> &'static str {
-    match event {
-        ClientEvent::SessionUpdate { .. } => "session.update",
-        ClientEvent::Append { .. } => "input_audio_buffer.append",
-        ClientEvent::Commit => "input_audio_buffer.commit",
-        ClientEvent::Clear => "input_audio_buffer.clear",
-        ClientEvent::ResponseCreate => "response.create",
-        ClientEvent::ResponseCancel { .. } => "response.cancel",
-        ClientEvent::Truncate { .. } => "conversation.item.truncate",
-        ClientEvent::ApprovalResponse { .. } => "conversation.item.create",
-    }
+    event.kind()
 }
 
 /// The samples an append carries (PCM16, from its base64's length); 0 for any other event.
@@ -247,7 +239,7 @@ pub trait VoiceLink: Send + 'static {
     fn transcribe(&mut self, _thread: i64, _wav: Vec<u8>) -> Pending<Result<String, Refusal>> {
         Box::pin(async { Err(Refusal::no_answer("this link transcribes nothing")) })
     }
-    /// Opens `/v1/realtime?chat_thread=<thread>` with the device key. `take_over`: the owner's
+    /// Opens `/v1/realtime?chat_thread=<thread>` over the device link. `take_over`: the owner's
     /// own bind (a press, the tray), which takes the thread from another session; Kai's own binds
     /// (a rebind, `voice.on_at_start`) never do, and are refused 409 [`CHAT_THREAD_BOUND`] while
     /// another session holds it (`&takeover=never`, K5, review KAI-2 K2-13). Returns at once; the

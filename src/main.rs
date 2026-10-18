@@ -1,7 +1,8 @@
 //! Kai: the owner's Plasma client of lmgw (docs/design/2026-10-06-kai-design.md).
 //!
-//! Built so far: the NVIDIA rule, configuration, single instance, the device key in the Secret
-//! Service with the locked-wallet state, pairing (paste dialog and K13's handler path), the tray
+//! Built so far: the NVIDIA rule, configuration, single instance, the device's key in the Secret
+//! Service with the locked-wallet state, pairing over lmgw's device link (paste dialog and K13's
+//! handler path, enrolment, mutual TLS), the tray
 //! and the lmgw link's feed (WP2), audio (WP3), the voice session and the global shortcuts (WP4's
 //! local half), the ring overlay (WP5), `lmgw-client`'s rules (WP1), the self-updater on lmgw's
 //! `lmgw-update` (§13), and the hosted MCP server with K15's policy (WP8, [`host`]). The realtime
@@ -207,6 +208,7 @@ fn hosted_server(
         deps.screen.clone(),
         deps.jobs.clone(),
     );
+    link.set_core(deps.cmds.clone());
     let notes = link.unknown_policy_names();
     (link, notes)
 }
@@ -454,17 +456,9 @@ fn run(link_on_stdin: bool, nvidia: nvidia::Decision) -> ExitCode {
     let store = SecretServiceStore::new(bus.clone(), config.wallet.timeout());
     let dbus_timeout = config.dbus.timeout();
     let bind_shortcuts = config.shortcuts.bind;
-    let link = match lmgw_link::FeedLink::new(lmgw_link::FeedSettings::from_config(&config)) {
-        Ok(link) => link,
-        Err(e) => {
-            tracing::error!("the lmgw link: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let voice_link = lmgw_link::RealtimeLink::new(
-        lmgw_link::RealtimeSettings::from_config(&config),
-        link.client(),
-    );
+    let link = lmgw_link::FeedLink::new(lmgw_link::FeedSettings::from_config(&config));
+    let voice_link =
+        lmgw_link::RealtimeLink::new(lmgw_link::RealtimeSettings::from_config(&config));
     if let Some(raw) = arrival {
         // Parsed by the handler already; a link that fails here is said, not kept. It takes the
         // gate as a D-Bus `Pair` would (one link waits at a time, review KAI-2 K2-4).
@@ -762,7 +756,8 @@ async fn quit_on_signal(cmds: mpsc::UnboundedSender<Command>, terminated: Arc<At
     }
 }
 
-/// K13: a `kai` started by the `lmgw-pair:` scheme handler. Its argv carries the key, so it lives
+/// K13: a `kai` started by the `lmgw-pair:` scheme handler. Its argv carries the link's one-time
+/// token, so it lives
 /// only as long as the hand-off takes: it gives the link to the running Kai over D-Bus (which
 /// answers at once), or starts Kai with the link on a stdin pipe, and exits. It stores nothing and
 /// waits for no confirmation; Kai asks the owner in its own dialog. Every call it makes is bounded
@@ -770,8 +765,8 @@ async fn quit_on_signal(cmds: mpsc::UnboundedSender<Command>, terminated: Arc<At
 fn pair_handler(raw: String) -> ExitCode {
     // Checked first, so a bad link reaches nobody.
     let checked = PairingLink::parse(&raw)
-        .map_err(|e| e.to_string())
-        .and_then(|link| pairing::verify_fingerprint(&link));
+        .map(|_| ())
+        .map_err(|e| e.to_string());
     if let Err(e) = checked {
         tracing::error!("pairing link refused: {e}");
         if let Some(Setup {

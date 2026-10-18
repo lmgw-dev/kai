@@ -1,638 +1,344 @@
-//! Pairing (§3.1, K13, api §1.4): the `lmgw-pair:` link, and storing what it carries.
+//! Pairing (§3.1, K13; lmgw's device link design §3, §6.2): the `lmgw-pair:` link v2, the
+//! enrolment it makes, and what a pairing keeps.
 //!
 //! ```text
-//! lmgw-pair:?v=1&url=http%3A%2F%2F127.0.0.1%3A8001&name=desktop&key=lmgw-device-<64 hex>[&fp=sha256:<64 hex>]
+//! lmgw-pair:?v=2&name=<name>&url=<https URL>[&url=…]&fp=sha256:<64 hex>&token=lmgw-enrol-<32 hex>
 //! ```
 //!
-//! The link carries a credential. Nothing here logs it, and no error echoes any value taken from
-//! it: a mangled link can put the key anywhere (a parameter name, the url).
+//! The link is `lmgw-client`'s ([`PairingLink`], strict, https only; a v1 link is told it is from
+//! a pairing before TLS), and so are the facts a dialog shows ([`PairFacts`]). The link carries a
+//! one-time token while it lives: nothing here logs it, and no error echoes any value taken from
+//! it.
+//!
+//! [`enrol`] enrols the device's key ([`TlsKey`], P-256 in software, one per token: the core keeps
+//! it, so trying a link again sends the same key) with the token: `POST /devices/enrol` over TLS
+//! pinned to the link's `fp`, tried on the link's URLs by the device link's rule
+//! (`crate::lmgw_link::tls::race`). lmgw answers the device's
+//! certificate, its CA, the dates, the URLs and the confirmation code, which `lmgw-client` checks
+//! against the link and the key. [`store`] then keeps the key in the Secret Service (the item's
+//! `lmgw` attribute is the CA's fingerprint, its `kind` `device-tls-key`) and the rest, all of it
+//! public, in `device-link.json` beside the configuration ([`Paired`]); what it could not store yet
+//! (a locked wallet, a failed write) it stores at a later call, while Kai runs the pairing from
+//! memory. The owner confirms the code on lmgw's Devices card; until then lmgw answers 403
+//! `device_unconfirmed`.
 
-use std::fmt;
+mod key;
+#[cfg(test)]
+pub(crate) mod tests;
 
-use crate::config::{self, ConfigError};
+use std::path::Path;
+use std::time::Duration;
+
+use lmgw_client::requests::{self, KeyRefused};
+use lmgw_client::tls::TlsRefusal;
+use serde::{Deserialize, Serialize};
+
+pub use key::TlsKey;
+pub use lmgw_client::pairing::{FactLine, Fingerprint, LinkError, PairFacts, PairingLink};
+
+use crate::lmgw_link::tls::{self, Tls};
 use crate::paths::Paths;
 use crate::secret::{SecretError, SecretStore, Stored};
 
-const SCHEME_PREFIX: &str = "lmgw-pair:";
-const KEY_PREFIX: &str = "lmgw-device-";
-const FP_PREFIX: &str = "sha256:";
-
-/// A device key (`lmgw-device-<64 hex>`, api §1.1). Its `Debug` is redacted and it has no
-/// `Display`, so it cannot reach a log line by accident.
-#[derive(Clone, PartialEq, Eq)]
-pub struct DeviceKey(String);
-
-impl DeviceKey {
-    pub fn parse(s: &str) -> Result<Self, LinkError> {
-        let ok = s
-            .strip_prefix(KEY_PREFIX)
-            .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()));
-        if ok {
-            Ok(Self(s.to_owned()))
-        } else {
-            Err(LinkError::BadKey {
-                len: s.chars().count(),
-            })
-        }
-    }
-
-    /// A key read back from the Secret Service. It was validated when stored; it is not re-checked,
-    /// so a format change in lmgw never locks out a key that already works.
-    pub fn from_store(s: String) -> Self {
-        Self(s)
-    }
-
-    pub fn expose(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Debug for DeviceKey {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("DeviceKey(<redacted>)")
-    }
-}
-
-/// `fp=sha256:<64 hex>`: the SHA-256 of lmgw's TLS certificate (api §1.4).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Fingerprint(String);
-
-impl Fingerprint {
-    fn parse(s: &str) -> Result<Self, LinkError> {
-        let hex = s.strip_prefix(FP_PREFIX).ok_or(LinkError::BadFingerprint)?;
-        if hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-            Ok(Self(hex.to_ascii_lowercase()))
-        } else {
-            Err(LinkError::BadFingerprint)
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PairingLink {
-    /// The normalized base URL (no trailing slash).
-    pub url: String,
-    /// The device name lmgw gave this key.
+/// What a pairing keeps beside the configuration (`device-link.json`, device link §6.2). None of
+/// it is secret: the key is in the Secret Service.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Paired {
+    /// The device's name as the link gave it (lmgw's row; `hello` names it again).
     pub name: String,
-    pub key: DeviceKey,
-    pub fp: Option<Fingerprint>,
+    /// The `fp` the link pinned (`sha256:<64 hex>`): lmgw's device CA, so which gateway this is.
+    /// It names the Secret Service item that holds the key.
+    pub fp: String,
+    /// The certificate, lmgw's CA, the dates, the URLs and the confirmation code
+    /// (`lmgw_client::requests::read_enrolment`'s).
+    pub credentials: requests::Credentials,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum LinkError {
-    #[error("not a pairing link: it must start with `lmgw-pair:?`")]
-    NotALink,
-    #[error("the link has no `v` parameter; this Kai reads v=1 links")]
-    MissingVersion,
-    #[error("unsupported link version v={0}; this Kai reads v=1 links")]
-    UnsupportedVersion(String),
-    #[error("the link has no `{0}` parameter")]
-    Missing(&'static str),
-    #[error("the link's `{0}` parameter is empty")]
-    Empty(&'static str),
-    #[error("the link carries `{0}` twice")]
-    Duplicate(&'static str),
-    #[error("the link carries {0}, which a v=1 link does not have")]
-    Unknown(String),
-    #[error("the link's url is not usable: {0}")]
-    BadUrl(String),
-    #[error(
-        "the link's key is not a device key: expected `lmgw-device-` and 64 hex digits, got {len} characters"
-    )]
-    BadKey { len: usize },
-    #[error("the link's fp is not a fingerprint: expected `sha256:` and 64 hex digits")]
-    BadFingerprint,
-}
-
-const KNOWN: [&str; 5] = ["v", "url", "name", "key", "fp"];
-
-impl PairingLink {
-    /// Parses a link, strictly: `v` must be `1`, every v=1 parameter appears at most once, `url`,
-    /// `name` and `key` are required, and nothing else is accepted. Surrounding whitespace (from a
-    /// paste) is ignored; the scheme is case-insensitive.
-    pub fn parse(input: &str) -> Result<Self, LinkError> {
-        let s = input.trim();
-        let rest = s
-            .get(..SCHEME_PREFIX.len())
-            .filter(|p| p.eq_ignore_ascii_case(SCHEME_PREFIX))
-            .map(|_| &s[SCHEME_PREFIX.len()..])
-            .ok_or(LinkError::NotALink)?;
-        let query = rest.strip_prefix('?').ok_or(LinkError::NotALink)?;
-
-        let mut known: [Option<String>; 5] = Default::default();
-        let mut unknown: Option<String> = None;
-        for (k, v) in form_urlencoded::parse(query.as_bytes()) {
-            match KNOWN.iter().position(|n| *n == k) {
-                Some(i) if known[i].is_some() => return Err(LinkError::Duplicate(KNOWN[i])),
-                Some(i) => known[i] = Some(v.into_owned()),
-                None => {
-                    unknown.get_or_insert_with(|| describe_name(&k));
-                }
-            }
-        }
-        let [v, url, name, key, fp] = known;
-
-        // The version decides what the rest means, so it is checked first.
-        match v.as_deref() {
-            None => return Err(LinkError::MissingVersion),
-            Some("1") => {}
-            Some(other) => return Err(LinkError::UnsupportedVersion(describe_value(other))),
-        }
-        if let Some(u) = unknown {
-            return Err(LinkError::Unknown(u));
-        }
-        let required = |value: Option<String>, name: &'static str| match value {
-            None => Err(LinkError::Missing(name)),
-            Some(s) if s.trim().is_empty() => Err(LinkError::Empty(name)),
-            Some(s) => Ok(s),
+impl Paired {
+    /// The stored pairing, `None` when there is none. A file that does not read, or does not hold
+    /// together ([`Paired::check`]), is an error naming it: pair again (the next pairing replaces
+    /// it).
+    pub fn load(path: &Path) -> Result<Option<Self>, String> {
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
         };
-        let url = required(url, "url")?;
-        let name = required(name, "name")?;
-        let key = required(key, "key")?;
-        let url = normalize_base_url(&url).map_err(LinkError::BadUrl)?;
-        let key = DeviceKey::parse(&key)?;
-        let fp = fp.map(|f| Fingerprint::parse(&f)).transpose()?;
-        Ok(Self { url, name, key, fp })
+        let p: Paired = serde_json::from_str(&text)
+            .map_err(|e| format!("{} does not read ({e}): pair again", path.display()))?;
+        p.check()
+            .map_err(|e| format!("{} {e}: pair again", path.display()))?;
+        Ok(Some(p))
     }
-}
 
-/// Names an unknown parameter in an error only when it looks like a parameter name; anything else
-/// could be part of the key.
-fn describe_name(k: &str) -> String {
-    if !k.is_empty() && k.len() <= 16 && k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
-        format!("a parameter `{k}`")
-    } else {
-        "an unnamed or malformed parameter".into()
-    }
-}
-
-fn describe_value(v: &str) -> String {
-    if !v.is_empty() && v.len() <= 8 && v.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.') {
-        v.to_owned()
-    } else {
-        "<malformed>".into()
-    }
-}
-
-/// An lmgw base URL: `http` or `https`, a host, an optional path prefix; no user info, query or
-/// fragment. Returned without a trailing slash, so the stored attribute and the config value
-/// compare equal however the URL was written. The error is a rule, never the URL itself.
-pub fn normalize_base_url(s: &str) -> Result<String, String> {
-    let u = url::Url::parse(s.trim()).map_err(|e| format!("not a URL ({e})"))?;
-    if !matches!(u.scheme(), "http" | "https") {
-        return Err("the scheme must be http or https".into());
-    }
-    if u.host_str().is_none_or(str::is_empty) {
-        return Err("it has no host".into());
-    }
-    if !u.username().is_empty() || u.password().is_some() {
-        return Err("it must not carry a user name or password".into());
-    }
-    if u.query().is_some() {
-        return Err("it must not carry a query (?…)".into());
-    }
-    if u.fragment().is_some() {
-        return Err("it must not carry a fragment (#…)".into());
-    }
-    Ok(u.as_str().trim_end_matches('/').to_owned())
-}
-
-/// §3.1 step 4: a link with `fp` is verified against the server's certificate. This fails closed.
-/// lmgw serves no TLS today (api §1.4), and the TLS client that would read the certificate comes
-/// with the lmgw link (`lmgw_link`), so every link that carries `fp` is refused, with the reason.
-pub fn verify_fingerprint(link: &PairingLink) -> Result<(), String> {
-    match &link.fp {
-        None => Ok(()),
-        Some(_) if link.url.starts_with("http://") => Err(
-            "the link carries a certificate fingerprint (fp), but its url is http://, which has no \
-             certificate to check it against; refusing the link"
-                .into(),
-        ),
-        Some(_) => Err(
-            "the link carries a certificate fingerprint (fp), and this build cannot check one yet \
-             (lmgw serves no TLS today); refusing the link rather than trusting it unchecked"
-                .into(),
-        ),
-    }
-}
-
-/// How many characters of the device name a dialog shows; a longer name is shortened with "…"
-/// (the dialog says so). The name is the link's own text, and the link may come from anyone.
-pub const NAME_SHOWN_CHARS: usize = 64;
-
-/// What the owner confirms before Kai stores a link (api §1.4: "a client must confirm before it
-/// replaces an existing pairing, showing the new url"). The confirmation dialog shows it for a
-/// clicked or handed-over link, the paste dialog before its Pair button.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PairFacts {
-    /// The normalized gateway URL.
-    pub url: String,
-    /// The device name, safe to show (see [`display_name`]).
-    pub name: String,
-    /// The pairing this one replaces: the configured `lmgw.url`.
-    pub replaces: Option<String>,
-    /// `http://` to a host that is not this computer: the key and the voice go unencrypted.
-    pub plain_http_remote: bool,
-}
-
-/// One line of a pairing dialog.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FactLine {
-    Plain(String),
-    Warning(String),
-}
-
-impl PairFacts {
-    pub fn new(link: &PairingLink, current: Option<&str>) -> Self {
-        Self {
-            url: link.url.clone(),
-            name: display_name(&link.name),
-            replaces: current.map(str::to_owned),
-            plain_http_remote: plain_http_remote(&link.url),
+    /// Whether the parts hold together as an enrolment left them (`read_enrolment` checked them
+    /// then): `fp` reads and pins the CA certificate kept beside it, which reads as a root, and the
+    /// device's certificate is there. Whether the key is the certificate's is checked where the
+    /// key is used (`crate::lmgw_link::tls::Tls::paired`).
+    pub fn check(&self) -> Result<(), String> {
+        let fp = Fingerprint::parse(&self.fp).map_err(|e| format!("holds no fp ({e})"))?;
+        let ca = &self.credentials.ca_certificate;
+        if !fp.pins_certificate(ca) {
+            return Err(
+                "does not hold together: its fp does not pin the CA certificate kept with it"
+                    .to_owned(),
+            );
         }
+        rustls::RootCertStore::empty()
+            .add(rustls::pki_types::CertificateDer::from(ca.as_slice()))
+            .map_err(|e| {
+                format!("does not hold together: its CA certificate does not read ({e})")
+            })?;
+        if self.credentials.certificate.is_empty() {
+            return Err("does not hold together: it holds no device certificate".to_owned());
+        }
+        Ok(())
     }
 
-    /// The dialog's lines, in order: the gateway, the device, what it replaces, the http warning.
-    pub fn lines(&self) -> Vec<FactLine> {
-        let mut lines = vec![
-            FactLine::Plain(format!("Gateway: {}", self.url)),
-            FactLine::Plain(format!("Device name: {}", self.name)),
-        ];
-        match &self.replaces {
-            Some(old) if *old == self.url => lines.push(FactLine::Warning(format!(
-                "This replaces the device key Kai keeps for {old}."
-            ))),
-            Some(old) => lines.push(FactLine::Warning(format!(
-                "This replaces Kai's pairing with {old}: Kai stops using that gateway, its voice \
-                 session there ends, and Kai deletes the device key it keeps for it."
-            ))),
-            None => {}
+    /// Written atomically (public data, the configuration's own mode).
+    pub fn save(&self, path: &Path) -> Result<(), String> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)
+                .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
         }
-        if self.plain_http_remote {
-            lines.push(FactLine::Warning(
-                "This gateway is reached over plain http on another computer: the device key and \
-                 your voice travel unencrypted over the network."
-                    .into(),
-            ));
-        }
-        lines
+        let mut text = serde_json::to_string_pretty(self).expect("a pairing always serializes");
+        text.push('\n');
+        crate::config::write_atomically(path, text.as_bytes())
+            .map_err(|e| format!("cannot write {}: {e}", path.display()))
+    }
+
+    /// The URL that names this pairing in a dialog and the tooltip: the first the link gave.
+    pub fn first_url(&self) -> &str {
+        &self.credentials.urls.as_slice()[0]
+    }
+
+    /// The certificate's lapse as a date (`2027-10-14`, UTC).
+    pub fn not_after(&self) -> String {
+        date(self.credentials.not_after_ms)
     }
 }
 
-/// `http://` to a host other than this computer (loopback addresses and `localhost` are this
-/// computer).
-pub fn plain_http_remote(url: &str) -> bool {
-    let Ok(u) = url::Url::parse(url) else {
-        return false;
-    };
-    if u.scheme() != "http" {
-        return false;
-    }
-    match u.host() {
-        Some(url::Host::Ipv4(a)) => !a.is_loopback(),
-        Some(url::Host::Ipv6(a)) => !a.is_loopback(),
-        Some(url::Host::Domain(d)) => {
-            let d = d.trim_end_matches('.').to_ascii_lowercase();
-            !(d == "localhost" || d.ends_with(".localhost"))
-        }
-        None => true,
-    }
+/// Now, as the certificate's dates count it (unix milliseconds, the system clock).
+pub fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64)
 }
 
-/// Unicode's format characters (general category Cf: bidirectional formatting, zero-width and
-/// joiners, the soft hyphen, the BOM, tags) and its line and paragraph separators (Zl, Zp), which
-/// GTK breaks lines at.
-fn format_or_separator(c: char) -> bool {
-    matches!(c,
-        '\u{00AD}' | '\u{0600}'..='\u{0605}' | '\u{061C}' | '\u{06DD}' | '\u{070F}'
-        | '\u{0890}'..='\u{0891}' | '\u{08E2}' | '\u{180E}' | '\u{200B}'..='\u{200F}'
-        | '\u{2028}'..='\u{202E}' | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206F}'
-        | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}' | '\u{110BD}' | '\u{110CD}'
-        | '\u{13430}'..='\u{1343F}' | '\u{1BCA0}'..='\u{1BCA3}' | '\u{1D173}'..='\u{1D17A}'
-        | '\u{E0001}' | '\u{E0020}'..='\u{E007F}')
-}
-
-/// The device name as a dialog shows it: control characters, format characters (bidirectional
-/// formatting, zero-width) and line or paragraph separators, which could make one name read as
-/// another or add a line under it, become U+FFFD (review KAI-2 K2-14); past [`NAME_SHOWN_CHARS`]
-/// it is cut with "… (shortened)".
-pub fn display_name(name: &str) -> String {
-    let clean: Vec<char> = name
-        .chars()
-        .map(|c| {
-            if c.is_control() || format_or_separator(c) {
-                '\u{FFFD}'
-            } else {
-                c
-            }
-        })
-        .collect();
-    if clean.len() > NAME_SHOWN_CHARS {
-        let mut s: String = clean[..NAME_SHOWN_CHARS].iter().collect();
-        s.push_str("… (shortened)");
-        s
-    } else {
-        clean.into_iter().collect()
-    }
+/// A unix time in milliseconds as a UTC date.
+pub fn date(ms: i64) -> String {
+    let days = ms.div_euclid(86_400_000);
+    // Howard Hinnant's civil_from_days.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02}")
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum PairError {
     #[error("{0}")]
     Link(#[from] LinkError),
+    /// The device's key could not be made.
     #[error("{0}")]
-    Fingerprint(String),
+    Key(String),
+    /// The enrolment: lmgw's refusal in its words, a handshake lmgw-client refused, or no answer.
     #[error("{0}")]
-    Wallet(#[from] SecretError),
-    #[error("{0}")]
-    Config(#[from] ConfigError),
+    Enrol(String),
 }
 
-/// What storing a link did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Committed {
-    /// The key is in the Secret Service and `lmgw.url` in the config. `first`: Kai had no
-    /// `lmgw.url` before, so "Start with Plasma" is switched on (§13).
-    Stored { first: bool },
-    /// The wallet is locked; nothing was stored and no unlock was asked for.
+/// A finished enrolment, nothing stored yet.
+#[derive(Debug, Clone)]
+pub struct Enrolled {
+    pub key: TlsKey,
+    pub paired: Paired,
+}
+
+/// What the Devices card shows of the enrolling client (`client`, free text): Kai's version, the
+/// computer's host name and the system's name (`Kai <version> on <host name> (<PRETTY_NAME>)`; the
+/// review's decision 9).
+pub fn client_text() -> String {
+    let os = std::fs::read_to_string("/etc/os-release")
+        .ok()
+        .and_then(|t| {
+            t.lines().find_map(|l| {
+                l.strip_prefix("PRETTY_NAME=")
+                    .map(|v| v.trim().trim_matches('"').to_owned())
+            })
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "Linux".to_owned());
+    let host = std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .ok()
+        .map(|h| h.trim().to_owned())
+        .filter(|h| !h.is_empty());
+    match host {
+        Some(host) => format!("Kai {} on {host} ({os})", crate::VERSION),
+        None => format!("Kai {} ({os})", crate::VERSION),
+    }
+}
+
+/// Enrols `key` with `link` (module doc): its public half sent with the link's token over TLS
+/// pinned to the link's `fp`, lmgw's answer checked by `lmgw-client`. `timeout` is
+/// `lmgw.timeout_s` (the connection, the answer and its body), `stagger` `lmgw.url_stagger_ms`.
+/// Nothing is stored here ([`store`]).
+///
+/// The caller sends the same key again when it tries the same link again (lmgw's device link §3.3,
+/// D8's lost answer): while the token lives, lmgw answers the key that used it what it answered it
+/// (the same certificate, `confirmed` as it stands), and only another key meets 410
+/// `pairing_token_used`, which marks the row contested. The race's tries may each reach lmgw, and
+/// each sends the same key, so a second POST is such a repeat.
+pub async fn enrol(
+    link: &PairingLink,
+    key: &TlsKey,
+    client: &str,
+    timeout: Duration,
+    stagger: Duration,
+) -> Result<Enrolled, PairError> {
+    let spki = key.public_key().map_err(PairError::Key)?;
+    let tls = Tls::enrolment(link.fp, timeout).map_err(PairError::Enrol)?;
+    let req = requests::enrol(&link.token, &spki, Some(client));
+    let secs = timeout.as_secs();
+    let attempt = |base: &str, answered: tls::Answered| {
+        // Each try's client is its own, so the race sees when its connection is up (§6.3).
+        let http = tls.racing(answered);
+        let url = req.url(base);
+        let req = &req;
+        async move {
+            let http = http.map_err(|e| {
+                format!(
+                    "cannot build the HTTP client for lmgw: {}",
+                    crate::lmgw_link::describe(&e)
+                )
+            })?;
+            // The request carries the token: never logged.
+            let mut rb = http.post(url);
+            for h in &req.headers {
+                if let Ok((name, value)) = crate::lmgw_link::header(h) {
+                    rb = rb.header(name, value);
+                }
+            }
+            let rb = rb.body(req.body.clone().unwrap_or_default());
+            let resp = rb.send().await.map_err(|e| match tls::enrol_refusal(&e) {
+                Some(TlsRefusal::Unproven) => UNPROVEN.to_owned(),
+                Some(r) => r.to_string(),
+                None => format!("lmgw is not reachable: {}", crate::lmgw_link::describe(&e)),
+            })?;
+            let status = resp.status().as_u16();
+            let body = resp.text().await.map_err(|e| {
+                format!(
+                    "lmgw's answer to the enrolment broke off: {}",
+                    crate::lmgw_link::describe(&e)
+                )
+            })?;
+            Ok::<_, String>((status, body))
+        }
+    };
+    let urls = link.urls.order(None);
+    let raced = tokio::time::timeout(timeout, tls::race(urls, stagger, attempt)).await;
+    let (url, (status, body)) = match raced {
+        Err(_) => {
+            return Err(PairError::Enrol(format!(
+                "lmgw did not answer the enrolment within {secs} s (lmgw.timeout_s)"
+            )));
+        }
+        Ok(Err(failed)) => return Err(PairError::Enrol(said(failed))),
+        Ok(Ok(won)) => won,
+    };
+    tracing::info!(%url, status, "pairing: lmgw answered the enrolment");
+    let credentials = requests::read_enrolment(status, &body, link, &spki).map_err(|e| {
+        PairError::Enrol(match requests::key_refused(&e) {
+            Some(KeyRefused::TokenUsedElsewhere) => format!(
+                "someone else used this code: delete the device on lmgw's Devices card \
+                 (lmgw: {})",
+                e.message
+            ),
+            _ => format!("lmgw refused the enrolment: {} ({})", e.message, e.code),
+        })
+    })?;
+    Ok(Enrolled {
+        key: key.clone(),
+        paired: Paired {
+            name: link.name.clone(),
+            fp: link.fp.to_string(),
+            credentials,
+        },
+    })
+}
+
+/// lmgw-client's [`TlsRefusal::Unproven`] at enrolment (lmgw's device link §3.3, its note of
+/// 2026-10-15): a `certificate_required` alert. lmgw sends it while no pairing token lives, but an
+/// alert is unauthenticated and may come before the server proved anything, so whoever answers at
+/// the address can send one: a failed handshake to try again, which says nothing about the link. A
+/// new link is suggested, never stated. A try again sends the same key (`crate::core`'s enrolment
+/// keeps one per token), so an answer lost on the way comes back as it was.
+const UNPROVEN: &str = "the handshake failed: the server answered with TLS's certificate_required \
+     alert before it proved to be the lmgw this link pairs with, so something else may be \
+     answering at that address, or the pairing link may have ended (closed on lmgw's Devices card, \
+     expired or used). Try again; if it keeps failing, make a new link on lmgw's Devices card";
+
+/// The race's failures as one sentence: one URL's error, or each URL's.
+fn said(failed: Vec<(String, String)>) -> String {
+    match failed.as_slice() {
+        [(_, one)] => one.clone(),
+        many => format!(
+            "lmgw did not answer at any of the link's addresses: {}",
+            many.iter()
+                .map(|(u, e)| format!("{u}: {e}"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        ),
+    }
+}
+
+/// What of an enrolment is stored: the key in the Secret Service, the rest in `device-link.json`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StoredParts {
+    pub key: bool,
+    pub file: bool,
+}
+
+/// Why an enrolment is not stored (yet): Kai runs it from memory meanwhile and tries again.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum NotStored {
+    /// The wallet is locked; no unlock was asked for.
+    #[error("KWallet is locked: unlock it")]
     WalletLocked,
+    #[error("the wallet is not available ({0})")]
+    Wallet(SecretError),
+    /// `device-link.json` could not be written.
+    #[error("{0}")]
+    File(String),
 }
 
-/// Stores a parsed link (§3.1 step 3): the key as a Secret Service item, then the URL as
-/// `lmgw.url`. Only the running Kai calls it, and only for a link the owner confirmed (K13).
-/// `current_url` is the configured `lmgw.url` before this pairing.
-pub async fn commit<S: SecretStore>(
+/// Stores what of `enrolled` `done` does not hold yet (§3.1 step 3): the key as the Secret Service
+/// item for its gateway (replacing an earlier key for the same gateway), then the public data.
+/// `done` says how far it got; the first part that could not be stored says why.
+pub async fn store<S: SecretStore>(
     store: &S,
     paths: &Paths,
-    current_url: Option<&str>,
-    link: &PairingLink,
-) -> Result<Committed, PairError> {
-    verify_fingerprint(link).map_err(PairError::Fingerprint)?;
-    match store.store(&link.url, &link.name, &link.key).await? {
-        Stored::Locked => Ok(Committed::WalletLocked),
-        Stored::Stored => {
-            config::set_lmgw_url(&paths.config_file, &link.url)?;
-            Ok(Committed::Stored {
-                first: current_url.is_none(),
-            })
+    enrolled: &Enrolled,
+    done: &mut StoredParts,
+) -> Result<(), NotStored> {
+    let p = &enrolled.paired;
+    if !done.key {
+        let label = format!("Kai: lmgw device link key '{}' ({})", p.name, p.first_url());
+        match store.store(&p.fp, &label, &enrolled.key).await {
+            Ok(Stored::Stored) => done.key = true,
+            Ok(Stored::Locked) => return Err(NotStored::WalletLocked),
+            Err(e) => return Err(NotStored::Wallet(e)),
         }
     }
-}
-
-#[cfg(test)]
-pub(crate) mod tests {
-    use super::*;
-
-    pub const KEY: &str =
-        "lmgw-device-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-
-    pub fn link(params: &str) -> String {
-        format!("lmgw-pair:?{params}")
+    if !done.file {
+        p.save(&paths.device_link_file).map_err(NotStored::File)?;
+        done.file = true;
     }
-
-    pub fn good() -> String {
-        link(&format!(
-            "v=1&url=http%3A%2F%2F127.0.0.1%3A8001&name=desktop&key={KEY}"
-        ))
-    }
-
-    #[test]
-    fn a_good_link_parses() {
-        let l = PairingLink::parse(&good()).unwrap();
-        assert_eq!(l.url, "http://127.0.0.1:8001");
-        assert_eq!(l.name, "desktop");
-        assert_eq!(l.key.expose(), KEY);
-        assert_eq!(l.fp, None);
-        // pasted with whitespace, upper-case scheme, parameters in another order, `+` as a space
-        let l = PairingLink::parse(&format!(
-            "  LMGW-PAIR:?key={KEY}&name=my+desk&url=https%3A%2F%2Fgateway.example%2Fbase%2F&v=1\n"
-        ))
-        .unwrap();
-        assert_eq!(
-            (l.url.as_str(), l.name.as_str()),
-            ("https://gateway.example/base", "my desk")
-        );
-    }
-
-    #[test]
-    fn the_version_must_be_1() {
-        let k = format!("url=http%3A%2F%2Fh&name=n&key={KEY}");
-        assert_eq!(
-            PairingLink::parse(&link(&k)),
-            Err(LinkError::MissingVersion)
-        );
-        for v in ["2", "0", "01", "1.0", "", "%201"] {
-            let e = PairingLink::parse(&link(&format!("v={v}&{k}"))).unwrap_err();
-            assert!(
-                matches!(e, LinkError::UnsupportedVersion(_)),
-                "v={v}: {e:?}"
-            );
-        }
-        // a v=2 link with parameters this Kai does not know reports the version, not the parameter
-        let e = PairingLink::parse(&link(&format!("v=2&{k}&token=x"))).unwrap_err();
-        assert_eq!(e, LinkError::UnsupportedVersion("2".into()));
-    }
-
-    #[test]
-    fn missing_or_empty_required_parameters() {
-        let all = [
-            ("url", "http%3A%2F%2Fh".to_owned()),
-            ("name", "n".to_owned()),
-            ("key", KEY.to_owned()),
-        ];
-        for skip in ["url", "name", "key"] {
-            let q: Vec<String> = all
-                .iter()
-                .filter(|(n, _)| *n != skip)
-                .map(|(n, v)| format!("{n}={v}"))
-                .collect();
-            let e = PairingLink::parse(&link(&format!("v=1&{}", q.join("&")))).unwrap_err();
-            assert_eq!(
-                e,
-                LinkError::Missing(match skip {
-                    "url" => "url",
-                    "name" => "name",
-                    _ => "key",
-                })
-            );
-        }
-        let e = PairingLink::parse(&link("v=1&url=http%3A%2F%2Fh&name=n&key=")).unwrap_err();
-        assert_eq!(e, LinkError::Empty("key"));
-    }
-
-    #[test]
-    fn malformed_links_are_refused() {
-        assert_eq!(
-            PairingLink::parse("https://example.com"),
-            Err(LinkError::NotALink)
-        );
-        assert_eq!(
-            PairingLink::parse("lmgw-pair:v=1"),
-            Err(LinkError::NotALink)
-        );
-        assert_eq!(PairingLink::parse("lmgw-pai"), Err(LinkError::NotALink));
-        let dup = format!("{}&name=other", good());
-        assert_eq!(PairingLink::parse(&dup), Err(LinkError::Duplicate("name")));
-        let unknown = format!("{}&label=x", good());
-        assert_eq!(
-            PairingLink::parse(&unknown),
-            Err(LinkError::Unknown("a parameter `label`".into()))
-        );
-        let bad_url = link(&format!("v=1&url=ftp%3A%2F%2Fh&name=n&key={KEY}"));
-        assert!(matches!(
-            PairingLink::parse(&bad_url),
-            Err(LinkError::BadUrl(_))
-        ));
-        let short = link("v=1&url=http%3A%2F%2Fh&name=n&key=lmgw-device-0123");
-        assert_eq!(
-            PairingLink::parse(&short),
-            Err(LinkError::BadKey { len: 16 })
-        );
-        let other_kind = link(&format!(
-            "v=1&url=http%3A%2F%2Fh&name=n&key=lmgw-client-{}",
-            &KEY[12..]
-        ));
-        assert!(matches!(
-            PairingLink::parse(&other_kind),
-            Err(LinkError::BadKey { .. })
-        ));
-    }
-
-    #[test]
-    fn no_error_echoes_the_key() {
-        let secret = &KEY[12..];
-        let cases = [
-            // the key smuggled into a parameter name, the url and the version
-            link(&format!("v=1&url=http%3A%2F%2Fh&name=n&{KEY}")),
-            link(&format!(
-                "v=1&url=http%3A%2F%2Fh%3Fk%3D{KEY}&name=n&key={KEY}"
-            )),
-            link(&format!("v={KEY}&url=http%3A%2F%2Fh&name=n&key={KEY}")),
-            link(&format!("v=1&url=http%3A%2F%2Fh&name=n&key={KEY}0")),
-        ];
-        for c in cases {
-            let e = PairingLink::parse(&c).unwrap_err().to_string();
-            assert!(!e.contains(secret), "{e}");
-        }
-        assert!(!format!("{:?}", PairingLink::parse(&good()).unwrap()).contains(secret));
-    }
-
-    #[test]
-    fn a_link_with_fp_parses_and_then_fails_closed() {
-        let fp = "sha256:".to_owned() + &"AB".repeat(32);
-        let l = PairingLink::parse(&format!("{}&fp={fp}", good())).unwrap();
-        assert_eq!(l.fp, Some(Fingerprint("ab".repeat(32))));
-        let e = verify_fingerprint(&l).unwrap_err();
-        assert!(e.contains("http://") && e.contains("refusing"), "{e}");
-        let https = link(&format!("v=1&url=https%3A%2F%2Fh&name=n&key={KEY}&fp={fp}"));
-        let e = verify_fingerprint(&PairingLink::parse(&https).unwrap()).unwrap_err();
-        assert!(e.contains("cannot check") && e.contains("refusing"), "{e}");
-        assert_eq!(
-            verify_fingerprint(&PairingLink::parse(&good()).unwrap()),
-            Ok(())
-        );
-        let bad = format!("{}&fp=md5:00", good());
-        assert_eq!(PairingLink::parse(&bad), Err(LinkError::BadFingerprint));
-    }
-
-    #[test]
-    fn the_facts_name_the_gateway_the_device_and_what_is_replaced() {
-        let l = PairingLink::parse(&good()).unwrap();
-        let f = PairFacts::new(&l, None);
-        assert_eq!(
-            f.lines(),
-            [
-                FactLine::Plain("Gateway: http://127.0.0.1:8001".into()),
-                FactLine::Plain("Device name: desktop".into()),
-            ],
-            "a first pairing on this computer: no warning"
-        );
-        let f = PairFacts::new(&l, Some("http://gateway.example:8001"));
-        assert!(matches!(&f.lines()[2], FactLine::Warning(w)
-            if w.contains("replaces Kai's pairing with http://gateway.example:8001")));
-        let f = PairFacts::new(&l, Some("http://127.0.0.1:8001"));
-        assert!(matches!(&f.lines()[2], FactLine::Warning(w)
-            if w.contains("replaces the device key Kai keeps for http://127.0.0.1:8001")));
-        let remote = link(&format!(
-            "v=1&url=http%3A%2F%2F192.0.2.20%3A8001&name=desktop&key={KEY}"
-        ));
-        let f = PairFacts::new(&PairingLink::parse(&remote).unwrap(), None);
-        assert!(f.plain_http_remote);
-        assert!(
-            matches!(f.lines().last(), Some(FactLine::Warning(w)) if w.contains("unencrypted"))
-        );
-        let text = format!("{:?}", f.lines());
-        assert!(!text.contains(&KEY[12..]), "the key is never shown");
-    }
-
-    #[test]
-    fn plain_http_is_remote_unless_it_is_this_computer() {
-        for (url, remote) in [
-            ("http://127.0.0.1:8001", false),
-            ("http://127.3.4.5", false),
-            ("http://[::1]:8001", false),
-            ("http://localhost:8001", false),
-            ("http://LOCALHOST.", false),
-            ("http://kai.localhost", false),
-            ("http://192.0.2.20:8001", true),
-            ("http://gateway.example", true),
-            ("http://[fe80::1]", true),
-            ("https://gateway.example", false),
-        ] {
-            assert_eq!(plain_http_remote(url), remote, "{url}");
-        }
-    }
-
-    #[test]
-    fn a_device_name_is_made_safe_to_show() {
-        assert_eq!(display_name("desktop"), "desktop");
-        assert_eq!(display_name("a\nb\u{202E}c"), "a\u{FFFD}b\u{FFFD}c");
-        // K2-14: a line separator would show a second "Gateway" line; zero-width characters and
-        // the soft hyphen hide in a name.
-        assert_eq!(
-            display_name("desktop\u{2028}Gateway: http://127.0.0.1:8001"),
-            "desktop\u{FFFD}Gateway: http://127.0.0.1:8001"
-        );
-        for c in [
-            '\u{2029}',
-            '\u{200B}',
-            '\u{200D}',
-            '\u{FEFF}',
-            '\u{00AD}',
-            '\u{E0041}',
-        ] {
-            assert_eq!(
-                display_name(&format!("a{c}b")),
-                "a\u{FFFD}b",
-                "U+{:04X}",
-                c as u32
-            );
-        }
-        assert_eq!(
-            display_name("Küche — Tür"),
-            "Küche — Tür",
-            "letters and dashes stay"
-        );
-        let long = "x".repeat(NAME_SHOWN_CHARS + 5);
-        let shown = display_name(&long);
-        assert!(shown.ends_with("… (shortened)"), "{shown}");
-        assert_eq!(
-            shown.chars().filter(|c| *c == 'x').count(),
-            NAME_SHOWN_CHARS
-        );
-    }
-
-    #[test]
-    fn base_urls_are_normalized() {
-        assert_eq!(
-            normalize_base_url("http://127.0.0.1:8001/").unwrap(),
-            "http://127.0.0.1:8001"
-        );
-        assert_eq!(normalize_base_url("HTTP://Host:80").unwrap(), "http://host");
-        assert_eq!(
-            normalize_base_url("https://h/a/b/").unwrap(),
-            "https://h/a/b"
-        );
-        assert!(normalize_base_url("http://h#x").is_err());
-    }
+    Ok(())
 }

@@ -25,13 +25,11 @@ use crate::audio::{Audio, RATE};
 use crate::config::Config;
 use crate::core::{Command, Core};
 use crate::lmgw_link::LinkEvent;
-use crate::pairing::DeviceKey;
-use crate::pairing::tests::KEY;
 use crate::paths::Paths;
 use crate::secret::MemoryStore;
 use crate::tray::model::{Link, Pairing, TrayModel};
 
-const URL: &str = "http://127.0.0.1:1";
+const URL: &str = "https://127.0.0.1:1";
 /// When the clip starts playing into the microphone, after the press.
 const SPEAKS_AFTER_MS: u64 = 150;
 
@@ -111,18 +109,11 @@ async fn live_voice_push_to_talk_and_barge_in() {
     std::fs::create_dir_all(paths.config_file.parent().unwrap()).unwrap();
     std::fs::write(
         &paths.config_file,
-        format!(
-            "[lmgw]\nurl = \"{URL}\"\n[audio]\ninput = \"{MIC}\"\noutput = \"{SINK}\"\n\
-             [voice]\ngrace_s = 1\n"
-        ),
+        format!("[audio]\ninput = \"{MIC}\"\noutput = \"{SINK}\"\n[voice]\ngrace_s = 1\n"),
     )
     .unwrap();
     let store = Arc::new(MemoryStore::default());
-    store
-        .items
-        .lock()
-        .unwrap()
-        .insert(URL.into(), ("d".into(), DeviceKey::parse(KEY).unwrap()));
+    crate::pairing::tests::store_pairing(&crate::lmgw_link::test_pki::PKI, &paths, &store, URL);
     let mock = MockLink::default();
     mock.with(|s| {
         s.keep_audio = true;

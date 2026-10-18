@@ -16,7 +16,7 @@
 # KAI_UPDATE_DEPLOY_TOKEN and KAI_UPDATE_PUBLIC_FEED in rpmbuild's environment (CI sets them:
 # packaging/ci-build.sh the private feed with its token, packaging/gh-build.sh the public feed,
 # marked public so it never gets a token); a build without them has no feed.
-%{!?kai_version: %global kai_version 0.1.0}
+%{!?kai_version: %global kai_version 0.2.0}
 # The lmgw commit the tarball's lmgw crates come from (LMGW_PIN; packaging/build-rpm.sh defines it),
 # and how the description names that source: "commit <sha>" where the build's lmgw checkout holds the
 # pinned commit (the private checkout), else "<lmgw_tag> (tree <sha>)" (a clone of the public
@@ -40,7 +40,7 @@ Name:           kai
 Version:        %{kai_version}
 Release:        1%{?dist}
 Summary:        Voice, tray state and overlays for lmgw on Plasma
-License:        FSL-1.1-MIT
+License:        MIT
 URL:            https://github.com/lmgw-dev/kai
 Source0:        kai-%{version}.tar.gz
 

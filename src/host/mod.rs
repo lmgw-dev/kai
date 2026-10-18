@@ -1,5 +1,5 @@
 //! Kai's hosted MCP server (ruling 17, K2, §10.1, §11.1, PD2): Kai connects out to lmgw's
-//! `/mcp/host` with its device key and serves its tools there; lmgw lists them under the label of
+//! `/mcp/host` over the device link and serves its tools there; lmgw lists them under the label of
 //! the device's hosting grant (`<label>__<tool>`) to the principals api §5.6 lets reach it, and
 //! forwards their calls with who is calling (`_meta`, api §5.5).
 //!
@@ -228,6 +228,12 @@ impl HostLink {
             .read()
             .expect("never poisoned")
             .unknown_names(&offered)
+    }
+
+    /// The core's commands: from then on a trusted caller's confirmation offers "always allow"
+    /// (`server::Shared::always_option`), which the core writes.
+    pub fn set_core(&self, cmds: mpsc::UnboundedSender<crate::core::Command>) {
+        let _ = self.shared.core.set(cmds);
     }
 
     /// A new policy (WP21a's operations): when it changes the list (`off`, `config_tools`), lmgw

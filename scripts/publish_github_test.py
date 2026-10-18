@@ -10,7 +10,9 @@ out with it. In the second the fake GitHub has a history of its own, as after an
 private repo's history starts at its own "private root" (the hook template's root sha is replaced
 by it), the public repo is a separate lineage, and the private repo's `origin` names a host that is
 never contacted (GIT_SSH_COMMAND=false makes sure of it). Git's global and system config are shut
-out, so the owner's settings change nothing here.
+out, so the owner's settings change nothing here. A second local bare repo is the public lmgw,
+with two releases, which the committed LMGW_PIN is checked against (scripts/lmgw-pin.sh
+verify-published).
 """
 
 import os
@@ -20,7 +22,7 @@ import sys
 import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SCRIPTS = ["publish-github.sh", "publish_scan.py", "pre-push-github.sh"]
+SCRIPTS = ["publish-github.sh", "publish_scan.py", "pre-push-github.sh", "lmgw-pin.sh"]
 REAL_ROOT = "89dae3db1697e14887872af3b99f09f0b873e685"
 PRIVATE_HOST = "git.private-host.test"
 # Built at run time, so this file carries no address-shaped string of its own.
@@ -41,6 +43,7 @@ class World:
     def __init__(self, tmp):
         self.tmp = tmp
         self.bare = os.path.join(tmp, "github.com", "kai.git")
+        self.lmgw = os.path.join(tmp, "github.com", "lmgw.git")
         self.src = os.path.join(tmp, "private")
         cfg = os.path.join(tmp, "config")
         os.makedirs(os.path.join(cfg, "lmgw"))
@@ -56,6 +59,7 @@ class World:
             "GIT_SSH_COMMAND": "false",
             "GIT_TERMINAL_PROMPT": "0",
             "KAI_PUBLISH_URL": self.bare,
+            "LMGW_PUBLIC_URL": self.lmgw,
             "LANG": "C.UTF-8",
         }
         os.makedirs(self.env["HOME"])
@@ -141,8 +145,33 @@ def setup(tmp, seeded=True):
     return private(w)
 
 
+def public_lmgw(w):
+    """The public lmgw: releases v0.4.3 and v0.4.4, of other trees; LMGW_PIN pins v0.4.4."""
+    seed = os.path.join(w.tmp, "lmgw-seed")
+    os.makedirs(seed)
+    w.git("init", "-q", "-b", "main", cwd=seed)
+    for k, v in [("user.name", "Tester"), ("user.email", "1+tester@users.noreply.github.com")]:
+        w.git("config", k, v, cwd=seed)
+    for version in ["0.4.3", "0.4.4"]:
+        with open(os.path.join(seed, "Cargo.toml"), "w") as f:
+            f.write(f'version = "{version}"\n')
+        w.git("add", "Cargo.toml", cwd=seed)
+        w.git("commit", "-q", "-m", f"lmgw {version}", cwd=seed)
+        w.git("tag", "-a", f"v{version}", "-m", f"lmgw {version}", cwd=seed)
+    w.lmgw_commit = w.rev("HEAD", cwd=seed)
+    w.lmgw_tree = w.rev("HEAD^{tree}", cwd=seed)
+    w.git("init", "-q", "--bare", "-b", "main", w.lmgw, cwd=w.tmp)
+    w.git("push", "-q", "--follow-tags", w.lmgw, "main", cwd=seed)
+
+
+def pin_text(w, tag="v0.4.4"):
+    return f"# the test's pin\nlmgw_commit {w.lmgw_commit}\nlmgw_tag {tag}\nlmgw_tree {w.lmgw_tree}\n"
+
+
 def private(w):
-    # The private repo: starts at its private root, carries the scripts under test.
+    # The private repo: starts at its private root, carries the scripts under test and a pin to
+    # the public lmgw's v0.4.4.
+    public_lmgw(w)
     os.makedirs(w.src)
     w.git("init", "-q", "-b", "main")
     for k, v in [("user.name", "Tester"), ("user.email", "1+tester@users.noreply.github.com")]:
@@ -159,7 +188,9 @@ def private(w):
             f.write(text.replace(REAL_ROOT, w.old_root))
     with open(os.path.join(w.src, ".gitignore"), "w") as f:
         f.write("/target\n")
-    w.git("add", "scripts", ".gitignore")
+    with open(os.path.join(w.src, "LMGW_PIN"), "w") as f:
+        f.write(pin_text(w))
+    w.git("add", "scripts", ".gitignore", "LMGW_PIN")
     w.git("commit", "-q", "-m", "scripts")
     w.commit("README.md", "public v2\n", "readme")
     w.git("remote", "add", "github", w.bare)
@@ -366,6 +397,46 @@ def run(w):
     rc, out = w.publish("--dry-run", "-F", msg)
     check(rc == 3 and "no-reply address" in out, "a personal e-mail identity is refused", out)
     w.git("config", "user.email", "1+tester@users.noreply.github.com")
+
+    # --- the lmgw pin: the published tree's, a release of the public lmgw with the pinned tree --
+    unpublished = w.commit("LMGW_PIN", pin_text(w, "unpublished"), "pin an unpublished lmgw")
+    rc, out = w.publish("--dry-run", "-F", msg)
+    check(rc == 3 and "lmgw_tag is unpublished" in out,
+          "a tree pinned to an unpublished lmgw is refused", out)
+    w.commit("LMGW_PIN", pin_text(w, "v0.4.3"), "pin another release")
+    rc, out = w.publish("--dry-run", "-F", msg)
+    check(rc == 3 and "not lmgw_tree" in out,
+          "a tree pinned to a release of other source is refused", out)
+    w.commit("LMGW_PIN", pin_text(w, "v0.4.5"), "pin a release that was never published")
+    rc, out = w.publish("--dry-run", "-F", msg)
+    check(rc == 3 and "cannot fetch lmgw_tag v0.4.5" in out,
+          "a tree pinned to a tag the public lmgw lacks is refused", out)
+    w.commit("LMGW_PIN", pin_text(w), "pin the published release")
+    check(w.rev("main^{tree}") == tree, "the pin is back at the approved tree")
+    with open(os.path.join(w.src, "LMGW_PIN"), "w") as f:
+        f.write(pin_text(w, "unpublished"))
+    rc, out = w.publish("--dry-run", "-F", msg)
+    check(rc == 0 and "gate: open" in out,
+          "the committed pin counts, not the working tree's", out)
+    w.git("checkout", "--", "LMGW_PIN")
+    rc, out = w.publish("--dry-run", "--ref", unpublished, "-F", msg)
+    check(rc == 3 and "lmgw_tag is unpublished" in out,
+          "the pin of the ref published counts, not HEAD's", out)
+    # A cache directory that is no repository: the fetch stays out of the private repo.
+    cache = os.path.join(w.src, "target", "lmgw-public.git")
+    shutil.rmtree(cache)
+    os.makedirs(cache)
+    rc, out = w.publish("--dry-run", "-F", msg)
+    shallow = w.git("rev-parse", "--is-shallow-repository").stdout.strip()
+    leaked = w.git("tag", "-l", "v0.4.4").stdout.strip()
+    check(rc == 0 and "gate: open" in out and shallow == "false" and leaked == "",
+          "an empty cache directory is made a repository, the private repo stays untouched",
+          f"shallow={shallow} tag={leaked!r}\n{out}")
+    lmgw_env = w.env.pop("KAI_PUBLISH_URL")
+    rc, out = w.publish("--dry-run", "-F", msg)
+    check(rc != 0 and "LMGW_PUBLIC_URL is set" in out,
+          "another public lmgw is refused for a publish to GitHub", out)
+    w.env["KAI_PUBLISH_URL"] = lmgw_env
 
     # --- the publish ----------------------------------------------------------------------------
     rc, out = w.publish("--dry-run", "-F", msg)

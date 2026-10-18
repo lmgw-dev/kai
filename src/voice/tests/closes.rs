@@ -51,11 +51,14 @@ pub(super) fn shows(m: &TrayModel, loss: KeyLoss, words: &str) {
         KeyLoss::PairAgain => Pairing::Revoked {
             reason: words.into(),
         },
+        KeyLoss::Lapsed => Pairing::PairAgain {
+            why: "this device's certificate lapsed on 2100-01-01; pair it again".into(),
+        },
     };
     assert_eq!(m.pairing, expected);
     let menu = render(m).menu;
     match loss {
-        KeyLoss::PairAgain => assert_eq!(
+        KeyLoss::PairAgain | KeyLoss::Lapsed => assert_eq!(
             menu,
             [
                 MenuEntry::PairWithLmgw,
@@ -81,14 +84,17 @@ pub(super) fn summary(loss: KeyLoss) -> &'static str {
     match loss {
         KeyLoss::Disabled => "Kai: this device is disabled",
         KeyLoss::Expired => "Kai: this device's key expired",
-        KeyLoss::PairAgain => "Kai: pair again",
+        KeyLoss::PairAgain | KeyLoss::Lapsed => "Kai: pair again",
     }
 }
 
 pub(super) fn is_lost(m: &TrayModel) -> bool {
     matches!(
         m.pairing,
-        Pairing::Revoked { .. } | Pairing::Disabled { .. } | Pairing::Expired { .. }
+        Pairing::Revoked { .. }
+            | Pairing::Disabled { .. }
+            | Pairing::Expired { .. }
+            | Pairing::PairAgain { .. }
     )
 }
 
@@ -112,9 +118,9 @@ async fn a_4003_close_says_what_its_kind_asks() {
             "device 'kai' expired",
         ),
         (
-            "key_unknown: device 'kai' was rotated — pair it again",
+            "key_unknown: the key of device 'kai' was replaced — pair it again",
             KeyLoss::PairAgain,
-            "device 'kai' was rotated — pair it again",
+            "the key of device 'kai' was replaced — pair it again",
         ),
         (
             "revoked: key 'kai' was disabled",

@@ -1,6 +1,6 @@
 //! Kai's delegates (ruling 21, K25, WP17): `look` and `find`, each a hosted tool whose call runs
 //! `kai_delegate`'s loop with
-//! - **the model**: lmgw's `/v1/chat/completions` under Kai's device key ([`model`]), on the
+//! - **the model**: lmgw's `/v1/chat/completions` as Kai's device ([`model`]), on the
 //!   delegate's alias (`[delegate]`, [`settings`]), else the Kai conversation's (its folder's
 //!   model, asked from lmgw at each call, so a change on the dashboard holds at once);
 //! - **the tools**: the desktop module's entries (WP14 to WP16), called in process, each call by
@@ -68,8 +68,6 @@ pub struct Inner {
     pub policy: SharedPolicy,
     pub confirmer: Arc<dyn Confirmer>,
     pub creds: watch::Receiver<Option<Credentials>>,
-    /// `None`: it could not be built (logged at the start; each call says it).
-    pub client: Option<reqwest::Client>,
     pub settings: DelegateConfig,
     /// `conversation.folder_name` and `conversation.folder_id`: the Kai conversation's folder.
     pub folder_name: String,
@@ -83,27 +81,11 @@ pub struct Inner {
 /// The provider `registry::providers` lists, over the desktop module's provider.
 pub fn provider(deps: &Deps, desktop: impl Provider) -> DelegateTools {
     let timeout = deps.config.lmgw.timeout();
-    // As the feed's: no proxy (Kai talks to its gateway directly), the system's trust store.
-    let client = match reqwest::Client::builder()
-        .no_proxy()
-        .connect_timeout(timeout)
-        .build()
-    {
-        Ok(c) => Some(c),
-        Err(e) => {
-            tracing::error!(
-                "delegate: cannot build the HTTP client: {}; look and find will fail",
-                crate::lmgw_link::describe(&e)
-            );
-            None
-        }
-    };
     DelegateTools::new(Inner {
         desktop: Box::new(desktop),
         policy: deps.policy.clone(),
         confirmer: Arc::new(Dialog(deps.ui.clone())),
         creds: deps.creds.clone(),
-        client,
         settings: deps.config.delegate.clone(),
         folder_name: deps.config.conversation.folder_name.clone(),
         folder_id: deps.config.conversation.folder_id,
@@ -202,11 +184,8 @@ impl Inner {
                 "Kai is not linked to lmgw, so the {name} delegate has no model"
             ));
         };
-        let Some(client) = self.client.clone() else {
-            return failed("Kai could not build its HTTP client (see its log)".into());
-        };
         let alias = tokio::select! {
-            a = self.alias(name, &creds, &client) => a,
+            a = self.alias(name, &creds) => a,
             () = call.cancel.cancelled() => return Reply::error(format!("the {name} task was cancelled")),
         };
         let alias = match alias {
@@ -218,7 +197,7 @@ impl Inner {
         };
         if d.vision {
             let seen = tokio::select! {
-                s = self.vision(&alias, &creds, &client) => s,
+                s = self.vision(&alias, &creds) => s,
                 () = call.cancel.cancelled() => return Reply::error(format!("the {name} task was cancelled")),
             };
             if seen == Some(false) {
@@ -229,7 +208,7 @@ impl Inner {
                 ));
             }
         }
-        let model = LmgwModel::new(client, creds.url.clone(), creds.key.clone(), alias.clone());
+        let model = LmgwModel::new(creds.clone(), alias.clone());
         let tools = KaiTools {
             delegate: name,
             entries: self
@@ -300,14 +279,11 @@ impl Inner {
 
     /// Whether lmgw lists `alias` with vision (`capabilities.vision` of `/v1/models`): `None` when
     /// lmgw does not say or cannot be asked, and the task goes on.
-    async fn vision(
-        &self,
-        alias: &str,
-        creds: &Credentials,
-        client: &reqwest::Client,
-    ) -> Option<bool> {
-        let req = model::models().bearer(creds.key.expose());
-        match tokio::time::timeout(self.lmgw_timeout, model::send(client, &creds.url, req)).await {
+    async fn vision(&self, alias: &str, creds: &Credentials) -> Option<bool> {
+        let req = model::models();
+        let (http, url) = (creds.http(), creds.url());
+        let asked = model::send(&http, &url, req);
+        match tokio::time::timeout(self.lmgw_timeout, asked).await {
             Ok(Ok((status, body))) if (200..300).contains(&status) => {
                 model::vision_of(&body, alias)
             }
@@ -316,18 +292,12 @@ impl Inner {
     }
 
     /// The delegate's alias: `delegate.<name>`, else the Kai conversation's folder's model.
-    async fn alias(
-        &self,
-        name: &str,
-        creds: &Credentials,
-        client: &reqwest::Client,
-    ) -> Result<String, String> {
+    async fn alias(&self, name: &str, creds: &Credentials) -> Result<String, String> {
         if let Some(a) = self.settings.alias(name) {
             return Ok(a.to_owned());
         }
         conversation_alias(
             &Conversation {
-                client,
                 creds,
                 folder_name: &self.folder_name,
                 folder_id: self.folder_id,
@@ -342,7 +312,6 @@ impl Inner {
 
 /// Where the Kai conversation's alias is asked for.
 pub struct Conversation<'a> {
-    pub client: &'a reqwest::Client,
     pub creds: &'a Credentials,
     /// `conversation.folder_name` and `conversation.folder_id`.
     pub folder_name: &'a str,
@@ -359,23 +328,24 @@ pub async fn conversation_alias(
     who: &str,
     set: &str,
 ) -> Result<String, String> {
-    let req = requests::folders().bearer(c.creds.key.expose());
+    let req = requests::folders();
     let secs = c.timeout.as_secs();
-    let (status, body) =
-        match tokio::time::timeout(c.timeout, model::send(c.client, &c.creds.url, req)).await {
-            Ok(Ok(answer)) => answer,
-            Ok(Err(e)) => {
-                return Err(format!(
-                    "Kai could not ask lmgw for the Kai conversation's alias ({e}); {set}"
-                ));
-            }
-            Err(_) => {
-                return Err(format!(
-                    "lmgw did not list the folders within {secs} s (lmgw.timeout_s), so the Kai \
+    let (http, url) = (c.creds.http(), c.creds.url());
+    let asked = model::send(&http, &url, req);
+    let (status, body) = match tokio::time::timeout(c.timeout, asked).await {
+        Ok(Ok(answer)) => answer,
+        Ok(Err(e)) => {
+            return Err(format!(
+                "Kai could not ask lmgw for the Kai conversation's alias ({e}); {set}"
+            ));
+        }
+        Err(_) => {
+            return Err(format!(
+                "lmgw did not list the folders within {secs} s (lmgw.timeout_s), so the Kai \
                      conversation's alias is not known; {set}"
-                ));
-            }
-        };
+            ));
+        }
+    };
     let list = requests::read_folders(status, &body).map_err(|e| {
         format!(
             "lmgw refused the folder list ({}: {}); {set}",

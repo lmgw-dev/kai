@@ -200,15 +200,16 @@ pub enum FeedFact {
     /// `resync`: the feed could not resume where it left off, so a move of the conversation may
     /// have been missed; Kai asks for its thread again (§3.2).
     Resync,
-    /// `approval.requested` (WP19): a call of a thread the device sees waits for an approval.
+    /// The feed's open set at `caught_up` (WP19, device link §7.3): every call that waits now in
+    /// the threads the device sees, at every connection of the feed; the approvals reconcile
+    /// against it.
+    ApprovalsOpen(Vec<approvals::Requested>),
+    /// After `caught_up`, a call of a thread the device sees waits for an approval: an
+    /// `approval.requested`, or a `state`'s set that gained it.
     ApprovalRequested(approvals::Requested),
-    /// `approval.decided`: a waiting call was decided (approved, declined, or approved and never
-    /// run: `approve` false).
-    ApprovalDecided {
-        id: String,
-        approve: bool,
-        by: Option<String>,
-    },
+    /// After `caught_up`, calls that wait no more, by id: decided, their reply or thread gone, or
+    /// out of the device's reach.
+    ApprovalsWithdrawn(Vec<String>),
     /// `task.done` (WP18): a job's result entered its thread.
     TaskDone(lmgw_client::realtime::TaskDone),
 }
@@ -367,7 +368,7 @@ pub struct Voice<L> {
     revoked_unknown: Option<String>,
     timing_line: Option<String>,
     /// `lmgw.response.timing` not handed to the ring yet.
-    timing_new: Option<serde_json::Value>,
+    timing_new: Option<lmgw_client::realtime::VoiceTiming>,
     /// Numbers hold periods: every hold change starts one (K21, §5.6).
     period: u64,
     notified: HashSet<(u64, String, String)>,
@@ -538,7 +539,7 @@ impl<L: VoiceLink> Voice<L> {
     }
 
     /// A new `lmgw.response.timing` for the ring's `setTiming`.
-    pub fn take_timing(&mut self) -> Option<serde_json::Value> {
+    pub fn take_timing(&mut self) -> Option<lmgw_client::realtime::VoiceTiming> {
         self.timing_new.take()
     }
 
@@ -796,12 +797,11 @@ impl<L: VoiceLink> Voice<L> {
                 self.approvals.thread_title(thread_id, &title);
                 self.thread_changed(thread_id, title, archived, last_message_at)
             }
+            FeedFact::ApprovalsOpen(set) => self.approvals.open_set(set),
             FeedFact::ApprovalRequested(r) => {
                 self.approvals.requested(r.thread_id, r.request, None);
             }
-            FeedFact::ApprovalDecided { id, approve, by } => {
-                self.approvals.decided(&id, approve, by.as_deref());
-            }
+            FeedFact::ApprovalsWithdrawn(ids) => self.approvals.withdrawn(&ids),
             FeedFact::ThreadGone { thread_id } => {
                 self.approvals.thread_gone(thread_id);
                 if self.thread_id() == Some(thread_id) {

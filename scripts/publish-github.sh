@@ -27,11 +27,14 @@
 # writes target/publish/<tree12>.diff (the whole diff from the public tip), .binaries (the added
 # or changed binary files) and .scan (scripts/publish_scan.py: secret shapes, every non-GitHub
 # remote host, and the private denylist), then gates: the diff and scan must be the ones
-# approved in target/publish/<tree sha>.approved, the messages must scan clean, and the author
-# and committer e-mail must be GitHub no-reply addresses. Then it shows the commit, asks for
-# the word "publish" on the terminal and pushes with KAI_PUBLISH=1, which the pre-push hook
-# requires. Each publish is recorded in .git/info/publish-map as "<ref sha> <public sha> <date>",
-# and a ref older than one recorded there is refused: copying it would revert the public repo.
+# approved in target/publish/<tree sha>.approved, the messages must scan clean, the author
+# and committer e-mail must be GitHub no-reply addresses, and the tree's LMGW_PIN must name a
+# published lmgw release with the pinned tree, which GitHub's CI clones (scripts/lmgw-pin.sh
+# verify-published; between lmgw releases the pin says `unpublished`, for GitLab's builds only).
+# Then it shows the commit, asks for the word "publish" on the terminal and pushes with
+# KAI_PUBLISH=1, which the pre-push hook requires. Each publish is recorded in
+# .git/info/publish-map as "<ref sha> <public sha> <date>", and a ref older than one recorded
+# there is refused: copying it would revert the public repo.
 #
 # The first publish: while github has no main at all (the repository was created empty) and
 # publish-map records no publish, the commit is a root commit, `git commit-tree <ref>^{tree}`
@@ -42,7 +45,8 @@
 # lmgw's publish reads, ${XDG_CONFIG_HOME:-~/.config}/lmgw/publish-denylist, one case-insensitive
 # regular expression per line, '#' comments (format and examples: scripts/publish_scan.py).
 # KAI_PUBLISH_URL overrides the public URL (tests point it at a local bare repo): the github
-# remote must name it, and every fetch and the push go to it.
+# remote must name it, and every fetch and the push go to it. LMGW_PUBLIC_URL does the same for the
+# public lmgw the pin is checked against, and is refused without KAI_PUBLISH_URL.
 set -euo pipefail
 
 REMOTE=github
@@ -142,6 +146,12 @@ case "$(realpath "$DENYLIST")" in
     "$(pwd -P)"/*) die "the denylist $DENYLIST is inside the repo: it holds private words, keep it outside" ;;
 esac
 
+# The pin is checked against another public lmgw than GitHub's only where the publish goes
+# elsewhere too (the test).
+if [[ -n "${LMGW_PUBLIC_URL:-}" && -z "${KAI_PUBLISH_URL:-}" ]]; then
+    die "LMGW_PUBLIC_URL is set ($LMGW_PUBLIC_URL): a publish to GitHub checks the pin against GitHub's lmgw; unset it"
+fi
+
 map="$(git rev-parse --git-common-dir)/info/publish-map"
 # github's main, or none at all: the repository was created empty and nothing is published yet.
 # ls-remote's exit code 2 is "no such ref" (anything else failing is a real error).
@@ -224,6 +234,13 @@ if [[ -n "$tag" ]]; then
     tag_msg="$OUT/$t12.tag-message"
     git cat-file tag "refs/tags/$tag" | sed '1,/^$/d' | sed '/^-----BEGIN [A-Z]* SIGNATURE-----$/,$d' > "$tag_msg"
     [[ -s "$tag_msg" ]] || die "$tag has an empty message: the release would have no notes"
+fi
+
+# The lmgw release the tree is pinned to, as committed in it: GitHub's CI and release build clone it.
+if pin_check="$(scripts/lmgw-pin.sh --at "$src" verify-published 2>&1)"; then
+    echo "lmgw pin: $pin_check"
+else
+    reasons+=("${pin_check//$'\n'/; }")
 fi
 
 # Who the commit and the tag name. Only GitHub's no-reply addresses are published.

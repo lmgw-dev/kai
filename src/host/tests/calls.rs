@@ -117,6 +117,64 @@ async fn a_confirmation_that_cannot_be_shown_denies() {
     assert_eq!(r.ran.all(), Vec::<String>::new());
 }
 
+/// The confirmation's "always allow" box: offered to a trusted caller once the core is known,
+/// unticked and after the tool's own boxes; ticked and allowed, the core is told the tool, and
+/// neither a denial nor an unticked Allow tells it anything. An untrusted caller gets no box
+/// (`allow_trusted` would still ask about its calls), and neither does a host without the core.
+#[tokio::test]
+async fn always_allow_is_offered_to_trusted_callers_and_told_to_the_core() {
+    use crate::core::Command;
+    use std::sync::atomic::Ordering;
+
+    let mut r = rig().await;
+    let mut c = r.linked().await;
+    let id = c.call("poke", json!({"text": "x"}), owner(), 60_000).await;
+    let q = r.ask().await;
+    assert!(q.options.is_empty(), "no core yet: no box");
+    q.reply.send(true).unwrap();
+    c.answer(id, &mut Vec::new()).await;
+
+    let (core, mut told) = mpsc::unbounded_channel();
+    r.host.set_core(core);
+    // Ticked and allowed: the call runs, and the core hears the tool's own name.
+    let id = c.call("poke", json!({"text": "x"}), owner(), 60_000).await;
+    let q = r.ask().await;
+    let [always] = &q.options[..] else {
+        panic!("one box: {:?}", q.options);
+    };
+    assert!(
+        always.label.starts_with("Always allow poke:"),
+        "{}",
+        always.label
+    );
+    assert!(!always.is_ticked(), "unticked when it opens");
+    always.ticked.store(true, Ordering::SeqCst);
+    q.reply.send(true).unwrap();
+    assert_eq!(text_of(&c.answer(id, &mut Vec::new()).await).0, "poked");
+    assert!(
+        matches!(told.try_recv(), Ok(Command::AllowAlways { tool }) if tool == "poke"),
+        "the core is told"
+    );
+    // Allowed without the tick, and denied with it: nothing is told.
+    let id = c.call("poke", json!({"text": "x"}), owner(), 60_000).await;
+    r.ask().await.reply.send(true).unwrap();
+    c.answer(id, &mut Vec::new()).await;
+    let id = c.call("poke", json!({"text": "x"}), owner(), 60_000).await;
+    let q = r.ask().await;
+    q.options[0].ticked.store(true, Ordering::SeqCst);
+    q.reply.send(false).unwrap();
+    assert!(text_of(&c.answer(id, &mut Vec::new()).await).1);
+    assert!(told.try_recv().is_err(), "nothing is told");
+    // An untrusted caller: no box.
+    let id = c
+        .call("poke", json!({"text": "x"}), key("script"), 60_000)
+        .await;
+    let q = r.ask().await;
+    assert!(q.options.is_empty(), "{:?}", q.options);
+    q.reply.send(false).unwrap();
+    c.answer(id, &mut Vec::new()).await;
+}
+
 /// The screen lock (the owner's decision, 2026-10-09): every call is refused while it is locked,
 /// a call waiting for the owner's confirmation and a running one are stopped at the lock, and
 /// after the unlock calls run again.

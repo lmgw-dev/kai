@@ -466,3 +466,22 @@ fn a_reset_forgets_the_gateways_folder() {
         "found and remembered anew"
     );
 }
+
+/// A lookup or create dropped with its request (a re-pair, a revocation) waits for no answer: the
+/// next connected start looks the folder up again (the security review's S1).
+#[test]
+fn a_dropped_request_is_asked_again_at_the_next_hello() {
+    let mut c = Conversation::new("Kai", None);
+    assert_eq!(c.connected(), vec![Action::Lookup]);
+    let acts = c.listed(Ok(Vec::new()));
+    assert!(acts.contains(&Action::Create("Kai".into())), "{acts:?}");
+    // The create's request goes with the pairing it was sent under.
+    c.dropped();
+    assert_eq!(
+        c.connected(),
+        vec![Action::Lookup],
+        "not held behind the create"
+    );
+    c.dropped();
+    assert_eq!(c.connected(), vec![Action::Lookup]);
+}

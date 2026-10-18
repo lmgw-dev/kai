@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # WP8's live check (§15.1.4): Kai's hosted MCP server against a dev lmgw on 127.0.0.1:8897 with
 # lmgw's host link (M1, api WP7) and the tool-calling mock (M7, scripts/mock-openai.py TOOL_SCRIPT):
-#   1. the grant: a device key minted with hosts_label "kailive", paired by the handler's path
-#      (the live-test build confirms the link this script minted, no dialog); the tooltip says
+#   1. the grant: a device minted for this computer with hosts_label "kailive" over lmgw's device
+#      link (scripts/live-device-link.sh: the device listener on, key_create's v2 link), paired by
+#      the handler's path (the live-test build confirms the link this script minted, no dialog),
+#      Kai's enrolment, the owner's Confirm of the code Kai shows (device_confirm); the tooltip says
 #      "tools: linked as kailive";
 #   2. the device's row on lmgw's MCP page: device:kai-live, transport device, prefix kailive,
 #      status ready; the link's limits Kai read from initialize's _meta["lmgw/host_limits"] are
@@ -15,7 +17,7 @@
 #   5. the dev lmgw restarts with mcp.host_max_message_mb 0: the tooltip says the link is offline,
 #      then linked again, and the new link's limits say no message bound (null), frames still
 #      bounded;
-#   6. no key and no tool argument in Kai's log (KAI_LOG=trace); a clean quit.
+#   6. no key, token and no tool argument in Kai's log (KAI_LOG=trace); a clean quit.
 # Usage: scripts/live-check-host.sh [lmgw checkout]   (default: ../lmgw, with M1 and M7 in it)
 #
 # Isolation as scripts/live-check-link.sh: Kai's config and state under target/live-host, the
@@ -34,6 +36,8 @@ cd "$(dirname "$0")/.."
 source scripts/private-bus.sh "$PWD/target/live-host-bus" "$self" "$@"
 # shellcheck source=scripts/shortcuts-guard.sh
 source scripts/shortcuts-guard.sh
+# shellcheck source=scripts/live-device-link.sh
+source scripts/live-device-link.sh
 
 LMGW=$(realpath "${1:-../lmgw}")
 ADDR=127.0.0.1:8897
@@ -49,6 +53,7 @@ LMGW_PID=""
 KAI_PID=""
 MOCK_PID=""
 SNI=""
+DEV_FP=""
 
 fail() { echo "FAIL: $*" | tee -a "$VERDICTS" >&2; exit 1; }
 pass() { echo "PASS: $*" | tee -a "$VERDICTS"; }
@@ -85,11 +90,11 @@ cleanup() {
   stop_kai >/dev/null 2>&1
   stop_lmgw >/dev/null 2>&1
   if [ -n "$MOCK_PID" ]; then kill -TERM "$MOCK_PID" 2>/dev/null; wait "$MOCK_PID" 2>/dev/null; fi
-  secret-tool clear application dev.rootshell.kai lmgw "$URL" 2>/dev/null
+  [ -z "$DEV_FP" ] || secret-tool clear application dev.rootshell.kai lmgw "$DEV_FP" 2>/dev/null
   private_bus_stop
   left=$(podman ps -a --format '{{.Names}}' 2>/dev/null | grep '^lmgw-kaihost' || true)
   [[ -z $left ]] || echo "WARNING: dev containers left: $left"
-  # The dev lmgw's log carries its owner login link; its data dir the minted keys.
+  # The dev lmgw's log carries its owner login link; its data dir the device CA and the keys.
   rm -rf "$DATA" "$OUT/lmgw.log" "$OUT/config" "$OUT/state" "$OUT/no-pipewire" "$HEADLESS" "$KAI"
 }
 trap 'cleanup; kgs_check || exit 1' EXIT
@@ -98,10 +103,11 @@ trap 'cleanup; kgs_check || exit 1' EXIT
 if busctl --user status dev.rootshell.kai >/dev/null 2>&1; then fail "a Kai already runs; quit it first"; fi
 locked=$(busctl --user get-property org.freedesktop.secrets /org/freedesktop/secrets/aliases/default \
   org.freedesktop.Secret.Collection Locked 2>/dev/null || echo "unknown")
-[ "$locked" = "b false" ] || fail "the wallet is locked or unknown ($locked): unlock KWallet first"
-[ -z "$(secret-tool lookup application dev.rootshell.kai lmgw "$URL" 2>/dev/null)" ] \
-  || fail "an item for $URL exists already; not touching it"
-if ss -ltnH "sport = :8897" | grep -q .; then fail "something listens on 8897 already"; fi
+[ "$locked" = "b false" ] || fail "the private keyring is locked or unknown ($locked)"
+# 8898: the device listener (loopback, the HTTP port plus one).
+for port in 8897 8898; do
+  if ss -ltnH "sport = :$port" | grep -q .; then fail "something listens on $port already"; fi
+done
 [ -x "$LMGW/target/debug/examples/headless" ] \
   || fail "no dev lmgw build: cargo build -p lmgw-core --example headless in $LMGW"
 grep -q TOOL_SCRIPT "$LMGW/scripts/mock-openai.py" || fail "$LMGW's mock-openai.py has no TOOL_SCRIPT (M7)"
@@ -146,19 +152,19 @@ op() {
   bearer "$TOKEN" | curl -sS --max-time 10 -X POST "$URL/api/op/$1" -H @- \
     -H 'Content-Type: application/json' -d "$2"
 }
+owner_get() { bearer "$TOKEN" | curl -sS --max-time 10 "$URL$1" -H @-; }
 op upstream_set "{\"action\": \"create\", \"name\": \"mock-chat\", \"protocol\": \"llama_cpp\", \"base_url\": \"http://127.0.0.1:$CHAT/v1\"}" >/dev/null
 op model_set '{"action": "create", "alias": "kai-chat", "upstream": "mock-chat", "upstream_model": "triage"}' >/dev/null
 
-created=$(op key_create "{\"kind\": \"device\", \"name\": \"kai-live\", \"url\": \"$URL\", \"hosts_label\": \"$LABEL\"}")
-echo "$created" | jq -e .key >/dev/null 2>&1 || fail "key_create answered: $(echo "$created" | jq -c 'del(.. | .key?, .link?)' 2>/dev/null || echo unreadable)"
-KEY=$(echo "$created" | jq -r .key)
-LINK=$(echo "$created" | jq -r .link)
+devices_on
+mint kai-live "\"hosts_label\": \"$LABEL\""
+LINK=$DEV_LINK
+TOKENHEX=$(token_hex "$LINK")
 denied=$(op key_create '{"kind": "client", "name": "kailive-deny", "tool_scope_mode": "deny"}')
-# A client key answers its plaintext once as `plaintext` (a device key's is `key`).
-DKEY=$(echo "$denied" | jq -r .plaintext)
-[ -n "$DKEY" ] && [ "$DKEY" != null ] || fail "the deny key was not minted: $(echo "$denied" | jq -c 'del(.plaintext)')"
-accept_entry() { printf '%s#%s' "$1" "$(printf %s "$2" | sha256sum | cut -d' ' -f1)"; }
-ACCEPT=$(accept_entry "$URL" "$KEY")
+# A client key answers its secret once as `key` (a device's pairing is its link).
+DKEY=$(echo "$denied" | jq -r .key)
+[ -n "$DKEY" ] && [ "$DKEY" != null ] || fail "the deny key was not minted: $(echo "$denied" | jq -c 'del(.key)')"
+ACCEPT=$(accept_entry "$LINK")
 
 # ---------------------------------------------------------------- Kai
 kai_config "$OUT/config/kai/config.toml" '[lmgw]\nretry_max_s = 4\n'
@@ -192,6 +198,12 @@ logged() { grep -qF -- "$1" "$OUT/kai.log"; }
 start_kai
 XDG_CONFIG_HOME=$OUT/config KAI_LIVE_LINK=1 "$KAI" "$LINK" >>"$OUT/handler.log" 2>&1 \
   || fail "the handler failed (see $OUT/handler.log)"
+# Kai enrolled its key; the owner confirms the code it shows (lmgw's device link §3.5).
+until_ 30 "waiting for the owner's confirmation" tip_has "waiting for your confirmation on lmgw"
+CODE=$(code_in "$(tooltip)")
+[ -n "$CODE" ] || fail "no code in the tooltip: $(tooltip)"
+confirm "$DEV_ID" "$CODE"
+note "Kai enrolled its key; the owner confirmed $CODE"
 
 # 1. The grant.
 until_ 30 "the tools linked as $LABEL" tip_has "tools: linked as $LABEL ("
@@ -291,6 +303,10 @@ pass "the second link (mcp.host_max_message_mb 0): no message bound read from th
 
 # 6. The log and the quit.
 stop_kai || fail "Kai's quit failed"
-grep -qF "${KEY#lmgw-device-}" "$OUT/kai.log" && fail "the device key is in Kai's log"
+PEMLINE=$(secret-tool lookup application dev.rootshell.kai lmgw "$DEV_FP" 2>/dev/null | sed -n 2p)
+[ -n "$PEMLINE" ] || fail "no key of Kai's in the wallet for $DEV_FP"
+grep -qF -- "$PEMLINE" "$OUT/kai.log" && fail "the device key is in Kai's log"
+grep -qF -- "$TOKENHEX" "$OUT/kai.log" && fail "the pairing token is in Kai's log"
+grep -qi 'lmgw-pair:' "$OUT/kai.log" && fail "the pairing link is in Kai's log"
 grep -qF "$ARG" "$OUT/kai.log" && fail "the tool's argument is in Kai's log"
-pass "no key and no tool argument in Kai's log at KAI_LOG=trace; a clean quit"
+pass "no key, token, link or tool argument in Kai's log at KAI_LOG=trace; a clean quit"

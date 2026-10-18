@@ -5,7 +5,7 @@
 //! The log names the tool, the caller and what happened, never an argument or a result (rmcp's own
 //! traces, which carry whole messages, are capped in `crate::logging`).
 
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
 
 use kai_desktop::contract::ToolSpec;
@@ -18,13 +18,14 @@ use rmcp::model::{
 };
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData as McpError, Peer, RoleServer, ServerHandler};
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 
-use super::confirm::{ConfirmRequest, Confirmer};
+use super::confirm::{ConfirmRequest, Confirmer, DialogOption};
 use super::limits::{LinkLimits, answer_len};
 use super::policy::{Caller, Decision, Policy, SharedPolicy};
 use super::registry::{Args, Block, Call, Entry, Origin, Registry, Reply};
+use crate::core::Command;
 
 /// The JSON-RPC code of the answer to a call lmgw cancelled (it no longer waits for one; MCP asks
 /// for none, rmcp sends one anyway).
@@ -118,6 +119,9 @@ pub struct Shared {
     pub screen: crate::screen_lock::ScreenLock,
     /// K26's jobs (WP18, `super::tasks`): kept across reconnects, as lmgw follows them across links.
     pub jobs: crate::jobs::Jobs,
+    /// The core's commands, for the confirmation's "always allow" box ([`Shared::always_option`]):
+    /// the core writes the setting, as it does the settings window's. Unset: no box is offered.
+    pub core: OnceLock<mpsc::UnboundedSender<Command>>,
 }
 
 /// The current link's peer, tagged with the generation of the run that set it. The host moves the
@@ -190,7 +194,30 @@ impl Shared {
             limits: RwLock::new(LinkLimits::fallback(0, 0)),
             screen,
             jobs,
+            core: OnceLock::new(),
         }
+    }
+
+    /// The confirmation's "always allow" box for `caller`'s call of `spec`, unticked: ticked and
+    /// allowed, the core sets `policy.tools.<tool> = "allow_trusted"`, so the tool runs unasked for
+    /// trusted callers from then on and is still asked about for the others. Offered only where
+    /// that setting would have spared this dialog: to a trusted caller (naming a caller trusted is
+    /// `policy.trusted_callers`, the settings window's), and not for `routine_enable` switching a
+    /// routine on, which `allow_trusted` does not skip (`Policy::decide_call`).
+    fn always_option(&self, spec: &ToolSpec, args: &Args, caller: &Caller) -> Option<DialogOption> {
+        self.core.get()?;
+        let trusted = self
+            .policy
+            .read()
+            .expect("never poisoned")
+            .trusted_caller(caller);
+        (trusted && super::policy::approval_applies(spec, args)).then(|| {
+            DialogOption::new(format!(
+                "Always allow {}: no dialog again for the owner, Kai itself and trusted callers \
+                 (Settings \u{2192} Tools changes it back)",
+                self.shown_name(spec.name)
+            ))
+        })
     }
 
     /// Lists the tools again (a provider's change, a policy change). When the list changed and a
@@ -336,6 +363,13 @@ impl Shared {
                 if let Some(p) = &prepared {
                     lines.extend(p.lines.iter().cloned());
                 }
+                // The tool's own boxes first, "always allow" last (next to the buttons).
+                let always = self.always_option(spec, &args, caller);
+                let options = prepared
+                    .iter()
+                    .flat_map(|p| p.options.iter().cloned())
+                    .chain(always.clone())
+                    .collect();
                 self.confirmer.ask(ConfirmRequest {
                     tool: self.shown_name(tool),
                     description: spec.description.to_owned(),
@@ -343,10 +377,7 @@ impl Shared {
                     lines,
                     destructive: spec.hints.destructive,
                     deadline: std_deadline,
-                    options: prepared
-                        .as_ref()
-                        .map(|p| p.options.clone())
-                        .unwrap_or_default(),
+                    options,
                     notes: prepared
                         .as_ref()
                         .map(|p| p.notes.clone())
@@ -368,7 +399,17 @@ impl Shared {
                     }
                 };
                 match answered {
-                    Some(true) => tracing::info!(tool, "host: the owner allowed the call"),
+                    Some(true) => {
+                        tracing::info!(tool, "host: the owner allowed the call");
+                        if always.is_some_and(|o| o.is_ticked())
+                            && let Some(core) = self.core.get()
+                        {
+                            tracing::info!(tool, "host: the owner ticked \"always allow\"");
+                            let _ = core.send(Command::AllowAlways {
+                                tool: tool.to_owned(),
+                            });
+                        }
+                    }
                     Some(false) => {
                         tracing::info!(tool, "host: the owner denied the call");
                         return Err(Stop::Refused(format!(

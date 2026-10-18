@@ -132,6 +132,75 @@ async fn no_grant_is_said_and_the_feed_s_hello_tries_again() {
     );
 }
 
+/// lmgw's device link §3.5: 403 `device_unconfirmed` is no missing grant: the tool link waits for
+/// the owner's Confirm and links at the feed's next `hello`.
+#[tokio::test]
+async fn an_unconfirmed_device_waits_for_the_feeds_hello() {
+    let mut r = rig_with(PolicyConfig::default(), settings(30)).await;
+    r.fake
+        .refuse(
+            403,
+            json!({"code": "device_unconfirmed", "message": "confirm 7F3A-91C2 on the Devices card"}),
+        )
+        .await;
+    let s = r.status(|s| matches!(s, HostStatus::Offline { .. })).await;
+    let line = crate::host::tools_line(&s, None);
+    assert!(
+        line.contains("waiting for you to confirm this device on lmgw's Devices card"),
+        "{line}"
+    );
+    r.fake.none_within(Duration::from_millis(1500)).await;
+    r.host.feed_up("desktop", Some("kai"));
+    let mut c = r.fake.accept().await;
+    c.initialize().await;
+    r.status(|s| matches!(s, HostStatus::Linked { .. })).await;
+}
+
+/// A `device_unconfirmed` 403 whose body comes after the head is still read by its code (the
+/// security review's nit): the body is read to its end before the status decides.
+#[tokio::test]
+async fn a_late_body_still_decides_the_403() {
+    let mut r = rig_with(PolicyConfig::default(), settings(30)).await;
+    r.fake
+        .refuse_after(
+            403,
+            json!({"code": "device_unconfirmed", "message": "confirm 7F3A-91C2 on the Devices card"}),
+            Some(Duration::from_millis(300)),
+        )
+        .await;
+    let s = loop {
+        match r.event().await {
+            HostEvent::Status(s @ HostStatus::Offline { .. }) => break s,
+            HostEvent::Status(s @ HostStatus::NotGranted { .. }) => panic!("read as {s:?}"),
+            _ => {}
+        }
+    };
+    let line = crate::host::tools_line(&s, None);
+    assert!(
+        line.contains("waiting for you to confirm this device"),
+        "{line}"
+    );
+}
+
+/// A credential beside the certificate (400 `credential_on_device_listener`) opens nothing either.
+#[tokio::test]
+async fn a_credential_on_the_device_listener_is_a_revocation() {
+    let mut r = rig().await;
+    r.fake
+        .refuse(
+            400,
+            json!({"code": "credential_on_device_listener", "message": "send no Authorization"}),
+        )
+        .await;
+    loop {
+        if let HostEvent::Revoked { reason, loss } = r.event().await {
+            assert_eq!(loss, Some(crate::lmgw_link::KeyLoss::PairAgain));
+            assert_eq!(reason, "send no Authorization");
+            break;
+        }
+    }
+}
+
 /// 401 at the handshake: the key opens nothing (§3.3), read by its code.
 #[tokio::test]
 async fn a_401_is_a_revocation() {
@@ -162,19 +231,98 @@ async fn an_unreachable_lmgw_is_retried_with_the_backoff() {
     // A rig's own fake, and the host pointed at the closed port instead.
     let (tx, events) = mpsc::unbounded_channel();
     r.events = events;
-    r.host.start(
-        Credentials {
-            url,
-            key: DeviceKey::parse(KEY).unwrap(),
-        },
-        tx,
-    );
+    r.host.start(creds(&url), tx);
     let s = r.status(|s| matches!(s, HostStatus::Offline { .. })).await;
     let line = crate::host::tools_line(&s, None);
     assert!(
         line.contains("lmgw is not reachable") && line.contains("next try in 1 s"),
         "{line}"
     );
+}
+
+/// Device link D15: the tool link's WebSocket refuses a server under another CA before it sends
+/// anything, says so, and tries again (the next try may reach the owner's lmgw).
+#[tokio::test]
+async fn the_tool_link_refuses_a_server_under_another_ca() {
+    use crate::lmgw_link::test_pki::{Clients, FOREIGN};
+    let foreign = Gateway::bind_as(&FOREIGN, Clients::None).await;
+    let mut r = rig().await;
+    let (tx, events) = mpsc::unbounded_channel();
+    r.events = events;
+    r.host.start(creds(&foreign.url), tx);
+    let handshake = tokio::time::timeout(WAIT, foreign.accept()).await.unwrap();
+    assert!(handshake.is_err(), "the handshake completed");
+    let s = r.status(|s| matches!(s, HostStatus::Offline { .. })).await;
+    let line = crate::host::tools_line(&s, None);
+    assert!(
+        line.contains("device authority changed") && line.contains("next try in 1 s"),
+        "{line}"
+    );
+}
+
+/// The next status the predicate takes; a revocation on the way fails the test.
+async fn unrevoked(r: &mut Rig, want: impl Fn(&HostStatus) -> bool) -> HostStatus {
+    loop {
+        match r.event().await {
+            HostEvent::Status(s) if want(&s) => return s,
+            HostEvent::Status(_) => {}
+            HostEvent::Revoked { reason, loss } => panic!("revoked: {reason} ({loss:?})"),
+        }
+    }
+}
+
+/// The security review's B1: a port squatter's plaintext alert right after the ClientHello never
+/// ends the tool link: said by TLS's name, and tried again on the backoff.
+#[tokio::test]
+async fn a_plaintext_alert_never_ends_the_tool_link() {
+    use crate::lmgw_link::test_pki::{self, Squatter};
+    let squatter = Squatter::bind().await;
+    let mut r = rig().await;
+    let (tx, events) = mpsc::unbounded_channel();
+    r.events = events;
+    r.host.start(creds(&squatter.url), tx);
+    for (alert, name) in [
+        (test_pki::BAD_CERTIFICATE, "bad_certificate"),
+        (test_pki::UNKNOWN_CA, "unknown_ca"),
+        (test_pki::CERTIFICATE_EXPIRED, "certificate_expired"),
+    ] {
+        tokio::time::timeout(WAIT, squatter.answer(alert))
+            .await
+            .expect("the tool link tried again");
+        let s = unrevoked(&mut r, |s| matches!(s, HostStatus::Offline { .. })).await;
+        let line = crate::host::tools_line(&s, None);
+        assert!(
+            line.contains(name) && line.contains("next try in") && !line.contains("pair again"),
+            "{line}"
+        );
+    }
+    tokio::time::timeout(WAIT, squatter.answer(test_pki::BAD_CERTIFICATE))
+        .await
+        .expect("the tool link still tries");
+}
+
+/// lmgw's own `certificate_expired` alert (a certificate past its date) is no revocation of the
+/// tool link either: said and tried again; the lapse is the feed's to find, by Kai's date.
+#[tokio::test]
+async fn a_certificate_alert_from_lmgw_is_said_and_tried_again() {
+    use crate::lmgw_link::test_pki::{PKI, device_cert};
+    let mut r = rig().await;
+    let mut p = PKI.paired(&[&r.fake.url]);
+    p.credentials.certificate =
+        device_cert(&PKI.ca, &PKI.device_key.public_key().unwrap(), (2020, 2021));
+    let lapsed = Credentials {
+        reach: crate::lmgw_link::tls::Reach::new(p.credentials.urls.clone()),
+        tls: crate::lmgw_link::tls::Tls::paired(&p.credentials, &PKI.device_key, WAIT).unwrap(),
+    };
+    let (tx, events) = mpsc::unbounded_channel();
+    r.events = events;
+    r.host.start(lapsed, tx);
+    let _ = tokio::time::timeout(WAIT, r.fake.listener.accept()).await;
+    let s = unrevoked(&mut r, |s| matches!(s, HostStatus::Offline { .. })).await;
+    let line = crate::host::tools_line(&s, None);
+    assert!(line.contains("certificate_expired"), "{line}");
+    let again = tokio::time::timeout(WAIT, r.fake.listener.accept()).await;
+    assert!(again.is_ok(), "the tool link tried again");
 }
 
 /// Kai's stop closes the link with 1000 and its reason; the calls in flight end with it.

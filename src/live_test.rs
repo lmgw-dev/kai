@@ -6,8 +6,9 @@
 //! (`scripts/live-check-link.sh`):
 //!
 //! - a pairing link that reaches the owner's confirmation is answered yes at once, with no dialog,
-//!   only when it is one the live script minted: its URL and the SHA-256 of its key are listed in
-//!   `KAI_LIVE_LINK_ACCEPT` (review KAI-2 K2-2). Any other link, from any process of the session
+//!   only when it is one the live script minted: its first URL and the SHA-256 of its one-time
+//!   token are listed in `KAI_LIVE_LINK_ACCEPT` (review KAI-2 K2-2). lmgw still waits for the
+//!   owner's confirmation of the device's code, which the live script gives through lmgw's `/api`. Any other link, from any process of the session
 //!   or a click in the owner's browser during the run, gets the owner's dialog as in every build;
 //! - desktop notifications are written to the log instead of being sent;
 //! - no global shortcuts are bound (the portal would name the caller's app scope, not Kai's).
@@ -20,20 +21,21 @@ compile_error!("the live-test feature is for debug builds only, never a release 
 
 /// The environment switch.
 pub const ENV: &str = "KAI_LIVE_LINK";
-/// The links the live script minted: whitespace-separated `<url>#<sha256 of the key, hex>`.
+/// The links the live script minted: whitespace-separated `<first url>#<sha256 of the token, hex>`.
 pub const ACCEPT: &str = "KAI_LIVE_LINK_ACCEPT";
 
 pub fn active() -> bool {
     std::env::var(ENV).is_ok_and(|v| v == "1")
 }
 
-/// The link for `url` (normalized, as the link parsed) with `key` is one the live script minted.
-pub fn accepts(url: &str, key: &str) -> bool {
-    active() && listed(&std::env::var(ACCEPT).unwrap_or_default(), url, key)
+/// The link whose first URL is `url` (normalized, as the link parsed) with `token` is one the live
+/// script minted.
+pub fn accepts(url: &str, token: &str) -> bool {
+    active() && listed(&std::env::var(ACCEPT).unwrap_or_default(), url, token)
 }
 
-fn listed(list: &str, url: &str, key: &str) -> bool {
-    let want = format!("{url}#{}", sha256_hex(key));
+fn listed(list: &str, url: &str, token: &str) -> bool {
+    let want = format!("{url}#{}", sha256_hex(token));
     list.split_whitespace().any(|entry| entry == want)
 }
 
@@ -66,20 +68,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_a_listed_url_and_key_are_accepted() {
-        let key = "lmgw-device-0123";
-        // `printf %s lmgw-device-0123 | sha256sum`
-        let entry = format!("http://127.0.0.1:8897#{}", sha256_hex(key));
+    fn only_a_listed_url_and_token_are_accepted() {
+        let key = "lmgw-enrol-0123";
+        // `printf %s lmgw-enrol-0123 | sha256sum`
+        let entry = format!("https://127.0.0.1:8898#{}", sha256_hex(key));
         assert_eq!(sha256_hex("abc").len(), 64);
         assert_eq!(
             sha256_hex("abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
-        let list = format!("http://localhost:8897#{} {entry}", sha256_hex("other"));
-        assert!(listed(&list, "http://127.0.0.1:8897", key));
-        assert!(!listed(&list, "http://127.0.0.1:8897", "lmgw-device-0124"));
-        assert!(!listed(&list, "http://127.0.0.1:8001", key));
-        assert!(!listed(&list, "http://localhost:8897", key));
-        assert!(!listed("", "http://127.0.0.1:8897", key));
+        let list = format!("https://localhost:8898#{} {entry}", sha256_hex("other"));
+        assert!(listed(&list, "https://127.0.0.1:8898", key));
+        assert!(!listed(&list, "https://127.0.0.1:8898", "lmgw-enrol-0124"));
+        assert!(!listed(&list, "https://127.0.0.1:8002", key));
+        assert!(!listed(&list, "https://localhost:8898", key));
+        assert!(!listed("", "https://127.0.0.1:8898", key));
     }
 }

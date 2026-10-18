@@ -702,7 +702,7 @@ impl<L: VoiceLink> Voice<L> {
                 "voice: the reply as stored"
             ),
             ServerEvent::ModelState(m) => self.on_model_state(m),
-            ServerEvent::Timing(v) => self.on_timing(v),
+            ServerEvent::Timing(v) => self.on_timing(*v),
             ServerEvent::Thread(t) => {
                 let t = ThreadRef::from(t);
                 s.thread = t.clone();
@@ -870,7 +870,7 @@ impl<L: VoiceLink> Voice<L> {
     /// `lmgw.response.timing`: the tooltip's line, the ring's `setTiming`, and K21: the first
     /// time in a hold period that a stage is answered by a fallback (another fallback alias for
     /// the same stage in that period is in the timing line, not notified again).
-    fn on_timing(&mut self, v: serde_json::Value) {
+    fn on_timing(&mut self, v: lmgw_client::realtime::VoiceTiming) {
         self.timing_line = timing::line(&v);
         for f in timing::fallbacks(&v) {
             if self

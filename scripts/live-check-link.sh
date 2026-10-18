@@ -1,36 +1,46 @@
 #!/usr/bin/env bash
-# WP2's live check of Kai's lmgw link against a dev lmgw on 127.0.0.1:8897 (§15 WP2, §3.1–§3.3):
-#   1. pairing: a device key minted on the dev lmgw, handed over as a link (K13's handler path),
-#      confirmed by the live-test build (no dialog: the link is one this script minted and listed in
-#      KAI_LIVE_LINK_ACCEPT; any other would get the owner's dialog), stored; the feed's hello names
-#      the device;
+# WP2's live check of Kai's lmgw link against a dev lmgw on 127.0.0.1:8897 (§15 WP2, §3.1–§3.3), over
+# lmgw's device link (its design §3, §5, §7.2; scripts/live-device-link.sh):
+#   1. pairing: the dev lmgw's device listener turned on (127.0.0.1:8898), a device minted for this
+#      computer (key_create, local_only), its v2 link handed over (K13's handler path) and confirmed
+#      by the live-test build (no dialog: the link is one this script minted and listed in
+#      KAI_LIVE_LINK_ACCEPT; any other would get the owner's dialog); Kai enrols its own key, lmgw
+#      answers 403 device_unconfirmed and the tray shows the code, the one lmgw's Devices card
+#      shows; the owner's Confirm (device_confirm with that code); the feed's hello names the
+#      device; the key in the wallet under lmgw's CA fingerprint, device-link.json written, Start
+#      with Plasma on; Open in lmgw names the dashboard address the hello sent (no browser);
 #   2. the icon follows the dev lmgw's GPU hold (the amber badge on and off), and the tooltip what
 #      the device's admin tools may do (key_set self_admin: read only, full, capped by the
 #      gateway's read_only until settings_set_full raises it, then off, which says nothing);
 #   3. the dev lmgw stopping (grey, the backoff in the tooltip; a tray click says "lmgw is not
-#      running" at once) and starting again (idle, connected);
-#   4. disable, rotate and expiry each end the feed with its revoked event, whose kind Kai reads
-#      (device_disabled, key_unknown, key_expired; lmgw 7d6d18c), and a restarted Kai meets the 401
-#      (device_disabled, device_key_unknown, key_expired), with no retry. Rotate says "pair again"
-#      with only Pair and Quit in the menu; a disable says "enable it on Usage → Keys, or pair
-#      again" and an expiry "move its expiry on Usage → Keys, or pair again", each with Try again,
-#      Pair and Quit, the key kept, and Try again connects with it once the device is enabled or
-#      the expiry moved (review KAI-3 K3-6);
-#   5. a confirmed re-pair to another URL deletes Kai's item for the old one;
-#   6. no key and no link in Kai's logs (at KAI_LOG=trace, review KAI-2 K2-1); a clean quit.
+#      running" at once) and starting again (idle, connected); the row's URLs changed meanwhile
+#      (key_set urls) reach device-link.json through the next hello;
+#   4. disable, a new token that ends the key at once, and expiry each end the feed with its
+#      revoked event, whose kind Kai reads (device_disabled, key_unknown, key_expired), and a
+#      restarted Kai meets the 401 (device_disabled, device_key_unknown, key_expired), with no
+#      retry. The ended key says "pair again" with only Pair, Settings…, Check for Updates… and Quit
+#      in the menu, and Kai pairs again with the new link (enrolled, confirmed); a disable says
+#      "enable it on Usage → Keys, or pair again" and an expiry "move its expiry on Usage → Keys, or
+#      pair again", each with Try again, Pair and Quit, the key kept, and Try again connects with it
+#      once the device is enabled or the expiry moved (review KAI-3 K3-6);
+#   5. a re-pair that keeps the current key (device_token with other URLs): Kai enrols a new key,
+#      which waits for its Confirm beside the kept one (the card shows both codes); confirmed, Kai
+#      connects at the new URL and the wallet's one item for this lmgw holds the new key;
+#   6. no key, token or link in Kai's logs (at KAI_LOG=trace, review KAI-2 K2-1); a clean quit.
 # Usage: scripts/live-check-link.sh [lmgw checkout]   (default: ../lmgw)
 #
 # Isolation: Kai's config and state live under target/live-link (the owner's ~/.config/kai is not
 # touched); Kai is the live-test build, built into target/live-test (never target/debug, the dev
 # handler's binary) (KAI_LIVE_LINK=1: the links this script minted confirmed without a dialog,
-# notifications logged instead of shown, no shortcuts bound) and cannot reach PipeWire (an empty
-# PIPEWIRE_RUNTIME_DIR). Its own session bus and Secret Service (scripts/private-bus.sh, under
-# target/live-link-bus): a Kai the session runs, the session's wallet and its tray are never
-# touched; items there only for http://127.0.0.1:8897 and, for the re-pair, http://localhost:8897
-# (the same dev lmgw), deleted at the end with the keyring. The dev lmgw is the checkout's
-# headless example, built beforehand (`cargo build -p lmgw-core --example headless`) and copied, run
-# on its own data dir and container prefix; the hold is set on it only. Nothing here talks to
-# 127.0.0.1:8001. No screen captures. Verdicts: target/live-link/verdicts.txt.
+# notifications logged instead of shown, no browser opened, no shortcuts bound) and cannot reach
+# PipeWire (an empty PIPEWIRE_RUNTIME_DIR). Its own session bus and Secret Service
+# (scripts/private-bus.sh, under target/live-link-bus): a Kai the session runs, the session's
+# wallet and its tray are never touched; the only item there is the device key Kai keeps for the
+# dev lmgw, deleted at the end with the keyring. The dev lmgw is the checkout's headless example,
+# built beforehand (`cargo build -p lmgw-core --example headless`) and copied, run on its own data
+# dir and container prefix (its device CA's key plain in that data dir, as a headless start keeps
+# it); the hold is set on it only. Nothing here talks to 127.0.0.1:8001. No screen captures.
+# Verdicts: target/live-link/verdicts.txt.
 set -euo pipefail
 self=$(realpath "$0")
 cd "$(dirname "$0")/.."
@@ -38,11 +48,15 @@ cd "$(dirname "$0")/.."
 source scripts/private-bus.sh "$PWD/target/live-link-bus" "$self" "$@"
 # shellcheck source=scripts/shortcuts-guard.sh
 source scripts/shortcuts-guard.sh
+# shellcheck source=scripts/live-device-link.sh
+source scripts/live-device-link.sh
 
 LMGW=${1:-$PWD/../lmgw}
 ADDR=127.0.0.1:8897
 URL=http://$ADDR
-URL2=http://localhost:8897
+# The device listener: loopback, the HTTP port plus one (lmgw's device link §4.1).
+DEVICE_PORT=8898
+DEV_URL2=https://localhost:$DEVICE_PORT
 OUT=$PWD/target/live-link
 DATA=$OUT/lmgw-data
 KAI=$OUT/kai-live
@@ -51,6 +65,9 @@ VERDICTS=$OUT/verdicts.txt
 LMGW_PID=""
 KAI_PID=""
 SNI=""
+DEV_FP=""
+# What no log may hold: each minted token's hex and a line of each key Kai stored.
+SECRETS=()
 
 fail() { echo "FAIL: $*" | tee -a "$VERDICTS" >&2; exit 1; }
 pass() { echo "PASS: $*" | tee -a "$VERDICTS"; }
@@ -87,8 +104,8 @@ cleanup() {
   set +e
   stop_kai >/dev/null 2>&1
   stop_lmgw >/dev/null 2>&1
-  for u in "$URL" "$URL2"; do secret-tool clear application dev.rootshell.kai lmgw "$u" 2>/dev/null; done
-  # The dev lmgw's log carries its owner login link; its data dir the minted keys.
+  [ -z "$DEV_FP" ] || secret-tool clear application dev.rootshell.kai lmgw "$DEV_FP" 2>/dev/null
+  # The dev lmgw's log carries its owner login link; its data dir the device CA and the rows.
   rm -rf "$DATA" "$OUT/lmgw.log" "$OUT/config" "$OUT/state" "$OUT/no-pipewire" "$HEADLESS" "$KAI"
   private_bus_stop
 }
@@ -98,12 +115,10 @@ trap 'cleanup; kgs_check || exit 1' EXIT
 if busctl --user status dev.rootshell.kai >/dev/null 2>&1; then fail "a Kai already runs; quit it first"; fi
 locked=$(busctl --user get-property org.freedesktop.secrets /org/freedesktop/secrets/aliases/default \
   org.freedesktop.Secret.Collection Locked 2>/dev/null || echo "unknown")
-[ "$locked" = "b false" ] || fail "the wallet is locked or unknown ($locked): unlock KWallet first"
-for u in "$URL" "$URL2"; do
-  [ -z "$(secret-tool lookup application dev.rootshell.kai lmgw "$u" 2>/dev/null)" ] \
-    || fail "an item for $u exists already; not touching it"
+[ "$locked" = "b false" ] || fail "the private keyring is locked or unknown ($locked)"
+for port in 8897 "$DEVICE_PORT"; do
+  if ss -ltnH "sport = :$port" | grep -q .; then fail "something listens on $port already"; fi
 done
-if ss -ltnH "sport = :8897" | grep -q .; then fail "something listens on 8897 already"; fi
 [ -x "$LMGW/target/debug/examples/headless" ] \
   || fail "no dev lmgw build: cargo build -p lmgw-core --example headless in $LMGW"
 
@@ -138,26 +153,32 @@ start_lmgw() {
 start_lmgw
 TOKEN=$(grep -o 'dashboard login: [^ ]*token=[^ ]*' "$OUT/lmgw.log" | tail -1 | sed 's/.*token=//')
 [ -n "$TOKEN" ] || fail "no owner login line in the dev lmgw's log"
+# The owner's requests, the bearer from a pipe, never in curl's argv.
+bearer() { printf 'Authorization: Bearer %s\n' "$TOKEN"; }
 op() {
-  curl -sS --max-time 10 -X POST "$URL/api/op/$1" -H "Authorization: Bearer $TOKEN" \
+  bearer | curl -sS --max-time 10 -X POST "$URL/api/op/$1" -H @- \
     -H 'Content-Type: application/json' -d "$2"
 }
+owner_get() { bearer | curl -sS --max-time 10 "$URL$1" -H @-; }
 hold() { op hold_set "{\"active\": $1}" >/dev/null; }
 
-created=$(op key_create "{\"kind\": \"device\", \"name\": \"kai-live\", \"url\": \"$URL\"}")
-echo "$created" | jq -e .key >/dev/null 2>&1 || fail "key_create answered: $(echo "$created" | jq -c 'del(.. | .key?, .link?)' 2>/dev/null || echo unreadable)"
-ID=$(echo "$created" | jq -r .id)
-KEY=$(echo "$created" | jq -r .key)
-LINK=$(echo "$created" | jq -r .link)
-KEYS=("$KEY")
-note "minted device key id $ID ('kai-live'); the answer's fields: $(echo "$created" | jq -c 'keys')"
-# The links this script mints, which the live-test Kai confirms without a dialog: <url>#<sha256 of
-# the key>. A Kai started later gets the list as it is then.
-accept_entry() { printf '%s#%s' "$1" "$(printf %s "$2" | sha256sum | cut -d' ' -f1)"; }
-ACCEPT=$(accept_entry "$URL" "$KEY")
+devices_on
+mint kai-live
+ID=$DEV_ID
+DEV_URL1=$DEV_URL
+[ "$DEV_URL1" = "https://127.0.0.1:$DEVICE_PORT" ] || fail "this computer's link names $DEV_URL1, not the device listener on 127.0.0.1:$DEVICE_PORT"
+[ -z "$(secret-tool lookup application dev.rootshell.kai lmgw "$DEV_FP" 2>/dev/null)" ] \
+  || fail "an item for $DEV_FP exists already; not touching it"
+LINK1=$DEV_LINK
+SECRETS+=("$(token_hex "$LINK1")")
+note "minted device id $ID ('kai-live') for this computer at $DEV_URL1; lmgw's device CA $DEV_FP"
+# The links this script mints, which the live-test Kai confirms without a dialog. A Kai started
+# later gets the list as it is then.
+ACCEPT=$(accept_entry "$LINK1")
 
 # ---------------------------------------------------------------- Kai
 kai_config "$OUT/config/kai/config.toml" '[lmgw]\nretry_max_s = 4\n'
+LINKFILE=$OUT/config/kai/device-link.json
 start_kai() {
   XDG_CONFIG_HOME=$OUT/config XDG_STATE_HOME=$OUT/state PIPEWIRE_RUNTIME_DIR=$OUT/no-pipewire \
     KAI_LIVE_LINK=1 KAI_LIVE_LINK_ACCEPT=$ACCEPT KAI_LOG=trace "$KAI" >>"$OUT/kai.log" 2>&1 &
@@ -200,14 +221,16 @@ pair() { # the scheme handler's path: a second kai hands the link to the running
     || fail "the handler failed (see $OUT/handler.log)"
 }
 connected() { icon_is kai-tray-idle && tip_has "device 'kai-live' on $1"; }
-stored_key() { secret-tool lookup application dev.rootshell.kai lmgw "$1" 2>/dev/null || true; }
+stored_key() { secret-tool lookup application dev.rootshell.kai lmgw "$DEV_FP" 2>/dev/null || true; }
+# The second line of a PEM: a run of the key that no log may hold.
+pem_line() { sed -n 2p <<<"$1"; }
 feed_connects() { grep -c 'lmgw link: connecting the feed' "$OUT/kai.log" || true; }
 # A 401 on the key: the feed's, or the host link's (both open at Try again; the first 401 stops
 # the other, so either one says the key was tried).
-feed_401s() { grep -cE 'lmgw link: the feed answered 401|host: the device key opens nothing \(401\)' "$OUT/kai.log" || true; }
+feed_401s() { grep -cE 'lmgw link: lmgw refused the feed|host: the pairing opens nothing' "$OUT/kai.log" || true; }
 more_401s() { [ "$(feed_401s)" -gt "$1" ]; }
 # The host link's own 401s: counted apart, so a host link that keeps trying a refused key shows.
-host_401s() { grep -cF 'host: the device key opens nothing (401)' "$OUT/kai.log" || true; }
+host_401s() { grep -cF 'host: the pairing opens nothing' "$OUT/kai.log" || true; }
 # click <label>: a top-level item of the tray's menu, through dbusmenu.
 click() {
   local id
@@ -221,10 +244,26 @@ for k in json.load(sys.stdin)["data"][1][2]:
 sys.exit(1)' "$1") || fail "no menu item '$1': $(menu)"
   busctl --user -- call "$SNI" /MenuBar com.canonical.dbusmenu Event isvu "$id" clicked s "" 0 >/dev/null
 }
+# Kai enrolled a link's key and waits for the owner's Confirm (lmgw's device link §3.5): the tray
+# says so with the code, the one lmgw's Devices card shows for the waiting key; then the owner's
+# Confirm with it, and the feed comes up at <url>. Sets CODE.
+enrol_and_confirm() { # <what> <url>
+  until_ 30 "$1: waiting for the owner's confirmation" tip_has "waiting for your confirmation on lmgw"
+  CODE=$(code_in "$(tooltip)")
+  [ -n "$CODE" ] || fail "$1: no code in the tooltip: $(tooltip)"
+  icon_is kai-tray-offline || fail "$1: icon $(icon) while unconfirmed"
+  until_ 10 "$1: lmgw's 403 device_unconfirmed" logged 'lmgw link: the device is not confirmed yet'
+  local on_card
+  on_card=$(card "$ID" .confirm_code)
+  [ "$on_card" = "$CODE" ] || fail "$1: lmgw's Devices card shows '$on_card' where Kai shows $CODE"
+  card "$ID" .client | grep -q '^Kai ' || fail "$1: the card names the client '$(card "$ID" .client)'"
+  note "$1: Kai and lmgw's card show $CODE (client: $(card "$ID" .client)); the owner confirms it"
+  confirm "$ID" "$CODE"
+  until_ 30 "$1: confirmed and connected" connected "$2"
+}
 # A key that waits for the owner (review KAI-3 K3-6; lmgw 7d6d18c for the expiry): its state line,
-# lmgw's words, grey, Try again, Pair, Settings…, Check for Updates… and Quit, no retry, and the key still in
-# the wallet.
-# Neither the feed nor the host link tries again during the 6 s wait.
+# lmgw's words, grey, Try again, Pair, Settings…, Check for Updates… and Quit, no retry, and the key
+# still in the wallet. Neither the feed nor the host link tries again during the 6 s wait.
 waiting() { # <what> <state line> <words in lmgw's message> <the stored key>
   until_ 20 "$1: $2" tip_has "$2"
   tip_has "$3" || fail "$1: lmgw's message lacks '$3': $(tooltip)"
@@ -236,21 +275,21 @@ waiting() { # <what> <state line> <words in lmgw's message> <the stored key>
   sleep 6
   [ "$(feed_connects)" = "$before" ] || fail "$1: the feed retried while waiting"
   [ "$(host_401s)" = "$host_before" ] || fail "$1: the host link retried while waiting ($host_before → $(host_401s) 401s)"
-  [ "$(stored_key "$URL")" = "$4" ] || fail "$1: the key left the wallet"
+  [ "$(stored_key)" = "$4" ] || fail "$1: the key left the wallet"
   note "$1: $(tooltip | sed 's/<br\/>/ | /g')"
 }
 DISABLED="this device was disabled on lmgw: enable it on Usage → Keys, or pair again"
 EXPIRED="this device's key expired on lmgw: move its expiry on Usage → Keys, or pair again"
-disabled() { waiting "$1" "$DISABLED" "$2" "$KEY"; }
-expired() { waiting "$1" "$EXPIRED" "$2" "$KEY2"; }
+disabled() { waiting "$1" "$DISABLED" "$2" "$PEM1"; }
+expired() { waiting "$1" "$EXPIRED" "$2" "$PEM2"; }
 # The feed's revoked event was read by its kind (api §1.6), not its words.
 kind_read() { # <kind> <what Kai makes of it>
   until_ 5 "the revoked event's kind $1" logged "lmgw link: revoked kind=$1"
   grep -F "lmgw link: revoked kind=$1" "$OUT/kai.log" | tail -1 | grep -qF "loss=Some($2)" \
     || fail "the revoked kind $1 is not read as $2: $(grep -F 'lmgw link: revoked' "$OUT/kai.log" | tail -1)"
 }
-# A revocation: "pair again" with the server's words, grey, only Pair, Settings…, Check for Updates… and Quit,
-# and no retry.
+# A revocation: "pair again" with the server's words, grey, only Pair, Settings…, Check for Updates…
+# and Quit, and no retry.
 revoked() { # <what> <words in the reason>
   until_ 20 "$1: pair again" tip_has "this device's key was revoked"
   tip_has "$2" || fail "$1: the reason lacks '$2': $(tooltip)"
@@ -272,15 +311,22 @@ icon_is kai-tray-offline || fail "unpaired icon $(icon)"
 pass "unpaired start: grey, 'not paired'"
 
 # 1. Pairing.
-pair "$LINK"
-until_ 20 "paired and connected" connected "$URL"
-[ "$(stored_key "$URL")" = "$KEY" ] || fail "the wallet holds no (or another) key for $URL"
-grep -q "^url = \"$URL\"" "$OUT/config/kai/config.toml" || fail "lmgw.url not written"
+pair "$LINK1"
+enrol_and_confirm "pairing" "$DEV_URL1"
+PEM1=$(stored_key)
+[[ $PEM1 == "-----BEGIN PRIVATE KEY-----"* ]] || fail "the wallet holds no key for $DEV_FP"
+SECRETS+=("$(pem_line "$PEM1")")
+jq -e --arg u "$DEV_URL1" --arg fp "$DEV_FP" '.fp == $fp and .credentials.urls == [$u] and .name == "kai-live"' \
+  "$LINKFILE" >/dev/null || fail "device-link.json does not hold the pairing: $(jq -c 'del(.credentials.certificate, .credentials.ca_certificate)' "$LINKFILE" 2>/dev/null || echo unreadable)"
 [ -f "$OUT/config/autostart/dev.rootshell.kai.desktop" ] || fail "a first pairing did not switch Start with Plasma on"
 logged 'live-test: the pairing link is confirmed without a dialog (the live script minted it)' || fail "not confirmed by the live-test path"
 logged 'lmgw link: the feed is up device=kai-live' || fail "no hello in the log"
-pass "pairing: confirmed, key stored for $URL, lmgw.url written, Start with Plasma on (in target/), the feed's hello names device 'kai-live'"
+pass "pairing: the link confirmed, Kai's key enrolled, '$CODE' shown by Kai and lmgw's card until the owner confirmed it, the key in the wallet under $DEV_FP, device-link.json written, Start with Plasma on (in target/), the feed's hello names device 'kai-live'"
 note "tooltip: $(tooltip)"
+# Open in lmgw: the dashboard address the hello sent (this computer: the plain listener's).
+click "Open in lmgw"
+until_ 5 "Open in lmgw names the dashboard" logged "live test: no browser is opened url=$URL/chat"
+pass "Open in lmgw: $(grep -o "no browser is opened url=[^ ]*" "$OUT/kai.log" | tail -1 | sed 's/.*url=//'), from the hello's dashboard_url"
 
 # 2. The hold.
 hold true
@@ -306,7 +352,9 @@ until_ 10 "admin tools: full" tip_has "admin tools: full"
 grep -q 'lmgw link: the live state again.*admin_tools=full' "$OUT/kai.log" || fail "no state with the level in the log"
 pass "what the admin tools may do follows the key and the gateway live: 'read only'; at full under the gateway's read_only still 'read only'; the gateway raised to full, 'full' in the tooltip"
 
-# 3. The dev lmgw stops and starts.
+# 3. The dev lmgw stops and starts; the row's URLs changed meanwhile reach Kai in the next hello.
+op key_set "{\"id\": $ID, \"urls\": [\"$DEV_URL1\", \"$DEV_URL2\"]}" | jq -e '.ok == true' >/dev/null \
+  || fail "key_set refused the row's URLs"
 stop_lmgw
 until_ 15 "lmgw stopped: grey" icon_is kai-tray-offline
 until_ 15 "the backoff in the tooltip" tip_has "next try in"
@@ -320,8 +368,12 @@ busctl --user call "$SNI" /StatusNotifierItem org.kde.StatusNotifierItem Activat
 until_ 2 "a click says lmgw is not running" logged 'summary="Kai: lmgw is not running"'
 note "said $(( ($(date +%s%N) - t0) / 1000000 )) ms after the click (within the 0.2 s poll)"
 start_lmgw
-until_ 20 "lmgw back: connected" connected "$URL"
+until_ 20 "lmgw back: connected" connected "$DEV_URL1"
 pass "the icon follows the dev lmgw: grey with the backoff (1, 2, 4, 4 s) while it is stopped, a click says 'lmgw is not running', idle again once it is back"
+jq -e --arg a "$DEV_URL1" --arg b "$DEV_URL2" '.credentials.urls == [$a, $b]' "$LINKFILE" >/dev/null \
+  || fail "the hello's URLs did not reach device-link.json: $(jq -c .credentials.urls "$LINKFILE")"
+logged "lmgw's hello: this device's URLs changed" || fail "no URL change in the log"
+pass "the row's URLs (key_set urls) came with the next hello: device-link.json lists $DEV_URL1 and $DEV_URL2"
 # The new feed's hello says the level the key has (full, from 2b); off takes the line away.
 tip_has "admin tools: full" || fail "the hello after the restart did not say the level: $(tooltip)"
 op key_set "{\"id\": $ID, \"self_admin\": \"off\"}" >/dev/null
@@ -342,27 +394,28 @@ start_kai
 disabled "disable (401 device_disabled at a restart)" "is disabled"
 op key_set "{\"id\": $ID, \"enabled\": true}" >/dev/null
 click "Try again"
-until_ 20 "Try again after enabling: connected" connected "$URL"
-[ "$(stored_key "$URL")" = "$KEY" ] || fail "the wallet's key changed"
-logged 'the owner asked to try the stored device key again' || fail "no Try again in the log"
+until_ 20 "Try again after enabling: connected" connected "$DEV_URL1"
+[ "$(stored_key)" = "$PEM1" ] || fail "the wallet's key changed"
+logged 'the owner asked to try the stored pairing again' || fail "no Try again in the log"
 pass "disable: 'enable it on Usage → Keys, or pair again' from the revoked event (kind device_disabled) and from the 401, with Try again, Pair and Quit, no retry; Try again while disabled met the 401 again; enabled, Try again connected with the stored key"
 
-# 4b. Rotate: the revoked event, then a 401 for the old key at a restart.
-rotated=$(op key_rotate "{\"id\": $ID, \"url\": \"$URL\"}")
-KEY2=$(echo "$rotated" | jq -r .key)
-LINK2=$(echo "$rotated" | jq -r .link)
-[ -n "$KEY2" ] && [ "$KEY2" != null ] || fail "key_rotate answered no key"
-KEYS+=("$KEY2")
-ACCEPT="$(accept_entry "$URL" "$KEY2") $(accept_entry "$URL2" "$KEY2")"
-revoked "rotate (revoked event)" "rotated"
+# 4b. A new token that ends the key at once (device_token end_current, a stolen key's answer): the
+# revoked event, then a 401 for the old key at a restart; Kai pairs again with the new link.
+new_token "$ID" '"end_current": true'
+LINK2=$DEV_LINK
+SECRETS+=("$(token_hex "$LINK2")")
+ACCEPT="$ACCEPT $(accept_entry "$LINK2")"
+revoked "end the key (revoked event)" "was replaced"
 kind_read key_unknown PairAgain
 stop_kai || fail "Kai's quit failed"
 start_kai
-revoked "rotate (401 device_key_unknown at a restart)" "rotated or deleted"
+revoked "end the key (401 device_key_unknown at a restart)" "re-paired or deleted"
 pair "$LINK2"
-until_ 20 "paired with the rotated key" connected "$URL"
-[ "$(stored_key "$URL")" = "$KEY2" ] || fail "the wallet does not hold the rotated key"
-pass "rotate: 'pair again' from the revoked event (kind key_unknown) and from the 401; paired with the new link"
+enrol_and_confirm "pairing again" "$DEV_URL1"
+PEM2=$(stored_key)
+[[ $PEM2 == "-----BEGIN PRIVATE KEY-----"* && $PEM2 != "$PEM1" ]] || fail "the wallet does not hold a new key"
+SECRETS+=("$(pem_line "$PEM2")")
+pass "a new token that ends the key: 'pair again' from the revoked event (kind key_unknown) and from the 401; paired again with the new link, a new key, confirmed with '$CODE'"
 
 # 4c. Expiry (lmgw 7d6d18c: the expiry may be moved, so the key waits): the revoked event when it
 # passes, Try again while still expired, then a 401 at a restart; the expiry moved, Try again
@@ -380,23 +433,41 @@ start_kai
 expired "expiry (401 key_expired at a restart)" "expired on"
 op key_set "{\"id\": $ID, \"expires_at\": \"\"}" >/dev/null
 click "Try again"
-until_ 20 "Try again after moving the expiry: connected" connected "$URL"
-[ "$(stored_key "$URL")" = "$KEY2" ] || fail "the wallet's key changed"
+until_ 20 "Try again after moving the expiry: connected" connected "$DEV_URL1"
+[ "$(stored_key)" = "$PEM2" ] || fail "the wallet's key changed"
 pass "expiry: 'move its expiry on Usage → Keys, or pair again' from the revoked event (kind key_expired) and from the 401, with Try again, Pair and Quit, no retry; Try again while expired met the 401 again; the expiry moved, Try again connected with the stored key"
 
-# 5. A re-pair to another URL deletes Kai's item for the old one (the owner's decision).
-pair "lmgw-pair:?v=1&url=http%3A%2F%2Flocalhost%3A8897&name=kai-live&key=$KEY2"
-until_ 20 "re-paired at $URL2" connected "$URL2"
-[ -z "$(stored_key "$URL")" ] || fail "the item for $URL stayed"
-[ "$(stored_key "$URL2")" = "$KEY2" ] || fail "no item for $URL2"
-logged 'the old gateway'"'"'s device key is deleted from the wallet' || fail "no deletion in the log"
-pass "re-pair to $URL2: its key stored, Kai's item for $URL deleted"
+# 5. A re-pair that keeps the current key (device_token with other URLs, lmgw's device link §5.2):
+# the new key waits for its Confirm beside the kept one, which the card shows too; confirmed, Kai
+# connects at the new URL, and the wallet's one item for this lmgw holds the new key.
+CODE2=$CODE
+new_token "$ID" "\"urls\": [\"$DEV_URL2\"]"
+LINK3=$DEV_LINK
+SECRETS+=("$(token_hex "$LINK3")")
+ACCEPT="$ACCEPT $(accept_entry "$LINK3")"
+stop_kai || fail "Kai's quit failed"
+start_kai
+# The kept key works on, and its hello names the row's new URL.
+until_ 20 "the kept key connects at the row's new URL" connected "$DEV_URL2"
+pair "$LINK3"
+until_ 30 "re-pair: waiting for the owner's confirmation" tip_has "waiting for your confirmation on lmgw"
+kept=$(card "$ID" .kept_code)
+[ "$kept" = "$CODE2" ] || fail "re-pair: the card's kept key is '$kept', not $CODE2"
+enrol_and_confirm "re-pair" "$DEV_URL2"
+PEM3=$(stored_key)
+[[ $PEM3 == "-----BEGIN PRIVATE KEY-----"* && $PEM3 != "$PEM2" ]] || fail "the wallet does not hold the re-pair's key"
+SECRETS+=("$(pem_line "$PEM3")")
+items=$(secret-tool search --all application dev.rootshell.kai 2>&1 | grep -c '^\[' || true)
+[ "$items" = 1 ] || fail "the wallet holds $items items of Kai's, not one"
+jq -e --arg u "$DEV_URL2" '.credentials.urls == [$u]' "$LINKFILE" >/dev/null \
+  || fail "device-link.json does not name $DEV_URL2: $(jq -c .credentials.urls "$LINKFILE")"
+pass "re-pair keeping the key: the new key waited for its Confirm beside the kept one ($CODE2 kept, $CODE waiting on the card); confirmed, connected at $DEV_URL2, the one wallet item holds the new key"
 
-# 6. No key or link in Kai's logs; a clean quit.
-for k in "${KEYS[@]}"; do
-  hex=${k#lmgw-device-}
+# 6. No key, token or link in Kai's logs; a clean quit.
+for secret in "${SECRETS[@]}"; do
+  [ -n "$secret" ] || fail "an empty secret to look for"
   for f in "$OUT/kai.log" "$OUT/handler.log"; do
-    if grep -q "$hex" "$f"; then fail "a key is in $f"; fi
+    if grep -qF -- "$secret" "$f"; then fail "a key or token is in $f"; fi
   done
 done
 for f in "$OUT/kai.log" "$OUT/handler.log"; do
@@ -405,5 +476,5 @@ done
 stop_kai || fail "Kai exited with an error"
 grep -q 'Kai has quit' "$OUT/kai.log" || fail "no clean quit in the log"
 if busctl --user status dev.rootshell.kai >/dev/null 2>&1; then fail "dev.rootshell.kai is still owned"; fi
-pass "no key and no link in Kai's logs; a clean quit"
+pass "no key, token or link in Kai's logs; a clean quit"
 echo "all passed; verdicts in $VERDICTS"

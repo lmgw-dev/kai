@@ -1,59 +1,20 @@
-//! The window's forwarding to lmgw against a scripted gateway on loopback: what goes out (the
-//! bearer, the body, nothing of the page's), what comes back (lmgw's status and body, a reduced
-//! content type, no other header), and the bounds.
+//! The window's forwarding to lmgw against a scripted gateway behind the tests' device listener on
+//! loopback (`crate::lmgw_link::test_pki`): what goes out (the body, no credential, nothing of the
+//! page's), what comes back (lmgw's status and body, a reduced content type, no other header), and
+//! the bounds.
 
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpListener;
 
 use super::*;
-use crate::pairing::DeviceKey;
-use crate::pairing::tests::KEY;
-
-fn creds(url: &str) -> Credentials {
-    Credentials {
-        url: format!("{url}/"),
-        key: DeviceKey::parse(KEY).unwrap(),
-    }
-}
-
-fn client() -> reqwest::Client {
-    reqwest::Client::builder().no_proxy().build().unwrap()
-}
+use crate::lmgw_link::test_pki::{Gateway, creds, read_request};
 
 const LIMITS: Limits = Limits {
     max_mb: 1,
     timeout_s: 5,
 };
-
-/// One request's head (lowercased header names kept as sent) and body.
-async fn read_request(s: &mut TcpStream) -> (String, Vec<u8>) {
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 4096];
-    loop {
-        let n = s.read(&mut chunk).await.unwrap();
-        assert!(n > 0, "the request ended early");
-        buf.extend_from_slice(&chunk[..n]);
-        if let Some(at) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-            let head = String::from_utf8(buf[..at].to_vec()).unwrap();
-            let len = head
-                .lines()
-                .find_map(|l| {
-                    let (k, v) = l.split_once(':')?;
-                    k.eq_ignore_ascii_case("content-length")
-                        .then(|| v.trim().parse::<usize>().unwrap())
-                })
-                .unwrap_or(0);
-            while buf.len() < at + 4 + len {
-                let n = s.read(&mut chunk).await.unwrap();
-                assert!(n > 0, "the body ended early");
-                buf.extend_from_slice(&chunk[..n]);
-            }
-            return (head, buf[at + 4..at + 4 + len].to_vec());
-        }
-    }
-}
 
 /// A gateway that answers one request with `head` (status line and headers) and `body`, and
 /// hands back what it was asked.
@@ -61,10 +22,10 @@ async fn gateway(
     head: &'static str,
     body: Vec<u8>,
 ) -> (String, tokio::task::JoinHandle<(String, Vec<u8>)>) {
-    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}", l.local_addr().unwrap());
+    let g = Gateway::bind().await;
+    let url = g.url.clone();
     let task = tokio::spawn(async move {
-        let (mut s, _) = l.accept().await.unwrap();
+        let (mut s, _) = g.accept().await.unwrap();
         let seen = read_request(&mut s).await;
         let r = format!(
             "{head}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
@@ -78,7 +39,7 @@ async fn gateway(
 }
 
 #[tokio::test]
-async fn a_post_goes_with_the_bearer_and_the_answer_comes_back_without_lmgws_headers() {
+async fn a_post_goes_without_a_credential_and_the_answer_comes_back_without_lmgws_headers() {
     let (url, seen) = gateway(
         "HTTP/1.1 201 Created\r\ncontent-type: application/json; charset=utf-8\r\n\
          set-cookie: s=1\r\nx-lmgw-fallback: other",
@@ -90,7 +51,7 @@ async fn a_post_goes_with_the_bearer_and_the_answer_comes_back_without_lmgws_hea
         path: "/chat/api/profiles".into(),
         body: br#"{"name":"Calm"}"#.to_vec(),
     };
-    let answer = send(&client(), &creds(&url), forward, LIMITS).await;
+    let answer = send(&creds(&url), forward, LIMITS).await;
     let (head, body) = seen.await.unwrap();
     assert!(
         head.starts_with("POST /chat/api/profiles HTTP/1.1"),
@@ -98,17 +59,15 @@ async fn a_post_goes_with_the_bearer_and_the_answer_comes_back_without_lmgws_hea
     );
     let lower = head.to_lowercase();
     assert!(
-        lower.contains(&format!("authorization: bearer {}", KEY.to_lowercase())),
-        "the device key is the bearer: {head}"
+        !lower.contains("authorization"),
+        "the device's certificate authenticates it: {head}"
     );
     assert!(lower.contains("content-type: application/json"), "{head}");
     assert_eq!(body, br#"{"name":"Calm"}"#);
-    // lmgw's status, body and (reduced) type; no header of lmgw's reaches the page, and the key
-    // is nowhere in what does.
+    // lmgw's status, body and (reduced) type; no header of lmgw's reaches the page.
     assert_eq!(answer.status, 201);
     assert_eq!(answer.mime, "application/json");
     assert_eq!(answer.body, br#"{"id":7,"name":"Calm"}"#);
-    assert!(!String::from_utf8_lossy(&answer.body).contains(KEY));
 }
 
 #[tokio::test]
@@ -123,7 +82,7 @@ async fn a_get_carries_its_query_and_no_body() {
         path: "/v1/audio/voices?model=tts%2Fa+b".into(),
         body: Vec::new(),
     };
-    let answer = send(&client(), &creds(&url), forward, LIMITS).await;
+    let answer = send(&creds(&url), forward, LIMITS).await;
     let (head, body) = seen.await.unwrap();
     assert!(
         head.starts_with("GET /v1/audio/voices?model=tts%2Fa+b HTTP/1.1"),
@@ -142,7 +101,7 @@ async fn speak_passes_the_wav_through_and_a_refusal_keeps_lmgws_words() {
         path: "/chat/api/profiles/speak".into(),
         body: b"{}".to_vec(),
     };
-    let answer = send(&client(), &creds(&url), forward.clone(), LIMITS).await;
+    let answer = send(&creds(&url), forward.clone(), LIMITS).await;
     assert_eq!(
         (answer.status, answer.mime, answer.body),
         (200, "audio/wav", wav)
@@ -154,7 +113,7 @@ async fn speak_passes_the_wav_through_and_a_refusal_keeps_lmgws_words() {
         refusal.clone(),
     )
     .await;
-    let answer = send(&client(), &creds(&url), forward, LIMITS).await;
+    let answer = send(&creds(&url), forward, LIMITS).await;
     assert_eq!((answer.status, answer.body), (403, refusal));
 }
 
@@ -170,7 +129,7 @@ async fn an_answer_over_the_bound_is_refused_naming_the_key() {
         path: "/v1/models".into(),
         body: Vec::new(),
     };
-    let answer = send(&client(), &creds(&url), forward, LIMITS).await;
+    let answer = send(&creds(&url), forward, LIMITS).await;
     assert_eq!(answer.status, 502);
     let v: serde_json::Value = serde_json::from_slice(&answer.body).unwrap();
     assert_eq!(v["code"], "answer_too_large");
@@ -209,7 +168,7 @@ async fn a_request_over_the_bound_is_refused_before_it_goes() {
 #[tokio::test]
 async fn a_silent_lmgw_is_given_up_naming_the_key_and_a_closed_one_says_so() {
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}", l.local_addr().unwrap());
+    let url = format!("https://{}", l.local_addr().unwrap());
     let hold = tokio::spawn(async move {
         let (s, _) = l.accept().await.unwrap();
         tokio::time::sleep(Duration::from_secs(30)).await;
@@ -224,15 +183,15 @@ async fn a_silent_lmgw_is_given_up_naming_the_key_and_a_closed_one_says_so() {
         max_mb: 1,
         timeout_s: 1,
     };
-    let answer = send(&client(), &creds(&url), forward.clone(), quick).await;
+    let answer = send(&creds(&url), forward.clone(), quick).await;
     hold.abort();
     assert_eq!(answer.status, 504);
     assert!(String::from_utf8_lossy(&answer.body).contains("window.proxy_timeout_s"));
     // Nothing listens: lmgw is not reachable.
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let gone = format!("http://{}", l.local_addr().unwrap());
+    let gone = format!("https://{}", l.local_addr().unwrap());
     drop(l);
-    let answer = send(&client(), &creds(&gone), forward, quick).await;
+    let answer = send(&creds(&gone), forward, quick).await;
     assert_eq!(answer.status, 502);
     assert!(String::from_utf8_lossy(&answer.body).contains("lmgw_unreachable"));
 }

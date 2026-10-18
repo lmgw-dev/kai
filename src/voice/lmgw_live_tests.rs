@@ -7,8 +7,9 @@
 //!
 //! The test starts and stops the dev lmgw itself (a restart is one of the checks), through the
 //! launcher the script wrote. The owner's side goes through the dev lmgw's `/api` and Chat API with
-//! the owner bearer from its log line; "the dashboard" is that bearer. The device key lives in
-//! memory only (no wallet). Speech is a TTS clip played into the private test microphone; the
+//! the owner bearer from its log line; "the dashboard" is that bearer. Kai pairs over lmgw's device
+//! link ([`device`]: a link for this computer, Kai's enrolment, the owner's Confirm); its key lives
+//! in memory only (no wallet). Speech is a TTS clip played into the private test microphone; the
 //! replies' audio is a TTS clip too, played on the private test sink, whose monitor is the ground
 //! truth of what was played.
 //!
@@ -21,6 +22,10 @@
 //! 5. a dashboard bind takes over: the notification names the dashboard, Kai does not reconnect;
 //! 6. a dev lmgw restart turns listening off with a notification that says lmgw is stopping or
 //!    restarting (its 1001 close, not a lost connection), and Kai does not reconnect.
+
+// The owner's requests to the dev lmgw's plain listener (its dashboard and admin API), never the
+// device link: device link D15's rule (`clippy.toml`) is a paired Kai's connections'.
+#![allow(clippy::disallowed_methods)]
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -44,8 +49,8 @@ use crate::audio::test_support::monotonic_ns;
 use crate::audio::{Audio, Player, RATE};
 use crate::config::Config;
 use crate::core::{Command, Core};
+use crate::lmgw_link::tls::{Reach, Tls};
 use crate::lmgw_link::{Credentials, FeedLink, FeedSettings, RealtimeLink, RealtimeSettings};
-use crate::pairing::DeviceKey;
 use crate::paths::Paths;
 use crate::secret::MemoryStore;
 use crate::tray::model::{Link, Pairing, TrayModel, VoiceShown};
@@ -215,8 +220,8 @@ impl Lmgw {
 }
 
 /// The mock upstreams, the aliases and the Chat's voice settings; Kai's folder (ongoing, its
-/// model the mock's) and Kai's device key. Returns (folder id, device key).
-async fn set_up(lmgw: &Lmgw) -> (i64, String) {
+/// model the mock's) and Kai's device. Returns (folder id, the device).
+async fn set_up(lmgw: &Lmgw) -> (i64, LiveDevice) {
     set_up_mocks(lmgw).await;
     let folder = lmgw
         .owner(
@@ -230,19 +235,114 @@ async fn set_up(lmgw: &Lmgw) -> (i64, String) {
         .await["id"]
         .as_i64()
         .unwrap();
-    (folder, device_key(lmgw, "kai-live").await)
+    (folder, device(lmgw, "kai-live", json!({})).await)
 }
 
-/// A device key named `name` for the dev lmgw.
-pub(super) async fn device_key(lmgw: &Lmgw, name: &str) -> String {
-    lmgw.op(
-        "key_create",
-        json!({"kind": "device", "name": name, "url": URL}),
+/// A device of the dev lmgw, paired over its device link: what Kai keeps, and its credentials.
+pub(super) struct LiveDevice {
+    pub(super) enrolled: crate::pairing::Enrolled,
+    pub(super) creds: Credentials,
+}
+
+impl LiveDevice {
+    /// What its log must never hold: a run of its private key's PEM.
+    pub(super) fn secret(&self) -> String {
+        self.enrolled
+            .key
+            .to_pem()
+            .lines()
+            .nth(1)
+            .expect("a PEM body")
+            .to_owned()
+    }
+
+    /// Kai's pairing with it, as the core finds it at its start (its key in `store`).
+    pub(super) fn store(&self, paths: &Paths, store: &MemoryStore) {
+        self.enrolled.paired.save(&paths.device_link_file).unwrap();
+        store.items.lock().unwrap().insert(
+            self.enrolled.paired.fp.clone(),
+            ("kai-live".into(), self.enrolled.key.clone()),
+        );
+    }
+
+    /// A request as this device (its certificate, over the device listener).
+    pub(super) async fn call(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+    ) -> (u16, String) {
+        let http = self.creds.http();
+        let url = format!("{}{path}", self.creds.url());
+        let mut rb = match method {
+            "GET" => http.get(url),
+            _ => http.post(url),
+        };
+        rb = rb.timeout(Duration::from_secs(60));
+        if let Some(b) = body {
+            rb = rb
+                .header("content-type", "application/json")
+                .body(b.to_string());
+        }
+        let r = rb.send().await.unwrap();
+        let status = r.status().as_u16();
+        (status, r.text().await.unwrap())
+    }
+}
+
+/// A device named `name` for the dev lmgw (lmgw's device link WP3): its device listener turned on
+/// first when it does not listen (loopback, the HTTP port plus one, as lmgw's pairing form does), a
+/// pairing link for this computer from `key_create` (`extra`: more of the device's policy), Kai's
+/// own enrolment with it, then the owner's Confirm with the code the device shows
+/// (`device_confirm {id, confirm_code}`).
+pub(super) async fn device(lmgw: &Lmgw, name: &str, extra: Value) -> LiveDevice {
+    let listening = |status: &Value| status["devices"]["listener"]["state"] == "listening";
+    if !listening(&lmgw.owner("GET", "/api/status", None).await) {
+        lmgw.op("settings_set", json!({"devices": {"listener": true}}))
+            .await;
+        let status = lmgw.owner("GET", "/api/status", None).await;
+        assert!(
+            listening(&status),
+            "the dev lmgw's device listener: {}",
+            status["devices"]["listener"]
+        );
+    }
+    let mut body = json!({"kind": "device", "name": name, "local_only": true});
+    if let (Some(b), Some(x)) = (body.as_object_mut(), extra.as_object()) {
+        b.extend(x.clone());
+    }
+    let made = lmgw.op("key_create", body).await;
+    let link = crate::pairing::PairingLink::parse(
+        made["link"]
+            .as_str()
+            .expect("key_create's pairing link (lmgw's device link WP3)"),
     )
-    .await["key"]
-        .as_str()
-        .unwrap()
-        .to_owned()
+    .unwrap();
+    let key = crate::pairing::TlsKey::generate().unwrap();
+    let enrolled = crate::pairing::enrol(
+        &link,
+        &key,
+        "Kai live check",
+        Duration::from_secs(10),
+        Duration::from_millis(250),
+    )
+    .await
+    .expect("the enrolment");
+    lmgw.op(
+        "device_confirm",
+        json!({"id": made["id"], "confirm_code": enrolled.paired.credentials.confirm_code}),
+    )
+    .await;
+    let creds = Credentials {
+        reach: Reach::new(enrolled.paired.credentials.urls.clone()),
+        tls: Tls::paired(
+            &enrolled.paired.credentials,
+            &enrolled.key,
+            Duration::from_secs(10),
+        )
+        .unwrap(),
+    };
+    LiveDevice { enrolled, creds }
 }
 
 /// The mock upstreams, the aliases `kai-chat`, `kai-asr` and `kai-tts`, and the Chat's voice
@@ -417,6 +517,7 @@ fn kind(e: &ClientEvent) -> &'static str {
         ClientEvent::ResponseCancel { .. } => "response.cancel",
         ClientEvent::Truncate { .. } => "truncate",
         ClientEvent::ApprovalResponse { .. } => "approval",
+        other => other.kind(),
     }
 }
 
@@ -698,12 +799,11 @@ fn signed_ms(a: Instant, b: Instant) -> i64 {
 }
 
 /// Review KAI-2 K2-1: Kai's log (at whatever `KAI_LOG` the script set, `trace` included) carries
-/// none of `keys` and no audio. Returns the report's line.
-pub(super) fn log_is_clean(log: &std::path::Path, keys: &[&str]) -> String {
+/// none of `secrets` ([`LiveDevice::secret`]) and no audio. Returns the report's line.
+pub(super) fn log_is_clean(log: &std::path::Path, secrets: &[&str]) -> String {
     let text = std::fs::read_to_string(log).unwrap_or_default();
-    for k in keys {
-        let hex = k.trim_start_matches("lmgw-device-");
-        assert!(!text.contains(hex), "a device key is in {}", log.display());
+    for k in secrets {
+        assert!(!text.contains(k), "a device's key is in {}", log.display());
     }
     assert!(
         !text.contains("\"audio\":\""),
@@ -771,7 +871,7 @@ async fn lmgw_voice_live() {
 
     let mut lmgw = Lmgw::new();
     let boot = lmgw.start().await;
-    let (folder, key) = set_up(&lmgw).await;
+    let (folder, kai) = set_up(&lmgw).await;
     r.line(format!(
         "dev lmgw up in {} ms; mocks: chat (echo), ASR (\"{ASR_TEXT}\"), TTS (the clip, {clip_ms} ms per clause); folder {folder}",
         ms(boot)
@@ -794,21 +894,18 @@ async fn lmgw_voice_live() {
     std::fs::write(
         &paths.config_file,
         format!(
-            "[lmgw]\nurl = \"{URL}\"\nretry_max_s = 2\n[audio]\ninput = \"{MIC}\"\noutput = \"{SINK}\"\n\
+            "[lmgw]\nretry_max_s = 2\n[audio]\ninput = \"{MIC}\"\noutput = \"{SINK}\"\n\
              [conversation]\nfolder_id = {folder}\n[voice]\ngrace_s = 2\n[shortcuts]\nbind = false\n"
         ),
     )
     .unwrap();
     let config = Config::load(&paths.config_file).unwrap();
     let store = Arc::new(MemoryStore::default());
-    store.items.lock().unwrap().insert(
-        URL.into(),
-        ("kai-live".into(), DeviceKey::parse(&key).unwrap()),
-    );
-    let feed = FeedLink::new(FeedSettings::from_config(&config)).unwrap();
+    kai.store(&paths, &store);
+    let feed = FeedLink::new(FeedSettings::from_config(&config));
     let tap = Tap::default();
     let voice_link = Tapped {
-        link: RealtimeLink::new(RealtimeSettings::from_config(&config), feed.client()),
+        link: RealtimeLink::new(RealtimeSettings::from_config(&config)),
         tap: tap.clone(),
     };
     let (model_tx, mut model) = watch::channel(TrayModel::starting(false));
@@ -1113,7 +1210,7 @@ async fn lmgw_voice_live() {
             .filter(|g| g.at >= barge)
             .filter_map(|g| match &g.event {
                 SessionEvent::Server(ServerEvent::ChatReply(c)) if c.unheard.is_some() => {
-                    Some((g.at, c.clone()))
+                    Some((g.at, (**c).clone()))
                 }
                 _ => None,
             })
@@ -1440,6 +1537,6 @@ async fn lmgw_voice_live() {
     mic_audio.shutdown(Duration::from_secs(4)).await;
     let how = lmgw.stop().await;
     r.line(format!("Kai quit; the dev lmgw {how}"));
-    r.line(log_is_clean(&out_dir().join("kai.log"), &[&key]));
+    r.line(log_is_clean(&out_dir().join("kai.log"), &[&kai.secret()]));
     std::fs::write(out_dir().join("report.txt"), &r.0).unwrap();
 }

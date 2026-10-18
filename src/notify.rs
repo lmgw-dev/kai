@@ -124,6 +124,27 @@ pub async fn notify(
     }
 }
 
+/// Closes `shown` (`CloseNotification`), which also removes it from the server's history. Best
+/// effort: a failure or a server past `timeout` is logged and nothing else.
+pub async fn close(conn: &zbus::Connection, shown: &Shown, timeout: Duration) {
+    #[cfg(feature = "live-test")]
+    if crate::live_test::active() {
+        return;
+    }
+    let args = (shown.id,);
+    let call = conn.call_method(Some(SERVER), PATH, Some(SERVER), "CloseNotification", &args);
+    match tokio::time::timeout(timeout, call).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => tracing::warn!("closing desktop notification {} failed: {e}", shown.id),
+        Err(_) => tracing::warn!(
+            "the notification server did not answer within {} s (dbus.timeout_s); notification {} \
+             stays",
+            timeout.as_secs(),
+            shown.id
+        ),
+    }
+}
+
 /// Follows the notification server's `ActionInvoked` into `tx` until the connection or the
 /// receiver goes. `timeout` (`dbus.timeout_s`) bounds the match rule; a failure is logged once and
 /// the watch ends (the notifications still show; their buttons then do nothing).

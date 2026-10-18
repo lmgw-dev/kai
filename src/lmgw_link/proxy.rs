@@ -1,12 +1,11 @@
 //! The configuration window's requests to lmgw (WP21b's Personality page): the kit's profile editor
 //! calls lmgw's `/chat/api/profiles*`, `/v1/models` and `/v1/audio/voices`, and Kai's scheme
 //! handler hands each one it admits (`crate::settings::window::profiles`) to the core as a
-//! [`Forward`]. The core sends it here with the device key, so the page never holds the key and
-//! opens no connection of its own.
+//! [`Forward`]. The core sends it here over the device link (lmgw's device link design §6.2), so
+//! the page holds no credential and opens no connection of its own.
 //!
-//! - **Out:** the method, the path and query as the window admitted them, a POST's JSON body, the
-//!   device key as the bearer (a sensitive header, never logged), and nothing of the page's own
-//!   headers.
+//! - **Out:** the method, the path and query as the window admitted them, a POST's JSON body, and
+//!   nothing of the page's own headers; the device's certificate authenticates it.
 //! - **Back:** lmgw's status and body as they are, with its content type reduced to the few the
 //!   page reads (JSON, `audio/wav` from Speak, plain text); none of lmgw's other headers.
 //! - **Bounds:** `window.proxy_max_mb` for the request (checked by the core before it is sent) and
@@ -108,29 +107,18 @@ pub fn mime_of(content_type: Option<&str>) -> &'static str {
     }
 }
 
-/// Sends `forward` to the paired lmgw with the device key and returns its answer for the page
-/// (module doc). Never fails: what went wrong is a [`Proxied::refused`].
-pub async fn send(
-    client: &reqwest::Client,
-    creds: &Credentials,
-    forward: Forward,
-    limits: Limits,
-) -> Proxied {
-    let url = format!("{}{}", creds.url.trim_end_matches('/'), forward.path);
-    let mut bearer =
-        match reqwest::header::HeaderValue::from_str(&format!("Bearer {}", creds.key.expose())) {
-            Ok(v) => v,
-            Err(_) => return Proxied::refused(500, "kai_key", "the device key cannot be sent"),
-        };
-    bearer.set_sensitive(true);
+/// Sends `forward` to the paired lmgw and returns its answer for the page (module doc). Never fails:
+/// what went wrong is a [`Proxied::refused`].
+pub async fn send(creds: &Credentials, forward: Forward, limits: Limits) -> Proxied {
+    let client = creds.http();
+    let url = format!("{}{}", creds.url().trim_end_matches('/'), forward.path);
     let rb = match forward.method {
         Method::Get => client.get(&url),
         Method::Post => client
             .post(&url)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(forward.body),
-    }
-    .header(reqwest::header::AUTHORIZATION, bearer);
+    };
     let exchange = exchange(rb, limits);
     let answer = match limits.timeout_s {
         0 => exchange.await,
@@ -155,11 +143,7 @@ async fn exchange(rb: reqwest::RequestBuilder, limits: Limits) -> Proxied {
     let mut resp = match rb.send().await {
         Ok(r) => r,
         Err(e) => {
-            return Proxied::refused(
-                502,
-                "lmgw_unreachable",
-                &format!("lmgw is not reachable: {}", describe(&e)),
-            );
+            return Proxied::refused(502, "lmgw_unreachable", &super::tls::unreachable(&e));
         }
     };
     let status = resp.status().as_u16();

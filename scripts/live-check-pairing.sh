@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 # Live check of an unpaired Kai, click-free: the tray item shows "not paired" with the unpaired menu
-# (Pair with lmgw…, Settings…, Check for Updates…, Quit); a second kai hands a test pairing link to
-# the running one, which answers at once and asks the owner in its confirmation dialog (never
-# answered); nothing is stored; neither the key nor the link reaches a log; then Kai quits cleanly.
+# (Pair with lmgw…, Settings…, Check for Updates…, Quit); a second kai hands a test pairing link (the
+# link v2 of lmgw's device link: an https URL, fp, a one-time token) to the running one, which
+# answers at once and asks the owner in its confirmation dialog (never answered); nothing is sent
+# to lmgw or stored (no key in the wallet under the link's fp, no device-link.json); neither the
+# token nor the link reaches a log; then Kai quits cleanly. No lmgw: nothing is confirmed, so
+# nothing is enrolled.
 # Usage: scripts/live-check-pairing.sh
 #
 # Isolation: its own session bus and Secret Service (scripts/private-bus.sh, under
 # target/live-pairing-bus): a Kai the session runs, the session's wallet and its tray are never
-# touched, and the item {application: dev.rootshell.kai, lmgw: http://127.0.0.1:1} exists only in
+# touched, and an item {application: dev.rootshell.kai, lmgw: <the link's fp>} could exist only in
 # that keyring. Kai gets no WAYLAND_DISPLAY or DISPLAY, so the confirmation dialog cannot open on
 # the owner's desktop. Kai's config lives under target/live (the owner's ~/.config/kai is
 # untouched). No screen captures, nothing installed.
@@ -19,10 +22,10 @@ source scripts/private-bus.sh "$PWD/target/live-pairing-bus" "$self" "$@"
 # shellcheck source=scripts/shortcuts-guard.sh
 source scripts/shortcuts-guard.sh
 
-URL=http://127.0.0.1:1
-KEYHEX=$(printf 'deadbeef%.0s' 1 2 3 4 5 6 7 8)
-KEY="lmgw-device-$KEYHEX"
-LINK="lmgw-pair:?v=1&url=http%3A%2F%2F127.0.0.1%3A1&name=kai-live-check&key=$KEY"
+URL=https://127.0.0.1:1
+FP="sha256:$(printf 'deadbeef%.0s' 1 2 3 4 5 6 7 8)"
+TOKENHEX=$(printf 'c0ffee42%.0s' 1 2 3 4)
+LINK="lmgw-pair:?v=2&name=kai-live-check&url=https%3A%2F%2F127.0.0.1%3A1&fp=sha256%3A${FP#sha256:}&token=lmgw-enrol-$TOKENHEX"
 LIVE=target/live
 EXE=$PWD/target/debug/kai
 KAI_PID=""
@@ -33,15 +36,15 @@ pass() { echo "PASS: $*"; }
 cleanup() {
   set +e
   if [ -n "$KAI_PID" ] && kill -0 "$KAI_PID" 2>/dev/null; then kill -TERM "$KAI_PID"; wait "$KAI_PID"; fi
-  secret-tool clear application dev.rootshell.kai lmgw "$URL" 2>/dev/null
+  secret-tool clear application dev.rootshell.kai lmgw "$FP" 2>/dev/null
   rm -rf "$LIVE/config"
   private_bus_stop
 }
 trap 'cleanup; kgs_check || exit 1' EXIT
 
 if busctl --user status dev.rootshell.kai >/dev/null 2>&1; then fail "a Kai already runs; quit it first"; fi
-[ -z "$(secret-tool lookup application dev.rootshell.kai lmgw "$URL" 2>/dev/null)" ] \
-  || fail "an item for $URL exists already; not touching it"
+[ -z "$(secret-tool lookup application dev.rootshell.kai lmgw "$FP" 2>/dev/null)" ] \
+  || fail "an item for $FP exists already; not touching it"
 
 rm -rf "$LIVE"
 mkdir -p "$LIVE"
@@ -83,18 +86,19 @@ pass "the running Kai received the link from the second kai and asks the owner"
 
 # 3. The link never reaches a log.
 for f in "$LIVE"/*.log; do
-  if grep -q "$KEYHEX" "$f"; then fail "the key is in $f"; fi
+  if grep -q "$TOKENHEX" "$f"; then fail "the token is in $f"; fi
   if grep -qi 'lmgw-pair:' "$f"; then fail "the link is in $f"; fi
 done
-pass "neither the key nor the link is in kai.log or handler.log"
+pass "neither the token nor the link is in kai.log or handler.log"
 
-# 4. Nothing is stored before the owner's answer; the tray says the link waits.
-[ -z "$(secret-tool lookup application dev.rootshell.kai lmgw "$URL" 2>/dev/null)" ] || fail "stored without a confirmation"
-! grep -q "url = " "$XDG_CONFIG_HOME/kai/config.toml" 2>/dev/null || fail "lmgw.url written without a confirmation"
+# 4. Nothing is sent or stored before the owner's answer; the tray says the link waits.
+[ -z "$(secret-tool lookup application dev.rootshell.kai lmgw "$FP" 2>/dev/null)" ] || fail "a key stored without a confirmation"
+[ ! -e "$XDG_CONFIG_HOME/kai/device-link.json" ] || fail "device-link.json written without a confirmation"
+! grep -q 'pairing: enrolling' "$LIVE/kai.log" || fail "Kai enrolled without a confirmation"
 [ ! -f "$XDG_CONFIG_HOME/autostart/dev.rootshell.kai.desktop" ] || fail "Start with Plasma switched on without a confirmation"
 echo "  tooltip: $(tooltip)"
 prop ToolTip | grep -qE "pairing link for $URL waits for (your answer|the wallet)" || fail "the tooltip does not say the link waits"
-pass "nothing stored, no lmgw.url, Start with Plasma off; the tooltip says the link waits"
+pass "nothing enrolled or stored (no key under the link's fp, no device-link.json), Start with Plasma off; the tooltip says the link waits"
 
 # 5. Quit: the dialog goes unanswered, and still nothing is stored.
 kill -TERM "$KAI_PID"
@@ -104,5 +108,6 @@ KAI_PID=""
 [ "$code" -eq 0 ] || fail "Kai exited with $code"
 grep -q 'Kai has quit' "$LIVE/kai.log" || fail "no clean quit in the log"
 if busctl --user status dev.rootshell.kai >/dev/null 2>&1; then fail "dev.rootshell.kai is still owned"; fi
-[ -z "$(secret-tool lookup application dev.rootshell.kai lmgw "$URL" 2>/dev/null)" ] || fail "stored at quit"
+[ -z "$(secret-tool lookup application dev.rootshell.kai lmgw "$FP" 2>/dev/null)" ] || fail "stored at quit"
+[ ! -e "$XDG_CONFIG_HOME/kai/device-link.json" ] || fail "device-link.json written at quit"
 pass "clean quit: exit 0, name released, nothing stored"

@@ -34,6 +34,10 @@
 //!    card goes at the lock and is back after the unlock; approved by the owner in lmgw while
 //!    locked, the resumed turn's call of Kai's tool is refused; after the unlock Kai is idle.
 //! 6. No device key and no tool argument in Kai's log; the card's surface and its web process go.
+
+// The owner's requests to the dev lmgw's plain listener (its dashboard and admin API), never the
+// device link: device link D15's rule (`clippy.toml`) is a paired Kai's connections'.
+#![allow(clippy::disallowed_methods)]
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -44,14 +48,13 @@ use tokio::sync::{mpsc, watch};
 
 use super::link::ClientEvent;
 use super::lmgw_live_tests::{
-    Lmgw, Mic, Report, Tap, Tapped, URL, env, log_is_clean, set_up_mocks,
+    Lmgw, Mic, Report, Tap, Tapped, URL, device, env, log_is_clean, set_up_mocks,
 };
 use crate::audio::live_tests::{MIC, MIC_IN, SINK, read_wav, settings};
 use crate::audio::{Audio, RATE};
 use crate::config::Config;
 use crate::core::{Command, Core};
-use crate::lmgw_link::{FeedLink, FeedSettings, RealtimeLink, RealtimeSettings};
-use crate::pairing::DeviceKey;
+use crate::lmgw_link::{Credentials, FeedLink, FeedSettings, RealtimeLink, RealtimeSettings};
 use crate::paths::Paths;
 use crate::secret::MemoryStore;
 use crate::tray::model::{Link, Pairing, TrayModel, VoiceShown};
@@ -258,44 +261,78 @@ async fn until_thread(lmgw: &Lmgw, id: i64, what: &str, f: impl Fn(&str) -> bool
     }
 }
 
-/// A thread with Kai's tools, every call waiting for an approval; `bearer` is who creates it.
-async fn gated_thread(lmgw: &Lmgw, bearer: &str) -> i64 {
-    let (st, body) = lmgw
+/// Who a request goes as: the owner (its bearer, on the plain listener) or a device (its
+/// certificate, on the device listener).
+#[derive(Clone)]
+enum Who {
+    Owner(String),
+    Device(Credentials),
+}
+
+impl Who {
+    fn request(&self, method: &str, path: &str) -> reqwest::RequestBuilder {
+        let (http, url) = match self {
+            Who::Owner(_) => (reqwest::Client::new(), format!("{URL}{path}")),
+            Who::Device(c) => (c.http(), format!("{}{path}", c.url())),
+        };
+        let rb = match method {
+            "GET" => http.get(url),
+            _ => http.post(url),
+        };
+        match self {
+            Who::Owner(token) => rb.bearer_auth(token),
+            Who::Device(_) => rb,
+        }
+    }
+
+    async fn call(&self, method: &str, path: &str, body: Option<Value>) -> (u16, String) {
+        let mut rb = self.request(method, path).timeout(Duration::from_secs(60));
+        if let Some(b) = body {
+            rb = rb
+                .header("content-type", "application/json")
+                .body(b.to_string());
+        }
+        let r = rb.send().await.unwrap();
+        let status = r.status().as_u16();
+        (status, r.text().await.unwrap())
+    }
+}
+
+/// A thread with Kai's tools, every call waiting for an approval; `who` creates it.
+async fn gated_thread(lmgw: &Lmgw, who: &Who) -> i64 {
+    let (st, body) = who
         .call(
             "POST",
             "/chat/api/threads",
             Some(json!({"model_alias": "kai-chat"})),
-            bearer,
         )
         .await;
     assert!((200..300).contains(&st), "a new thread: {st} {body}");
     let id = serde_json::from_str::<Value>(&body).unwrap()["id"]
         .as_i64()
         .unwrap();
-    gate(lmgw, id, bearer).await;
+    gate(lmgw, id, who).await;
     id
 }
 
-async fn gate(lmgw: &Lmgw, id: i64, bearer: &str) {
-    let (st, body) = lmgw
+async fn gate(lmgw: &Lmgw, id: i64, who: &Who) {
+    let _ = lmgw;
+    let (st, body) = who
         .call(
             "POST",
             &format!("/chat/api/threads/{id}/settings"),
             Some(json!({"mcp_tools": [{"server_label": LABEL, "require_approval": "always"}]})),
-            bearer,
         )
         .await;
     assert!((200..300).contains(&st), "thread {id}'s tools: {st} {body}");
 }
 
-/// A message sent as `bearer`, its stream read to its end (the gated stop) in a task.
-fn send(lmgw: &Lmgw, id: i64, bearer: &str) -> tokio::task::JoinHandle<(u16, String)> {
-    let (http, bearer) = (reqwest::Client::new(), bearer.to_owned());
+/// A message sent as `who`, its stream read to its end (the gated stop) in a task.
+fn send(lmgw: &Lmgw, id: i64, who: &Who) -> tokio::task::JoinHandle<(u16, String)> {
+    let rb = who.request("POST", &format!("/chat/api/threads/{id}/send"));
     let _ = lmgw;
     tokio::spawn(async move {
-        let r = http
-            .post(format!("{URL}/chat/api/threads/{id}/send"))
-            .bearer_auth(bearer)
+        let r = rb
             .header("content-type", "application/json")
             .body(json!({"content": "keep a note"}).to_string())
             .timeout(Duration::from_secs(60))
@@ -338,26 +375,18 @@ async fn scenario(out: PathBuf, notes: Arc<Mutex<Report>>) {
         .await["id"]
         .as_i64()
         .unwrap();
-    let made = lmgw
-        .op(
-            "key_create",
-            json!({"kind": "device", "name": "kai-live", "url": URL, "hosts_label": LABEL}),
-        )
-        .await;
-    let key = made["key"].as_str().unwrap().to_owned();
-    let peer = lmgw
-        .op(
-            "key_create",
-            // A device reaches another's hosted label only through a list naming it (L16).
-            json!({"kind": "device", "name": "kai-peer", "url": URL,
-                "tool_scope_mode": "allow", "tool_scope_patterns": format!("{LABEL}__*")}),
-        )
-        .await["key"]
-        .as_str()
-        .unwrap()
-        .to_owned();
+    let kai = device(&lmgw, "kai-live", json!({"hosts_label": LABEL})).await;
+    // A device reaches another's hosted label only through a list naming it (L16).
+    let peer = device(
+        &lmgw,
+        "kai-peer",
+        json!({"tool_scope_mode": "allow", "tool_scope_patterns": format!("{LABEL}__*")}),
+    )
+    .await;
+    let owner = Who::Owner(lmgw.token.clone());
+    let as_peer = Who::Device(peer.creds.clone());
     line(format!(
-        "dev lmgw up in {} ms; device keys kai-live (hosts {LABEL}) and kai-peer; folder {folder}",
+        "dev lmgw up in {} ms; devices kai-live (hosts {LABEL}) and kai-peer; folder {folder}",
         boot.as_millis()
     ));
     let granted = grant().await;
@@ -382,7 +411,7 @@ async fn scenario(out: PathBuf, notes: Arc<Mutex<Report>>) {
     std::fs::write(
         &paths.config_file,
         format!(
-            "[lmgw]\nurl = \"{URL}\"\nretry_max_s = 2\n[audio]\ninput = \"{MIC}\"\noutput = \"{SINK}\"\n\
+            "[lmgw]\nretry_max_s = 2\n[audio]\ninput = \"{MIC}\"\noutput = \"{SINK}\"\n\
              [conversation]\nfolder_id = {folder}\n[voice]\ngrace_s = 2\nmode = \"push_to_talk\"\n\
              [shortcuts]\nbind = false\n[policy]\ntrusted_approvers = [\"device:kai-peer\"]\n\
              [approvals]\narm_ms = 1500\n"
@@ -391,14 +420,11 @@ async fn scenario(out: PathBuf, notes: Arc<Mutex<Report>>) {
     .unwrap();
     let config = Config::load(&paths.config_file).unwrap();
     let store = Arc::new(MemoryStore::default());
-    store.items.lock().unwrap().insert(
-        URL.into(),
-        ("kai-live".into(), DeviceKey::parse(&key).unwrap()),
-    );
-    let feed = FeedLink::new(FeedSettings::from_config(&config)).unwrap();
+    kai.store(&paths, &store);
+    let feed = FeedLink::new(FeedSettings::from_config(&config));
     let tap = Tap::default();
     let voice_link = Tapped {
-        link: RealtimeLink::new(RealtimeSettings::from_config(&config), feed.client()),
+        link: RealtimeLink::new(RealtimeSettings::from_config(&config)),
         tap: tap.clone(),
     };
     let (model_tx, mut model) = watch::channel(TrayModel::starting(false));
@@ -452,8 +478,8 @@ async fn scenario(out: PathBuf, notes: Arc<Mutex<Report>>) {
     ));
 
     // ---- 1. the card and the route: an owner's thread, Enter after the arming delay
-    let t1 = gated_thread(&lmgw, &lmgw.token).await;
-    let sent = send(&lmgw, t1, &lmgw.token);
+    let t1 = gated_thread(&lmgw, &owner).await;
+    let sent = send(&lmgw, t1, &owner);
     let w = card_window(20).await;
     let shown = Instant::now();
     let (st, stopped) = sent.await.unwrap();
@@ -522,8 +548,8 @@ async fn scenario(out: PathBuf, notes: Arc<Mutex<Report>>) {
     ));
 
     // ---- 2. Esc declines
-    let t2 = gated_thread(&lmgw, &lmgw.token).await;
-    let sent = send(&lmgw, t2, &lmgw.token);
+    let t2 = gated_thread(&lmgw, &owner).await;
+    let sent = send(&lmgw, t2, &owner);
     card_window(20).await;
     let _ = sent.await;
     tokio::time::sleep(Duration::from_millis(1800)).await;
@@ -538,8 +564,8 @@ async fn scenario(out: PathBuf, notes: Arc<Mutex<Report>>) {
     );
 
     // ---- 3. a self-approval is no approval
-    let t3 = gated_thread(&lmgw, &peer).await;
-    let sent = send(&lmgw, t3, &peer);
+    let t3 = gated_thread(&lmgw, &as_peer).await;
+    let sent = send(&lmgw, t3, &as_peer);
     let (st, _) = sent.await.unwrap();
     assert_eq!(st, 200, "kai-peer's turn");
     // Kai's card may show kai-peer's call too (a thread Kai's device sees); kai-peer decides it.
@@ -558,12 +584,10 @@ async fn scenario(out: PathBuf, notes: Arc<Mutex<Report>>) {
     };
     // Its answer streams the resumed turn, which waits on Kai's dialog: read in a task.
     let decided = {
-        let (http, peer) = (reqwest::Client::new(), peer.clone());
+        let rb = as_peer.request("POST", &format!("/chat/api/threads/{t3}/approvals"));
         let body = json!({"decisions": [{"approval_request_id": call, "approve": true}]});
         tokio::spawn(async move {
-            let r = http
-                .post(format!("{URL}/chat/api/threads/{t3}/approvals"))
-                .bearer_auth(peer)
+            let r = rb
                 .header("content-type", "application/json")
                 .body(body.to_string())
                 .timeout(Duration::from_secs(120))
@@ -614,7 +638,7 @@ async fn scenario(out: PathBuf, notes: Arc<Mutex<Report>>) {
         .with(|t| t.currents.last().and_then(|c| c.3.clone().ok()))
         .map(|(id, _)| id)
         .expect("Kai asked for its conversation's thread");
-    gate(&lmgw, conv, &lmgw.token).await;
+    gate(&lmgw, conv, &owner).await;
     let press_at = Instant::now();
     cmds.send(Command::Talk(true)).unwrap();
     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -722,8 +746,8 @@ async fn scenario(out: PathBuf, notes: Arc<Mutex<Report>>) {
         )
         .await;
     assert!((200..300).contains(&st), "conv's tools off: {st} {body}");
-    let t5 = gated_thread(&lmgw, &lmgw.token).await;
-    let sent = send(&lmgw, t5, &lmgw.token);
+    let t5 = gated_thread(&lmgw, &owner).await;
+    let sent = send(&lmgw, t5, &owner);
     card_window(20).await;
     let _ = sent.await;
     let holder = crate::approvals::keyboard::Holder::global();
@@ -801,7 +825,10 @@ async fn scenario(out: PathBuf, notes: Arc<Mutex<Report>>) {
     let _ = tokio::time::timeout(Duration::from_secs(20), task).await;
     drop(mic);
     line(format!("6 lmgw: {}", lmgw.stop().await));
-    line(log_is_clean(&out.join("kai.log"), &[&key, &peer]));
+    line(log_is_clean(
+        &out.join("kai.log"),
+        &[&kai.secret(), &peer.secret()],
+    ));
     let log = std::fs::read_to_string(out.join("kai.log")).unwrap_or_default();
     for n in 1..=7 {
         assert!(
@@ -892,8 +919,9 @@ async fn lock_step(
     ));
     tokio::time::sleep(Duration::from_millis(300)).await;
     // A call that waits through a lock.
-    let t6 = gated_thread(lmgw, &lmgw.token).await;
-    let sent = send(lmgw, t6, &lmgw.token);
+    let owner = Who::Owner(lmgw.token.clone());
+    let t6 = gated_thread(lmgw, &owner).await;
+    let sent = send(lmgw, t6, &owner);
     card_window(20).await;
     let _ = sent.await;
     let locked_at = Instant::now();

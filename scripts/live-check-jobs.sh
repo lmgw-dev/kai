@@ -61,7 +61,10 @@ trap 'cleanup; kgs_check || exit 1' EXIT
     || fail "no dev lmgw build: cargo build -p lmgw-core --example headless in $LMGW"
 grep -q TOOL_SCRIPT "$LMGW/scripts/mock-openai.py" || fail "$LMGW's mock-openai.py has no TOOL_SCRIPT (M7)"
 git -C "$LMGW" grep -q 'lmgw.task.done' -- crates/lmgw-core/src || fail "$LMGW has no bound task results (M4 WP3)"
-if ss -ltnH "sport = :8897" | grep -q .; then fail "something listens on 8897 already"; fi
+# 8898: the dev lmgw's device listener, which Kai pairs over (loopback, the HTTP port plus one).
+for port in 8897 8898; do
+    if ss -ltnH "sport = :$port" | grep -q .; then fail "something listens on $port already"; fi
+done
 
 rm -rf "$OUT"
 mkdir -p "$OUT" "$DATA"

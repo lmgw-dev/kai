@@ -1,6 +1,7 @@
-//! The adapter against a loopback lmgw that answers like `/v1/chat/completions` with scripted turns
-//! (tool calls, then a text) and lists the folders, and a fake desktop: the key, the alias and the
-//! body on the wire; the static part a byte prefix of every request; the screenshots in the
+//! The adapter against a loopback lmgw behind the tests' device listener
+//! (`crate::lmgw_link::test_pki`) that answers like `/v1/chat/completions` with scripted turns (tool
+//! calls, then a text) and lists the folders, and a fake desktop: no credential header, the alias
+//! and the body on the wire; the static part a byte prefix of every request; the screenshots in the
 //! delegate's requests only; K15 by the delegate's caller and the plan's one dialog; listing;
 //! cancellation; nothing private in a trace log.
 
@@ -10,7 +11,6 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
@@ -19,12 +19,11 @@ use crate::host::confirm::ConfirmRequest;
 use crate::host::policy::{Policy, SharedPolicy};
 use crate::host::registry::Args;
 use crate::host::settings::{Named, PolicyConfig, ToolState};
-use crate::pairing::DeviceKey;
+use crate::lmgw_link::test_pki::{Gateway, creds as test_creds};
 
 mod review;
 mod screenshots;
 
-const KEY: &str = "lmgw-device-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 const WORDS: &str = "Kai, was steht da im Fenster? «UTTERANCE-4711»";
 const QUESTION: &str = "what does the window say? QUESTION-0815";
 const SHOT: &str = "iVBORw0KGgoSHOT-WINDOW";
@@ -56,8 +55,8 @@ impl Drop for Lmgw {
 
 impl Lmgw {
     pub async fn start(folders: Value, turns: Vec<Value>) -> Self {
-        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", l.local_addr().unwrap());
+        let l = Gateway::bind().await;
+        let url = l.url.clone();
         let seen = Arc::new(Mutex::new(Vec::new()));
         let turns = Arc::new(Mutex::new(VecDeque::from(turns)));
         let s = seen.clone();
@@ -65,8 +64,9 @@ impl Lmgw {
         let listed = models.clone();
         let task = tokio::spawn(async move {
             loop {
+                // A handshake that failed (a client that went) ends only its connection.
                 let Ok((mut c, _)) = l.accept().await else {
-                    return;
+                    continue;
                 };
                 let (seen, turns, folders) = (s.clone(), turns.clone(), folders.clone());
                 let listed = listed.clone();
@@ -338,10 +338,7 @@ fn rig_with(
     asked: Asked,
     utterance: fn() -> Option<String>,
 ) -> Rig {
-    let (tx, creds) = watch::channel(Some(Credentials {
-        url: url.to_owned(),
-        key: DeviceKey::parse(KEY).unwrap(),
-    }));
+    let (tx, creds) = watch::channel(Some(test_creds(url)));
     let asked = Arc::new(asked);
     let policy: SharedPolicy = Arc::new(RwLock::new(Policy::new(&policy)));
     let tools = DelegateTools::new(Inner {
@@ -349,7 +346,6 @@ fn rig_with(
         policy: policy.clone(),
         confirmer: asked.clone(),
         creds,
-        client: Some(reqwest::Client::builder().no_proxy().build().unwrap()),
         settings,
         folder_name: "Kai".into(),
         folder_id: None,
@@ -457,7 +453,7 @@ async fn look_goes_to_lmgw_under_the_key_on_the_conversations_alias_with_the_scr
         "the alias from the Kai folder"
     );
     for s in &seen {
-        assert_eq!(s.auth, format!("Bearer {KEY}"), "Kai's device key");
+        assert_eq!(s.auth, "", "the device's certificate authenticates it");
     }
     let bodies: Vec<Value> = lmgw
         .completions()
@@ -701,8 +697,8 @@ async fn the_alias_setting_wins_and_a_missing_alias_names_the_setting() {
 async fn a_model_error_is_a_failed_answer_naming_lmgws_words() {
     let lmgw = Lmgw::start(folders(Some("kai-chat")), vec![]).await;
     // A refusal: a 503 with OpenAI's error shape, from a server that answers it.
-    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}", l.local_addr().unwrap());
+    let l = Gateway::bind().await;
+    let url = l.url.clone();
     let server = tokio::spawn(async move {
         while let Ok((mut c, _)) = l.accept().await {
             let mut buf = vec![0u8; 65536];
@@ -740,7 +736,7 @@ async fn a_model_error_is_a_failed_answer_naming_lmgws_words() {
 async fn a_delegate_is_listed_where_the_desktop_serves_what_it_needs() {
     let listed = |desk: &[&'static str], policy: PolicyConfig| {
         let r = rig(
-            "http://127.0.0.1:1",
+            "https://127.0.0.1:1",
             Desk::with(desk),
             DelegateConfig::default(),
             policy,
@@ -872,9 +868,8 @@ fn a_trace_log_carries_nothing_private() {
     ] {
         assert!(text.contains(want), "'{want}' missing: {text}");
     }
-    let secret = &KEY["lmgw-device-".len()..];
     for private in [
-        secret,
+        "PRIVATE KEY",
         QUESTION,
         "UTTERANCE-4711",
         "RESULT-31337",
@@ -902,7 +897,6 @@ pub(crate) fn full_entries() -> Vec<Entry> {
         policy: Arc::default(),
         confirmer: Arc::new(Asked::answering(false)),
         creds,
-        client: None,
         settings: DelegateConfig::default(),
         folder_name: "Kai".into(),
         folder_id: None,

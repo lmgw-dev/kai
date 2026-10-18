@@ -1,5 +1,7 @@
-//! The link to lmgw's `/mcp/host` (api §5.1 to §5.4): the WebSocket under the device key, its
-//! frames as rmcp's transport ([`LinkTransport`]), the reconnects and the closes.
+//! The link to lmgw's `/mcp/host` (api §5.1 to §5.4): the WebSocket over the device link (lmgw's
+//! device link design §6.2: its connector is the one TLS configuration every connection to lmgw
+//! comes from, the device's certificate authenticates it), its frames as rmcp's transport
+//! ([`LinkTransport`]), the reconnects and the closes.
 //!
 //! - **One JSON-RPC message per text message**, both ways, no batches. A message that does not
 //!   read as MCP's client side is answered with an error to its id (when it has one) and said in
@@ -28,7 +30,10 @@
 //!   path (the core, §3.3); 4000 (another link of this device took over) waits for the next
 //!   feed `hello`, so two Kais of one key do not take the link from each other in turns; 1001 (lmgw
 //!   stopping) and every other close reconnect after the backoff. A 401 at the handshake is a
-//!   revocation too.
+//!   revocation too. A TLS alert refusing the device's certificate never is (the security review's
+//!   B1): rustls takes one before the server proved anything, so it is said and tried again on the
+//!   backoff; a lapse is the feed's to find, by Kai's own date (`crate::lmgw_link::tls::Tls::
+//!   lapsed`).
 //! - **The calls end with the link:** every call in flight is cancelled when it drops.
 
 use std::sync::{Arc, RwLock};
@@ -42,7 +47,6 @@ use rmcp::service::{RoleServer, serve_server_with_ct};
 use rmcp::transport::Transport;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
-use tokio_tungstenite::Connector;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, WebSocketConfig};
@@ -264,22 +268,12 @@ fn request_id(text: &str) -> Option<RequestId> {
 enum Refused {
     /// 403 (`host_not_granted`; an `Origin` refusal cannot happen, Kai sends none).
     NotGranted(String),
-    /// 401: the key opens nothing (§3.3).
+    /// 403 `device_unconfirmed` (lmgw's device link §3.5): the owner has not confirmed this
+    /// device's code yet; the feed's `hello` says when it has.
+    Unconfirmed,
+    /// 401, or a credential beside the certificate (400): the pairing opens nothing (§3.3).
     Key(String, KeyLoss),
     Other(String),
-}
-
-/// The TLS a `wss:` gateway gets (the feed's: the system's trust store through the platform
-/// verifier).
-fn tls() -> Result<Arc<rustls::ClientConfig>, String> {
-    use rustls_platform_verifier::BuilderVerifierExt;
-    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-    let config = rustls::ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .and_then(|b| b.with_platform_verifier())
-        .map_err(|e| format!("cannot set up TLS for the tool link: {e}"))?
-        .with_no_client_auth();
-    Ok(Arc::new(config))
 }
 
 /// One link run (started by the core, aborted or stopped by it).
@@ -333,12 +327,23 @@ impl Run {
             }
             let wait = match self.connect().await {
                 Err(Refused::Key(reason, loss)) => {
-                    tracing::warn!(%reason, ?loss, "host: the device key opens nothing (401)");
+                    tracing::warn!(%reason, ?loss, "host: the pairing opens nothing");
                     let _ = self.events.send(HostEvent::Revoked {
                         reason,
                         loss: Some(loss),
                     });
                     return;
+                }
+                Err(Refused::Unconfirmed) => {
+                    tracing::info!("host: lmgw waits for the owner to confirm this device");
+                    self.status(HostStatus::Offline {
+                        note: format!(
+                            "waiting for you to confirm this device on lmgw's Devices card; Kai \
+                             links its tools once you did (or tries again in {} s)",
+                            retry_max.as_secs()
+                        ),
+                    });
+                    Wait::KickOr(retry_max)
                 }
                 Err(Refused::NotGranted(message)) => {
                     tracing::info!(%message, "host: this device has no hosting grant (403)");
@@ -464,15 +469,10 @@ impl Run {
             end: End::Stopped,
             linked: false,
         };
-        let req = requests::mcp_host().bearer(self.creds.key.expose());
+        let req = requests::mcp_host();
         let url = req
-            .ws_url(&self.creds.url)
+            .ws_url(&self.creds.url())
             .map_err(|e| Refused::Other(format!("{} ({})", e.message, e.code)))?;
-        let connector = if url.starts_with("wss://") {
-            Connector::Rustls(tls().map_err(Refused::Other)?)
-        } else {
-            Connector::Plain
-        };
         let mut request = url.as_str().into_client_request().map_err(|e| {
             Refused::Other(format!(
                 "the tool link's address '{url}' does not work: {e}"
@@ -487,12 +487,12 @@ impl Run {
             .max_message_size(None)
             .max_frame_size(None);
         let secs = self.settings.timeout.as_secs();
-        let connect = tokio_tungstenite::connect_async_tls_with_config(
-            request,
-            Some(config),
-            true,
-            Some(connector),
-        );
+        // The device link's WebSocket (`wss://` only); a refusal's body is read to its end, so its
+        // code decides, within the same `lmgw.timeout_s`.
+        let connect = self
+            .creds
+            .tls
+            .websocket(request, Some(config), true, self.settings.timeout);
         // A stop drops the handshake where it is: an old run's upgrade never completes after a
         // new run's (lmgw would close the new link with 4000).
         let handshake = tokio::select! {
@@ -510,15 +510,19 @@ impl Run {
                 let status = resp.status().as_u16();
                 let body = crate::lmgw_link::refusal_body(&resp);
                 let e = requests::read_refusal(status, &body);
-                // The status decides: the body may come after the head tungstenite read.
+                // The status and lmgw's code decide (the body was read to its end).
                 return Err(match status {
                     401 => Refused::Key(e.message, KeyLoss::of_code(&e.code)),
+                    400 if e.code == requests::code::CREDENTIAL_ON_DEVICE_LISTENER => {
+                        Refused::Key(e.message, KeyLoss::PairAgain)
+                    }
+                    403 if e.code == requests::code::DEVICE_UNCONFIRMED => Refused::Unconfirmed,
                     // Kai sends no Origin; should a proxy add one, lmgw says so.
                     403 if e.code == mcp_host::CROSS_ORIGIN_REFUSED => Refused::Other(format!(
                         "lmgw refused the tool link for an Origin header Kai did not send: {}",
                         e.message
                     )),
-                    // `host_not_granted`, or a 403 whose body came after the head.
+                    // `host_not_granted`, or a 403 without lmgw's code.
                     403 => {
                         if e.code != mcp_host::HOST_NOT_GRANTED {
                             tracing::info!(code = %e.code, "host: a 403 without lmgw's code; read as no grant");
@@ -531,12 +535,9 @@ impl Run {
                     )),
                 });
             }
-            Ok(Err(e)) => {
-                return Err(Refused::Other(format!(
-                    "lmgw is not reachable: {}",
-                    describe(&e)
-                )));
-            }
+            // A refused handshake, an alert about the device's certificate included, is said and
+            // tried again (B1, the module doc).
+            Ok(Err(e)) => return Err(Refused::Other(crate::lmgw_link::tls::unreachable(&e))),
             Ok(Ok((ws, _))) => ws,
         };
         let (in_tx, in_rx) = mpsc::unbounded_channel();

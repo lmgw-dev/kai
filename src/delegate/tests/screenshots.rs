@@ -69,7 +69,7 @@ fn the_view_drops_only_the_image_tools_and_follows_the_setting() {
 async fn the_hosts_list_follows_who_looks_at_screenshots() {
     let desk = Desk::with(LOOK_TOOLS);
     let delegates = rig(
-        "http://127.0.0.1:1",
+        "https://127.0.0.1:1",
         desk.clone(),
         DelegateConfig::default(),
         PolicyConfig::default(),

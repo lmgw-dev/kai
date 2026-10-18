@@ -1,13 +1,13 @@
-//! The realtime adapter against a scripted gateway on loopback: a WebSocket server
-//! (tokio-tungstenite's own accept) for the bound session, raw HTTP for `current`, the folders and
-//! the handshake's refusals.
+//! The realtime adapter against a scripted gateway behind the tests' device listener on loopback
+//! (`crate::lmgw_link::test_pki`): a WebSocket server (tokio-tungstenite's own accept) for the bound
+//! session, raw HTTP for `current`, the folders and the handshake's refusals.
 
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
@@ -16,8 +16,7 @@ use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
 use super::*;
-use crate::pairing::DeviceKey;
-use crate::pairing::tests::KEY;
+use crate::lmgw_link::test_pki::{self, Gateway};
 use crate::voice::link::{CHAT_THREAD_BOUND, ErrorFacts, ServerEvent, TurnDetection};
 
 const WAIT: Duration = Duration::from_secs(10);
@@ -34,20 +33,17 @@ fn link(url: &str) -> RealtimeLink {
 }
 
 fn link_with(url: &str, settings: RealtimeSettings) -> RealtimeLink {
-    let mut l = RealtimeLink::new(
-        settings,
-        reqwest::Client::builder().no_proxy().build().unwrap(),
-    );
-    l.set_credentials(Some(Credentials {
-        url: url.to_owned(),
-        key: DeviceKey::parse(KEY).unwrap(),
-    }));
+    let mut l = RealtimeLink::new(settings);
+    l.set_credentials(Some(test_pki::creds(url)));
     l
 }
 
-async fn listener() -> (TcpListener, String) {
-    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}", l.local_addr().unwrap());
+/// The gateway's TLS stream (the device listener's).
+type Stream = tokio_rustls::server::TlsStream<TcpStream>;
+
+async fn listener() -> (Gateway, String) {
+    let l = Gateway::bind().await;
+    let url = l.url.clone();
     (l, url)
 }
 
@@ -58,12 +54,13 @@ async fn next(events: &mut mpsc::UnboundedReceiver<SessionEvent>) -> SessionEven
         .expect("the session's task runs")
 }
 
-/// What the handshake carried: the path with its query, and the bearer.
+/// What the handshake carried: the path with its query, and an Authorization header (none: the
+/// device's certificate authenticates it).
 type Seen = (String, Option<String>);
 
 /// Accepts one WebSocket and reports the handshake's path and Authorization header.
 #[allow(clippy::result_large_err)] // tungstenite's callback type
-async fn accept_ws(l: &TcpListener) -> (WebSocketStream<TcpStream>, Seen) {
+async fn accept_ws(l: &Gateway) -> (WebSocketStream<Stream>, Seen) {
     let (s, _) = tokio::time::timeout(WAIT, l.accept())
         .await
         .expect("a connection")
@@ -82,7 +79,7 @@ async fn accept_ws(l: &TcpListener) -> (WebSocketStream<TcpStream>, Seen) {
     (ws, rx.await.unwrap())
 }
 
-async fn text(ws: &mut WebSocketStream<TcpStream>) -> Value {
+async fn text(ws: &mut WebSocketStream<Stream>) -> Value {
     loop {
         match tokio::time::timeout(WAIT, ws.next())
             .await
@@ -98,7 +95,7 @@ async fn text(ws: &mut WebSocketStream<TcpStream>) -> Value {
 }
 
 /// Reads one HTTP request (head and body) from `s`.
-async fn read_request(s: &mut TcpStream) -> (String, String) {
+async fn read_request(s: &mut Stream) -> (String, String) {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
@@ -126,7 +123,7 @@ async fn read_request(s: &mut TcpStream) -> (String, String) {
     }
 }
 
-async fn answer(s: &mut TcpStream, status: &str, body: &str) {
+async fn answer(s: &mut Stream, status: &str, body: &str) {
     let r = format!(
         "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
          connection: close\r\n\r\n{body}",
@@ -149,7 +146,7 @@ async fn a_session_moves_text_frames_both_ways_and_ends_with_the_servers_close()
     socket.send(ClientEvent::append_pcm16(&[1, 2, 3]));
     let (mut ws, (path, auth)) = accept_ws(&l).await;
     assert_eq!(path, "/v1/realtime?chat_thread=812");
-    assert_eq!(auth.as_deref(), Some(format!("Bearer {KEY}").as_str()));
+    assert_eq!(auth, None, "the device's certificate authenticates it");
     assert_eq!(next(&mut events).await, SessionEvent::Opened);
     let first = text(&mut ws).await;
     assert_eq!(first["type"], "session.update");
@@ -375,35 +372,41 @@ async fn a_chunked_refusal_before_the_101_reads_its_code() {
     );
 }
 
-/// Review KAI-4 K4-5: tungstenite hands over only the body bytes that came with the head, so a
-/// body written after it is lost. The refusal then carries no code (never a guessed one), and the
-/// voice decides by the status, which always came.
+/// Review KAI-4 K4-5: tungstenite hands over only the body bytes that came with the head; the
+/// device link's WebSocket reads the rest (`tls::ws`), so a body written after the head still
+/// carries lmgw's code. A body that never comes carries none (never a guessed one), and the voice
+/// decides by the status, which always came.
 #[tokio::test]
-async fn a_refusal_whose_body_comes_after_the_head_carries_no_code() {
-    let (l, url) = listener().await;
-    let mut link = link(&url);
-    let (tx, mut events) = mpsc::unbounded_channel();
-    let _socket = link.open(3, false, tx);
-    let (mut s, _) = l.accept().await.unwrap();
-    read_request(&mut s).await;
+async fn a_refusal_whose_body_comes_after_the_head_is_read_by_its_code() {
     let body = json!({"error": {"code": "device_disabled", "message": "device 'kai' is disabled",
         "param": null, "type": "invalid_request_error"}})
     .to_string();
     let head = "HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\n\
          transfer-encoding: chunked\r\nconnection: close\r\n\r\n";
-    s.write_all(head.as_bytes()).await.unwrap();
-    s.flush().await.unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    let _ = s
-        .write_all(format!("{:x}\r\n{body}\r\n0\r\n\r\n", body.len()).as_bytes())
-        .await;
-    match next(&mut events).await {
-        SessionEvent::Refused {
-            status: 401,
-            code: None,
-            ..
-        } => {}
-        other => panic!("a 401 without its code: {other:?}"),
+    for late_body in [true, false] {
+        let (l, url) = listener().await;
+        let mut link = link(&url);
+        let (tx, mut events) = mpsc::unbounded_channel();
+        let _socket = link.open(3, false, tx);
+        let (mut s, _) = l.accept().await.unwrap();
+        read_request(&mut s).await;
+        s.write_all(head.as_bytes()).await.unwrap();
+        s.flush().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if late_body {
+            let _ = s
+                .write_all(format!("{:x}\r\n{body}\r\n0\r\n\r\n", body.len()).as_bytes())
+                .await;
+        } else {
+            let _ = s.shutdown().await;
+        }
+        let want = late_body.then(|| "device_disabled".to_owned());
+        match next(&mut events).await {
+            SessionEvent::Refused {
+                status: 401, code, ..
+            } if code == want => {}
+            other => panic!("not a 401 with {want:?}: {other:?}"),
+        }
     }
 }
 
@@ -488,7 +491,10 @@ async fn current_posts_to_the_folder_and_reads_the_thread() {
     );
     let (head, body) = server.await.unwrap();
     assert!(head.starts_with("POST /chat/api/folders/3/current HTTP/1.1"));
-    assert!(head.contains(&format!("Bearer {KEY}")));
+    assert!(
+        !head.to_ascii_lowercase().contains("authorization"),
+        "{head}"
+    );
     assert_eq!(body, r#"{"new":true}"#);
 }
 
@@ -652,7 +658,7 @@ async fn the_folders_are_listed_and_a_new_one_carries_only_its_name() {
     let seen = server.await.unwrap();
     let (get, _) = seen.iter().find(|(h, _)| h.starts_with("GET ")).unwrap();
     assert!(get.starts_with("GET /chat/api/folders HTTP/1.1"), "{get}");
-    assert!(get.contains(&format!("Bearer {KEY}")));
+    assert!(!get.to_ascii_lowercase().contains("authorization"), "{get}");
     let (post, body) = seen.iter().find(|(h, _)| h.starts_with("POST ")).unwrap();
     assert!(
         post.starts_with("POST /chat/api/folders HTTP/1.1"),

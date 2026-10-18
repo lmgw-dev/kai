@@ -2,13 +2,16 @@
 //! approval shows as a card over the desktop, and the owner answers by click, by Enter and Esc, or,
 //! for a call of Kai's own conversation, by voice.
 //!
-//! **Where calls come from.** The feed's `approval.requested` (every thread the device sees) and
-//! the bound session's `mcp_approval_request` items, one call by its `approval_request_id` however
-//! many ways it came. The feed's `approval.decided`, the session's `lmgw.approval.decided`, a
-//! thread deleted, and the gateway left (a re-pair, a revocation) take calls away. Calls that
-//! waited before Kai's feed started are not shown (the feed starts with no cursor). A feed
-//! `resync` reads the waiting calls of every thread Kai knows calls of, and of Kai's own
-//! conversation, again (`GET /chat/api/threads/{id}`'s `pending_approvals`) and rebuilds them.
+//! **Where calls come from.** The feed's open set (device link §7.3: every thread the device sees)
+//! and the bound session's `mcp_approval_request` items, one call by its `approval_request_id`
+//! however many ways it came. At every connection the feed hands over the whole set of calls that
+//! wait ([`Approvals::open_set`], at `caught_up`, calls that waited before Kai started included),
+//! and Kai reconciles against it; after it each call added comes as it is asked, and each one that
+//! waits no more (decided, its reply or thread gone, out of the device's reach) is withdrawn
+//! ([`Approvals::withdrawn`]). The session's `lmgw.approval.decided`, a thread deleted, and the
+//! gateway left (a re-pair, a revocation) take calls away too. A feed `resync` reads the waiting
+//! calls of every thread Kai knows calls of, and of Kai's own conversation, again (`GET
+//! /chat/api/threads/{id}`'s `pending_approvals`) and rebuilds them.
 //!
 //! **The card** ([`card`], [`overlay`]) shows one call at a time, the oldest first: the tool as
 //! the thread names it (`<label>__<name>`), who asked (the starter of the thread's last turn, from
@@ -22,7 +25,7 @@
 //! **Where the verdicts go.** Through the bound session when it is bound to the thread and showed
 //! every one of its calls: an `mcp_approval_response` each, then `response.create`, so the resumed
 //! reply is spoken in the session (§11.1, K17). Otherwise through `POST
-//! /chat/api/threads/{id}/approvals` with Kai's device key, whose resumed turn streams to Kai's
+//! /chat/api/threads/{id}/approvals` as Kai's device, whose resumed turn streams to Kai's
 //! request and is read to its end (a request that stopped reading would stop the turn). Kai
 //! approves as its own device: lmgw refuses an approval beyond the device's reach (403
 //! `approval_out_of_scope`) and the card says so; declining stays open. Sent verdicts keep their
@@ -266,6 +269,12 @@ pub struct Approvals {
     shown: Option<CardModel>,
     /// Desktop notifications to send: (summary, body).
     notices: Vec<(String, String)>,
+    /// Calls lmgw said were decided (the live session's `lmgw.approval.decided`, the route's
+    /// answer) whose withdrawal the feed has not delivered yet: a stale open set or `Added`, read
+    /// at a head before the decision, does not bring them back for a moment. Kept until the feed
+    /// withdraws them, or until the next open set (its `caught_up`), whose events after it are in
+    /// order.
+    decided_here: HashSet<String>,
     /// Numbers the `response.create`s that carry verdicts (their `event_id`).
     creates: u64,
     /// The screen is locked (`crate::screen_lock`): the card is hidden, its calls stay waiting, no
@@ -297,6 +306,7 @@ impl Approvals {
             sink,
             shown: None,
             notices: Vec::new(),
+            decided_here: HashSet::new(),
             creates: 0,
             locked: false,
         }
@@ -457,9 +467,72 @@ impl Approvals {
 
     // ------------------------------------------------------------- facts
 
-    /// A call waits: the feed's `approval.requested` (`in_session` `None`) or session `no`'s
-    /// `mcp_approval_request` (`Some(no)`).
+    /// A call waits: the feed's open set gained it (`in_session` `None`) or session `no`'s
+    /// `mcp_approval_request` showed it (`Some(no)`).
     pub fn requested(&mut self, thread_id: i64, req: ApprovalRequest, in_session: Option<u64>) {
+        if in_session.is_none() && self.decided_here.contains(&req.approval_request_id) {
+            tracing::debug!(call = %req.approval_request_id, "approvals: the feed's call was decided already; not shown again");
+            return;
+        }
+        self.add(thread_id, req, in_session);
+        self.sync();
+    }
+
+    /// The feed's open set at `caught_up` (device link §7.3), at every connection of the feed:
+    /// every call that waits now in the threads the device sees. A call Kai does not show yet is
+    /// shown; one it shows that the set lacks was decided, or its reply or thread went, while the
+    /// feed was down, and goes. A call the live session showed stays: the session says its decision
+    /// itself, and it may have shown it after the head the set was read at.
+    pub fn open_set(&mut self, set: Vec<Requested>) {
+        // Calls lmgw said were decided, which a set read before the decision still holds.
+        let decided = std::mem::take(&mut self.decided_here);
+        let set: Vec<Requested> = set
+            .into_iter()
+            .filter(|r| !decided.contains(&r.request.approval_request_id))
+            .collect();
+        let gone: Vec<String> = self
+            .calls
+            .iter()
+            .filter(|c| {
+                !set.iter().any(|r| r.request.approval_request_id == c.id)
+                    && (c.in_session.is_none() || c.in_session != self.live)
+            })
+            .map(|c| c.id.clone())
+            .collect();
+        tracing::info!(
+            open = set.len(),
+            gone = gone.len(),
+            "approvals: the feed's open set"
+        );
+        for r in set {
+            self.add(r.thread_id, r.request, None);
+        }
+        self.remove(&gone, "it waits no more (the feed's open set)");
+        self.sync();
+    }
+
+    /// The feed's withdrawal: calls that wait no more (decided, their reply or thread gone, out of
+    /// the device's reach now). They go, also when their verdict was Kai's own on its way.
+    pub fn withdrawn(&mut self, ids: &[String]) {
+        for id in ids {
+            self.decided_here.remove(id);
+        }
+        self.remove(ids, "the feed withdrew it");
+        self.sync();
+    }
+
+    fn remove(&mut self, ids: &[String], why: &str) {
+        for id in ids {
+            let before = self.calls.len();
+            self.calls.retain(|c| c.id != *id);
+            if self.calls.len() < before {
+                tracing::info!(call = %id, why, "approvals: the call goes");
+                self.forget_call(id);
+            }
+        }
+    }
+
+    fn add(&mut self, thread_id: i64, req: ApprovalRequest, in_session: Option<u64>) {
         match self
             .calls
             .iter_mut()
@@ -494,7 +567,6 @@ impl Approvals {
                 });
             }
         }
-        self.sync();
     }
 
     /// The bound session's `lmgw.chat.frame` relaying a turn's `approval` frame carries the call's
@@ -520,9 +592,10 @@ impl Approvals {
             .and_then(|c| c.call_id.as_deref())
     }
 
-    /// A call was decided (the feed's `approval.decided`, the session's `lmgw.approval.decided`):
-    /// it goes, also when its verdict was Kai's own on its way.
+    /// A call was decided (the session's `lmgw.approval.decided`): it goes, also when its verdict
+    /// was Kai's own on its way.
     pub fn decided(&mut self, id: &str, approve: bool, by: Option<&str>) {
+        self.decided_here.insert(id.to_owned());
         let before = self.calls.len();
         self.calls.retain(|c| c.id != id);
         if self.calls.len() < before {
@@ -588,6 +661,7 @@ impl Approvals {
             );
         }
         self.calls.clear();
+        self.decided_here.clear();
         self.sending.clear();
         self.rereading.clear();
         self.ops = FuturesUnordered::new();
@@ -873,6 +947,7 @@ impl Approvals {
         match r {
             Ok(()) => {
                 tracing::info!(thread = thread_id, "approvals: lmgw took the verdicts");
+                self.decided_here.extend(ids.iter().cloned());
                 self.calls.retain(|c| !ids.contains(&c.id));
                 for id in ids {
                     self.forget_call(id);

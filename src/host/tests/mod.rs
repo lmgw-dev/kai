@@ -18,7 +18,7 @@ use futures_util::{SinkExt, StreamExt};
 use kai_desktop::contract::{Kind, Level, Param, ToolSpec};
 use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
@@ -32,8 +32,10 @@ use super::registry::{Changes, Deps, Entry, Provider, Reply, SessionBus};
 use super::settings::PolicyConfig;
 use super::{HostEvent, HostLink, HostStatus, ToolHost};
 use crate::lmgw_link::Credentials;
-use crate::pairing::DeviceKey;
-use crate::pairing::tests::KEY;
+use crate::lmgw_link::test_pki::{Gateway, creds};
+
+/// lmgw's TLS stream (the device listener's).
+type Stream = tokio_rustls::server::TlsStream<TcpStream>;
 
 pub const WAIT: Duration = Duration::from_secs(10);
 
@@ -204,20 +206,20 @@ impl Confirmer for Asks {
     }
 }
 
-/// lmgw's side: a listener for `/mcp/host`.
+/// lmgw's side: a listener for `/mcp/host`, behind the tests' device listener.
 pub struct FakeHost {
-    listener: TcpListener,
+    listener: Gateway,
     pub url: String,
 }
 
 impl FakeHost {
     pub async fn new() -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
+        let listener = Gateway::bind().await;
+        let url = listener.url.clone();
         Self { listener, url }
     }
 
-    async fn tcp(&self, within: Duration) -> Option<TcpStream> {
+    async fn tcp(&self, within: Duration) -> Option<Stream> {
         tokio::time::timeout(within, self.listener.accept())
             .await
             .ok()
@@ -241,12 +243,12 @@ impl FakeHost {
     }
 
     /// The upgrade on a connection already accepted.
-    async fn upgrade(stream: TcpStream) -> Conn {
+    async fn upgrade(stream: Stream) -> Conn {
         Self::upgrade_with(stream, None).await
     }
 
     #[allow(clippy::result_large_err)]
-    async fn upgrade_with(stream: TcpStream, config: Option<WebSocketConfig>) -> Conn {
+    async fn upgrade_with(stream: Stream, config: Option<WebSocketConfig>) -> Conn {
         let seen = Arc::new(Mutex::new((String::new(), HeaderMap::new())));
         let keep = seen.clone();
         let ws = tokio_tungstenite::accept_hdr_async_with_config(
@@ -275,6 +277,11 @@ impl FakeHost {
 
     /// Answers the next upgrade with an HTTP refusal instead.
     pub async fn refuse(&self, status: u16, body: Value) {
+        self.refuse_after(status, body, None).await
+    }
+
+    /// [`Self::refuse`], the body sent `later` after the head (its own TLS record).
+    pub async fn refuse_after(&self, status: u16, body: Value, later: Option<Duration>) {
         let mut stream = self.tcp(WAIT).await.expect("Kai linked");
         read_head(&mut stream).await;
         let body = body.to_string();
@@ -283,17 +290,22 @@ impl FakeHost {
             403 => "Forbidden",
             _ => "Refused",
         };
-        let resp = format!(
-            "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+        let head = format!(
+            "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
             body.len()
         );
-        stream.write_all(resp.as_bytes()).await.unwrap();
+        stream.write_all(head.as_bytes()).await.unwrap();
+        if let Some(d) = later {
+            stream.flush().await.unwrap();
+            tokio::time::sleep(d).await;
+        }
+        stream.write_all(body.as_bytes()).await.unwrap();
         stream.flush().await.unwrap();
     }
 }
 
 /// Reads an upgrade request's head off a raw connection (lmgw has not answered it).
-async fn read_head(stream: &mut TcpStream) {
+async fn read_head(stream: &mut Stream) {
     use tokio::io::AsyncReadExt;
     let mut buf = [0u8; 4096];
     let mut head = Vec::new();
@@ -306,7 +318,7 @@ async fn read_head(stream: &mut TcpStream) {
 
 /// One link, lmgw's end.
 pub struct Conn {
-    ws: WebSocketStream<TcpStream>,
+    ws: WebSocketStream<Stream>,
     pub path: String,
     pub headers: HeaderMap,
     next_id: i64,
@@ -556,13 +568,7 @@ pub async fn rig_with_providers(
         crate::jobs::Jobs::default(),
     );
     let (tx, events) = mpsc::unbounded_channel();
-    host.start(
-        Credentials {
-            url: fake.url.clone(),
-            key: DeviceKey::parse(KEY).unwrap(),
-        },
-        tx,
-    );
+    host.start(crate::lmgw_link::test_pki::creds(&fake.url), tx);
     Rig {
         host,
         creds,

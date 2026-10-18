@@ -1,6 +1,6 @@
 //! The configuration window's Personality page on the core (WP21b): the facts about Kai's
 //! conversation it shows in its header, and its profile-editor requests, sent to the paired lmgw
-//! through the voice's link with the device key (`crate::lmgw_link::proxy`). The request runs in a
+//! through the voice's link (`crate::lmgw_link::proxy`). The request runs in a
 //! spawned task, so the core's loop is never held by it.
 
 use tokio::sync::oneshot;
@@ -35,6 +35,9 @@ impl<S: SecretStore, L: LmgwLink, A: AudioPort, V: VoiceLink> Core<S, L, A, V> {
                     .to_owned(),
             ),
             Pairing::NotPaired => Some(NOT_PAIRED.to_owned()),
+            Pairing::PairAgain { why } => Some(format!(
+                "Kai cannot reach lmgw: {why} (the tray's \"Pair with lmgw…\")"
+            )),
         }
     }
 
@@ -48,7 +51,7 @@ impl<S: SecretStore, L: LmgwLink, A: AudioPort, V: VoiceLink> Core<S, L, A, V> {
         Conversation {
             paired: why.is_none(),
             why,
-            gateway: self.config.lmgw.url.clone(),
+            gateway: self.current_url(),
             folder: folder.map(|f| f.name.clone()),
             thread_id: thread,
             model: folder.and_then(|f| f.model.clone()),

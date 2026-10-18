@@ -27,8 +27,9 @@
 //!   start routines" reads the caller: a script can run `systemd-run --user kai tool <routine>` and
 //!   be `cli`.
 //! - **`kai model <alias>`** sends the prompt (stdin) as one user message to lmgw's
-//!   `/v1/chat/completions` under Kai's device key and prints the answer: the key never enters the
-//!   script. lmgw's scope for the key applies; Kai's tool policy does not (it is not a tool).
+//!   `/v1/chat/completions` as Kai's device (over the device link) and prints the answer: no
+//!   credential enters the script. lmgw's scope for the device applies; Kai's tool policy does not
+//!   (it is not a tool).
 //!
 //! Exit codes: 0 done, 1 the tool or the model failed (the reason on stderr), 2 a usage error, 3 no
 //! Kai answers on the socket.

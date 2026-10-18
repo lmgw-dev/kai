@@ -25,7 +25,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use serde_json::json;
+use lmgw_client::realtime::VoiceTiming;
+use lmgw_client::types::chat_threads::{ServedModel, VoiceModels};
 use tokio::sync::mpsc::UnboundedSender;
 
 use super::link::{
@@ -317,6 +318,7 @@ fn facts(st: &MockState, detection: Option<Option<TurnDetection>>) -> SessionFac
         }),
         chat: Some("mock/chat".into()),
         asr: Some("mock/asr".into()),
+        turn_mode: None,
         tts: Some("mock/tts".into()),
         voice: Some("mock-voice".into()),
     }
@@ -489,18 +491,33 @@ impl MockLink {
                 reason: None,
             });
             sock.stored.push((rid.clone(), Some(text.clone())));
-            sock.emit(ServerEvent::ChatReply(ChatReply {
+            sock.emit(ServerEvent::ChatReply(Box::new(ChatReply {
                 message_id: 900,
                 content: Some(text),
                 ..ChatReply::default()
-            }));
-            sock.emit(ServerEvent::Timing(json!({
-                "response_id": rid, "message_id": 900, "end_of_turn_ms": 400, "asr_ms": 30,
-                "first_token_ms": 200, "first_clause_ms": 100, "first_audio_ms": 40,
-                "total_ms": total, "to_first_audio_ms": 800, "cold": [],
-                "models": {"asr": {"alias": "mock/asr", "answered_by": null},
-                           "chat": {"alias": "mock/chat", "answered_by": null},
-                           "tts": {"alias": "mock/tts", "answered_by": null}}
+            })));
+            let served = |alias: &str| {
+                Some(ServedModel {
+                    alias: alias.into(),
+                    ..ServedModel::default()
+                })
+            };
+            sock.emit(ServerEvent::Timing(Box::new(VoiceTiming {
+                response_id: Some(rid.clone()),
+                message_id: Some(900),
+                end_of_turn_ms: Some(400),
+                asr_ms: Some(30),
+                first_token_ms: Some(200),
+                first_clause_ms: Some(100),
+                first_audio_ms: Some(40),
+                total_ms: Some(total),
+                to_first_audio_ms: Some(800),
+                models: VoiceModels {
+                    asr: served("mock/asr"),
+                    chat: served("mock/chat"),
+                    tts: served("mock/tts"),
+                },
+                ..VoiceTiming::default()
             })));
         });
     }
@@ -578,7 +595,7 @@ impl MockLink {
 
 impl VoiceLink for MockLink {
     fn set_credentials(&mut self, creds: Option<Credentials>) {
-        self.with(|s| s.creds = creds.map(|c| c.url));
+        self.with(|s| s.creds = creds.map(|c| c.url()));
     }
 
     fn current(&mut self, folder: i64, new: bool) -> Pending<Result<Current, Refusal>> {
@@ -867,16 +884,7 @@ impl VoiceSocket for Socket {
             let reply = s.reply.clone();
             let keep = s.keep_audio;
             let f_update = |s: &MockState, d| facts(s, Some(d));
-            let kind = match &event {
-                ClientEvent::SessionUpdate { .. } => "session.update",
-                ClientEvent::Append { .. } => "input_audio_buffer.append",
-                ClientEvent::Commit => "input_audio_buffer.commit",
-                ClientEvent::Clear => "input_audio_buffer.clear",
-                ClientEvent::ResponseCreate => "response.create",
-                ClientEvent::ResponseCancel { .. } => "response.cancel",
-                ClientEvent::Truncate { .. } => "conversation.item.truncate",
-                ClientEvent::ApprovalResponse { .. } => "conversation.item.create",
-            };
+            let kind = event.kind();
             let facts_now = match &event {
                 ClientEvent::SessionUpdate { turn_detection, .. } => {
                     Some(f_update(&s, *turn_detection))
@@ -968,13 +976,13 @@ impl VoiceSocket for Socket {
                             let stored = (!heard.is_empty()).then_some(heard.clone());
                             sock.stored.retain(|(id, _)| *id != r.response_id);
                             sock.stored.push((r.response_id.clone(), stored.clone()));
-                            sock.emit(ServerEvent::ChatReply(ChatReply {
+                            sock.emit(ServerEvent::ChatReply(Box::new(ChatReply {
                                 message_id: 900,
                                 content: stored,
                                 unheard: Some(r.text[heard.len()..].trim().to_owned()),
                                 removed: heard.is_empty(),
                                 ..ChatReply::default()
-                            }));
+                            })));
                         }
                         _ => {
                             sock.refused_truncates += 1;
@@ -986,7 +994,9 @@ impl VoiceSocket for Socket {
                         }
                     }
                 }
-                ClientEvent::ApprovalResponse { .. } => sock.sent.push(event.clone()),
+                // The approval's answer, and a call's events (Kai binds over the WebSocket, so it
+                // sends none of those): recorded, unanswered.
+                _ => sock.sent.push(event.clone()),
             }
             respond
         };

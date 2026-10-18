@@ -21,15 +21,16 @@ The main modules in `src/`:
 
 | Module | What it is |
 | --- | --- |
-| `lmgw_link.rs`, `lmgw_link/` | The link to lmgw (§3): pairing, the Chat feed (`feed.rs`, on `lmgw-client`'s `FeedReader`), the voice's realtime adapter (`realtime.rs`) |
+| `lmgw_link.rs`, `lmgw_link/` | The link to lmgw (§3): the device link's TLS (`tls.rs`: the one client configuration every connection comes from, the URLs and their order), the Chat feed (`feed.rs`, on `lmgw-client`'s `FeedReader`), the voice's realtime adapter (`realtime.rs`) |
+| `pairing.rs`, `pairing/` | Pairing over lmgw's device link (§3.1): the `lmgw-pair:` link v2 (`lmgw-client`'s), the device's P-256 key (`key.rs`), the enrolment, and what a pairing keeps: the key in the Secret Service (`secret.rs`), the rest in `$XDG_CONFIG_HOME/kai/device-link.json` |
 | `voice/` | The voice session (§5). It reaches lmgw only through the `VoiceLink` seam in `voice/link.rs`; `voice/mock.rs` is the scripted lmgw the tests use |
 | `audio/` | PipeWire capture and playback, the echo modes, the level taps (§6) |
-| `conversation.rs` | The Kai conversation's folder (§4): looked up by `conversation.folder_name`, created when missing, the steps it needs, recovery when it changes. **Open in lmgw** opens `<lmgw.url>/chat?t=<thread>` with `xdg-open` |
+| `conversation.rs` | The Kai conversation's folder (§4): looked up by `conversation.folder_name`, created when missing, the steps it needs, recovery when it changes. **Open in lmgw** opens `<lmgw's dashboard>/chat?t=<thread>` with `xdg-open`, the address lmgw's feed sends in its `hello` |
 | `shortcuts.rs` | Global shortcuts through the XDG GlobalShortcuts portal (§8) |
 | `tray/` | The tray item, its icons and menu (§7) |
 | `overlay/` | The ring overlay (§9): a layer-shell window with its own WebKit view. Its page is `assets/overlay/`, whose `viz/` holds lmgw's `engine.js` and `ring.js`, vendored byte-identical at the commit in `viz/PIN` |
 | `widgets/` | Tool-controlled overlays and the MCP Apps host (§10): text, HTML, image, emote, weather, `overlay_app` |
-| `host/` | The MCP server Kai serves to lmgw's `/mcp/host` over its device key (§10.1, §11.1): the registry of providers (`registry.rs`), the policy (`policy.rs`), the confirmation dialog (`confirm.rs`), MCP tasks (`tasks.rs`). lmgw lists the tools as `<label>__<tool>` under the device's hosting grant |
+| `host/` | The MCP server Kai serves to lmgw's `/mcp/host` over the device link (§10.1, §11.1): the registry of providers (`registry.rs`), the policy (`policy.rs`), the confirmation dialog (`confirm.rs`), MCP tasks (`tasks.rs`). lmgw lists the tools as `<label>__<tool>` under the device's hosting grant |
 | `desktop/` | The desktop providers behind the tools: KWin, portals, accessibility, search |
 | `approvals/` | The approval card (§11.1): a layer-shell surface with keyboard on demand, its page in `assets/approvals/`, the spoken answer (`words.rs`) |
 | `jobs/` | Asynchronous jobs: a long tool call runs as an MCP task and its result is spoken at a quiet moment or notified |
@@ -101,39 +102,61 @@ from a private PipeWire); the others show nothing on your screen. The `owner-che
 the manual counterparts on real devices and real key presses, and ask before each step.
 
 `just live-check-link` uses the `live-test` cargo feature (debug builds only): `KAI_LIVE_LINK=1`
-confirms pairing links without the dialog.
+confirms pairing links without the dialog. Kai pairs over lmgw's device link (enrolment and mutual
+TLS), so every check that pairs does what an owner does on the dev lmgw's `/api` with its owner
+bearer: the device listener on (`settings_set {"devices": {"listener": true}}`, 127.0.0.1:8898
+beside the dev lmgw's 8897), `key_create` with `local_only` for the v2 link, Kai's enrolment of its
+own key, then `device_confirm {id, confirm_code}` with the code Kai shows. The scripts share
+`scripts/live-device-link.sh` for it: `live-check-link` and `live-check-host` hand the link to the
+live-test Kai and read the code from its tooltip; `live-check-window` and `live-check-widgets`
+enrol with the test binary's ignored `pairing::tests::live_enrol` and hand the pairing to their
+live test; the Rust live tests pair with `voice::lmgw_live_tests::device`.
+`scripts/live-check-pairing.sh` needs no lmgw: it hands over a v2 link that is never confirmed.
+
+Unit tests never reach lmgw: `lmgw_link::test_pki` is a mock device listener (TLS 1.3 with a
+device CA, server leaves and device certificates rcgen makes), and every test server of Kai's
+lmgw-facing code runs behind it.
 
 ## The lmgw pin
 
 `LMGW_PIN` holds three lines naming the same lmgw source:
 
-- `lmgw_commit`, the commit in lmgw's development history;
+- `lmgw_commit`, the commit in lmgw's development history, which GitLab's CI clones;
+- `lmgw_tree`, its tree. The public repository gets one squashed commit per release, with other
+  hashes but the same tree, so the tree is what identifies the source;
 - `lmgw_tag`, the published lmgw release ([github.com/lmgw-dev/lmgw](https://github.com/lmgw-dev/lmgw))
-  that GitHub's CI clones;
-- `lmgw_tree`, the tree of both. The public repository gets one squashed commit per release, with
-  other hashes but the same tree, so the tree is what identifies the source.
+  with that tree, which GitHub's CI clones, or `unpublished` while no release has it yet.
 
-`scripts/lmgw-pin.sh verify-tree <checkout>` fails unless a checkout holds that tree (GitHub's CI
-runs it on its clone). `just check` and the live checks build with whatever `../lmgw` holds and
-warn, never fail, when it is not at the pinned commit or tree, has changes, or when
-`lmgw_commit`'s tree is not `lmgw_tree`. `just rpm` always stages the four crates and lmgw's
-workspace root from the pinned tree (`git archive`), so the RPM is the same whatever the checkout
-has checked out; that checkout must hold the tree wherever the RPM is built.
+So Kai follows lmgw's development without waiting for its releases: GitLab's builds take the commit
+and never depend on the tag. Only publishing Kai to GitHub needs a published one: `scripts/release.sh`
+and `scripts/publish-github.sh` refuse a pin whose tag is `unpublished` or names a release with
+another tree (`scripts/lmgw-pin.sh verify-published`, which fetches that tag alone into
+`target/lmgw-public.git`; `scripts/publish-github.sh` checks the pin committed in the tree it
+publishes).
 
-**Bumping it** (all three lines together):
+`scripts/lmgw-pin.sh verify-tree <checkout>` fails unless a checkout holds the pinned tree (GitHub's
+CI runs it on its clone). `just check` and the live checks build with whatever `../lmgw` holds and
+warn, never fail, when it is not at the pinned commit or tree, has changes, when `lmgw_commit`'s
+tree is not `lmgw_tree`, or when the checkout's own tag `lmgw_tag` has another tree. `just rpm`
+always stages the four crates and lmgw's workspace root from the pinned tree (`git archive`), so
+the RPM is the same whatever the checkout has checked out; that checkout must hold the tree
+wherever the RPM is built.
+
+**Bumping it to a new lmgw commit** (any commit of lmgw's `main`; GitLab's next build takes it):
 
 1. Check out the new lmgw commit in `../lmgw` and build its headless example.
 2. Run `just check` and the live checks that touch lmgw: `live-check-link`, `live-check-host`,
    `live-check-voice-lmgw`, `live-check-conversation`. Each runs on a private bus or PipeWire, so a
    running Kai may stay up.
 3. Write `lmgw_commit` (`git -C ../lmgw rev-parse HEAD`) and `lmgw_tree`
-   (`git -C ../lmgw rev-parse 'HEAD^{tree}'`).
-4. `lmgw_tag` must be a published lmgw release with that very tree. Check it with
-   `git clone --depth 1 --branch <tag> https://github.com/lmgw-dev/lmgw target/lmgw-public` and
-   `scripts/lmgw-pin.sh verify-tree target/lmgw-public`. So the commit must have been published and
-   tagged first.
-5. Commit the three lines with the results and the `Cargo.lock` the build updated (lmgw's crates
+   (`git -C ../lmgw rev-parse 'HEAD^{tree}'`). Set `lmgw_tag` to the published release with that
+   tree, if there is one (`scripts/lmgw-pin.sh verify-published` checks it), else to `unpublished`.
+4. Commit the three lines with the results and the `Cargo.lock` the build updated (lmgw's crates
    carry its version).
+
+**Naming the release** (before Kai goes to GitHub): once lmgw has published the pinned tree, write
+its tag to `lmgw_tag` and run `scripts/lmgw-pin.sh verify-published`. When lmgw's release has other
+source than the pin, bump to the release's commit first (above).
 
 ## The RPM
 
@@ -154,10 +177,17 @@ and says so.
   `.github/workflows/release.yml`) points at this repository's
   `releases/latest/download/latest.json` and is marked public (`KAI_UPDATE_PUBLIC_FEED`), so it
   never sends its feed a token.
+- **The GitLab feed.** Development builds come from `.gitlab-ci.yml` on a self-hosted GitLab that
+  holds Kai's and lmgw's projects side by side: every push to `main` builds `X.Y.Z+<pipeline>`
+  against the lmgw commit `LMGW_PIN` names and publishes it with its `latest.json` to the project's
+  generic package registry. The build compiles that feed in with a read-only deploy token (`KAI_UPDATE_DEPLOY_TOKEN`),
+  so it follows `main`, never GitHub.
+- **Which feed.** An installed Kai follows the feed it was built with; there is no channel setting.
+  Installing one RPM of the other kind switches it. `X.Y.Z+<pipeline>` sorts after `X.Y.Z`, so going
+  from a GitLab build back to the release of the same version is a `dnf downgrade`.
 - **Another feed.** `KAI_UPDATE_ENDPOINT` points a running Kai at another feed, and
   `KAI_REGISTRY_TOKEN` gives it a token, only together with `KAI_UPDATE_ENDPOINT` and never to a
-  GitHub host. The compiled-in feed ignores that token, and the log says so. `.gitlab-ci.yml` lets
-  an optional self-hosted GitLab mirror build a feed of its own.
+  GitHub host. The compiled-in feed ignores that token, and the log says so.
 - **What Kai installs.** A manifest must name the RPM's sha256 as 64 hex digits and an https URL;
   anything else is refused before a download starts. Redirects from https to http are never
   followed. Installing needs `pkexec` and `dnf`.

@@ -11,11 +11,12 @@
 //! page's console is on stdout (`KAI_WINDOW_CONSOLE`), and a CSP violation fails the run.
 //!
 //! The Personality page ([`personality`]) runs against a dev lmgw the script started: the stand-in
-//! core forwards the page's profile-editor requests with that lmgw's device key as Kai's core does
-//! (`crate::lmgw_link::proxy`), unpaired first, then paired.
+//! core forwards the page's profile-editor requests over a pairing with that lmgw as Kai's core
+//! does (`crate::lmgw_link::proxy`), unpaired first, then paired.
 //!
 //! Env: `KAI_LIVE_OUT` the report directory (screenshots in `<out>/shots/`, spectacle's capture of
-//! the active window); `KAI_LIVE_LMGW` the file with the dev lmgw's URL and a device key (two lines).
+//! the active window); `KAI_LIVE_LMGW` the file naming a pairing with the dev lmgw (two lines: a
+//! `device-link.json` and the device's key as PEM).
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -86,7 +87,6 @@ struct Lmgw {
     creds: Option<Credentials>,
     paired: std::cell::Cell<bool>,
     rt: tokio::runtime::Runtime,
-    client: reqwest::Client,
 }
 
 impl Lmgw {
@@ -95,11 +95,18 @@ impl Lmgw {
             .and_then(|p| std::fs::read_to_string(p).ok())
             .and_then(|text| {
                 let mut lines = text.lines();
-                let url = lines.next()?.trim().to_owned();
-                let key = lines.next()?.trim().to_owned();
+                let paired =
+                    crate::pairing::Paired::load(Path::new(lines.next()?.trim())).ok()??;
+                let pem = std::fs::read_to_string(lines.next()?.trim()).ok()?;
+                let key = crate::pairing::TlsKey::from_pem(&pem).ok()?;
                 Some(Credentials {
-                    url,
-                    key: crate::pairing::DeviceKey::from_store(key),
+                    reach: crate::lmgw_link::tls::Reach::new(paired.credentials.urls.clone()),
+                    tls: crate::lmgw_link::tls::Tls::paired(
+                        &paired.credentials,
+                        &key,
+                        std::time::Duration::from_secs(10),
+                    )
+                    .ok()?,
                 })
             });
         Self {
@@ -110,7 +117,6 @@ impl Lmgw {
                 .enable_all()
                 .build()
                 .unwrap(),
-            client: reqwest::Client::builder().no_proxy().build().unwrap(),
         }
     }
 
@@ -124,10 +130,9 @@ impl Lmgw {
                 return;
             }
         };
-        let client = self.client.clone();
         let limits = Limits::from_config(&crate::config::WindowConfig::default());
         self.rt.spawn(async move {
-            let _ = reply.send(proxy::send(&client, &creds, forward, limits).await);
+            let _ = reply.send(proxy::send(&creds, forward, limits).await);
         });
     }
 
@@ -136,7 +141,7 @@ impl Lmgw {
         super::profiles::Conversation {
             paired,
             why: (!paired).then(|| crate::core::WINDOW_NOT_PAIRED.to_owned()),
-            gateway: self.creds.as_ref().map(|c| c.url.clone()),
+            gateway: self.creds.as_ref().map(|c| c.url()),
             folder: paired.then(|| "Kai".to_owned()),
             thread_id: None,
             model: None,

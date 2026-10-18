@@ -18,8 +18,8 @@
 //!
 //! Any other method, path or query (lmgw's `GET /chat/api/profiles/{id}`, which the kit does not
 //! call, included) is a 404, a POST whose body is not JSON a 400; the origin checks of
-//! `/api/apply` run first (`route`). The core sends an admitted request with the device key
-//! (`crate::lmgw_link::proxy`); the page never sees the key and opens no connection.
+//! `/api/apply` run first (`route`). The core sends an admitted request over the device link
+//! (`crate::lmgw_link::proxy`); the page holds no credential and opens no connection.
 //!
 //! **The conversation's facts** (`GET /api/conversation`, [`Conversation`]): what the core knows of
 //! Kai's conversation (WP22's state): the pairing, the folder, the thread, the folder's model and
@@ -137,7 +137,7 @@ pub struct Conversation {
     /// Kai holds a working pairing; otherwise `why` says what the owner can do.
     pub paired: bool,
     pub why: Option<String>,
-    /// The paired gateway (`lmgw.url`).
+    /// The paired gateway (the pairing's first URL).
     pub gateway: Option<String>,
     /// The conversation's Chat folder, once Kai found it.
     pub folder: Option<String>,

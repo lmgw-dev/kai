@@ -318,10 +318,7 @@ async fn leaving_the_gateway_ends_continuous_listenings_activity() {
     let mut r = rig("").await;
     r.listening_on().await;
     assert!(r.rings().last().is_some_and(|i| i.active));
-    let link = crate::pairing::tests::link(&format!(
-        "v=1&url=http%3A%2F%2F127.0.0.1%3A2&name=desktop&key={}",
-        crate::pairing::tests::KEY
-    ));
+    let link = crate::pairing::tests::other_at("https://127.0.0.1:2");
     r.send(Command::Arrived(
         crate::pairing::PairingLink::parse(&link).unwrap(),
     ));

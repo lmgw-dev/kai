@@ -15,9 +15,9 @@ async fn initialize_and_listing_as_lmgw_does_them() {
     assert_eq!(r.status(|_| true).await, HostStatus::Connecting);
     let mut c = r.fake.accept().await;
     assert_eq!(c.path, "/mcp/host");
-    assert_eq!(
-        c.headers.get("authorization").unwrap().to_str().unwrap(),
-        format!("Bearer {KEY}")
+    assert!(
+        c.headers.get("authorization").is_none(),
+        "the device's certificate authenticates it"
     );
     assert!(
         c.headers.get("origin").is_none(),

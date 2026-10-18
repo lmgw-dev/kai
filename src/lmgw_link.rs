@@ -1,7 +1,12 @@
 //! The lmgw link (§3.2, §3.3): the seam the core drives, and [`FeedLink`], Kai's implementation on
 //! top of `lmgw-client`'s feed reader.
 //!
-//! [`FeedLink`] keeps one `GET /chat/api/feed` open with the device key (api §2):
+//! Every connection goes over lmgw's device link (lmgw's device link design §6.2): TLS 1.3 to
+//! lmgw's device listener, lmgw verified against its device CA alone and the device by its
+//! certificate, all of it built from one configuration ([`tls::Tls`]). No request carries a
+//! credential of its own.
+//!
+//! [`FeedLink`] keeps one `GET /chat/api/feed` open (api §2):
 //! - resumed with `Last-Event-ID` (the reader's cursor, opaque text) after every reconnect of a run;
 //!   a `resync` is passed on as [`crate::voice::FeedFact::Resync`], and so is a known event whose
 //!   data does not read (`FeedItem::Unreadable`: what it was about may be shown stale);
@@ -12,15 +17,26 @@
 //!   while a level change goes live, api §2.1) waits two keep-alive intervals between bytes, the
 //!   interval lmgw stated in its last `hello` on the run or `lmgw.timeout_s` until it stated one;
 //!   once up, two `hello.keepalive_s` intervals without a byte are a dead link;
-//! - validating the key by opening the feed (§3.1 step 3): `hello` is [`LinkEvent::Connected`];
-//! - §3.3: the `revoked` event or a 401 on the feed (`device_key_unknown`, `device_disabled`,
-//!   `key_expired`: `lmgw_client::requests::key_refused`) is [`LinkEvent::Revoked`] with the
-//!   server's message verbatim and what it asks of the owner, by the event's `kind` or the 401's
-//!   code ([`KeyLoss`]: a disabled device is enabled again, an expired key's expiry is moved, a
-//!   rotated or deleted key is paired again), after which the link stops retrying by itself; a
-//!   `kind` Kai does not know is asked about once while the link tries again after its backoff,
-//!   never started over by that end (a 4003 or 4004 close of a WebSocket link comes from the
-//!   voice);
+//! - trying the pairing's URLs by the device link's rule (`tls::race`) and keeping the one that
+//!   answered for every other connection ([`tls::Reach`]);
+//! - validating the pairing by opening the feed (§3.1 step 3): `hello` is [`LinkEvent::Connected`],
+//!   after [`LinkEvent::Device`] with what it says about this device (its URLs, its certificate's
+//!   dates, lmgw's dashboard: lmgw's device link §7.2);
+//!   lmgw's 403 `device_unconfirmed` (the owner has not confirmed the code yet) is
+//!   [`LinkEvent::Unconfirmed`], and the feed asks again on its backoff;
+//! - §3.3: the `revoked` event, a 401 on the feed (`device_key_unknown`, `device_disabled`,
+//!   `key_expired`, `device_certificate_expired`, `client_certificate_required`:
+//!   `lmgw_client::requests::key_refused`), or the 400 `credential_on_device_listener`, all of them
+//!   over the authenticated link, is [`LinkEvent::Revoked`] with the server's message verbatim and
+//!   what it asks of the owner, by the event's `kind` or the code ([`KeyLoss`]: a disabled device
+//!   is enabled again, an expired key's expiry is moved, a lapsed certificate and a rotated or
+//!   deleted key are paired again), after which the link stops retrying by itself; so is a
+//!   certificate past its date by Kai's own clock, checked before each try ([`tls::Tls::lapsed`]).
+//!   A handshake's alert never is (the security review's B1): rustls takes a fatal alert before the
+//!   server proved anything, so whoever answers at the address could send one; it is said and
+//!   tried again. A `kind` Kai does not know is asked about once while the link tries again after
+//!   its backoff, never started over by that end (a 4003 or 4004 close of a WebSocket link comes
+//!   from the voice);
 //! - `device.revoked` (another device's key deleted) is [`LinkEvent::DeviceRevoked`]: the core
 //!   cancels the jobs that device started;
 //! - what the device's admin tools may do (`hello.self_admin`, then `state.self_admin` when it
@@ -35,7 +51,7 @@
 //!   [`LinkEvent::Profile`] (WP22: the tray's picker).
 //!
 //! [`mcp`] is Kai's own client of lmgw's `/mcp` (WP12: the MCP Apps bridge's reads and calls).
-//! [`proxy`] sends the configuration window's profile-editor requests with the device key (WP21b).
+//! [`proxy`] sends the configuration window's profile-editor requests (WP21b).
 //!
 //! The core owns one implementation, calls [`LmgwLink::start`] after every successful pairing or
 //! load, and [`LmgwLink::stop`] at quit, re-pairing and revocation. Each start gets a fresh event
@@ -45,24 +61,38 @@ mod feed;
 pub mod mcp;
 pub mod proxy;
 mod realtime;
+#[cfg(test)]
+pub(crate) mod test_pki;
+pub mod tls;
 
 use lmgw_client::realtime::RevokeKind;
 use lmgw_client::requests::KeyRefused;
 use tokio::sync::mpsc;
 
 use crate::conversation::FolderInfo;
-use crate::pairing::DeviceKey;
 
 pub use feed::{FeedLink, FeedSettings};
 pub(crate) use realtime::refusal_body;
 pub use realtime::{RealtimeLink, RealtimeSettings};
 
-/// What the link needs to connect.
+/// What the link needs to connect: where lmgw is, and the device link's TLS every connection is
+/// built from. Cheap to clone; clones share the reach.
 #[derive(Debug, Clone)]
 pub struct Credentials {
-    /// The paired base URL (`lmgw.url`).
-    pub url: String,
-    pub key: DeviceKey,
+    pub reach: tls::Reach,
+    pub tls: tls::Tls,
+}
+
+impl Credentials {
+    /// The base URL a connection goes to now ([`tls::Reach::base`]).
+    pub fn url(&self) -> String {
+        self.reach.base()
+    }
+
+    /// The HTTP client every request to lmgw goes through.
+    pub fn http(&self) -> reqwest::Client {
+        self.tls.http()
+    }
 }
 
 /// What this device's admin tools may do now (api L3, the pre-merge review's P-3):
@@ -88,15 +118,21 @@ pub fn admin_note(level: &AdminLevel) -> Option<String> {
     Some(format!("admin tools: {level}"))
 }
 
-/// What a key that opens nothing now asks of the owner (§3.3, review KAI-3 K3-6), as lmgw says it
-/// by kind (api §1.6, §1.8): a 401's code, the feed's `revoked.kind`, and a 4003 close's token
-/// (`lmgw_client::realtime::close_kind`). Kai never reads it from lmgw's words.
+/// What a pairing that opens nothing now asks of the owner (§3.3, review KAI-3 K3-6), as lmgw says
+/// it by kind (api §1.6, §1.8) over the authenticated link: a 401's code, the feed's
+/// `revoked.kind`, a 4003 close's token (`lmgw_client::realtime::close_kind`); and a lapse by Kai's
+/// own date (device link §5.3). Kai never reads it from lmgw's words, nor from a handshake's alert
+/// (the security review's B1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyLoss {
-    /// The key matches no device any more (rotated or deleted: `device_key_unknown`,
-    /// `key_unknown`), another kind of key was revoked (`revoked`), or a 401 Kai cannot tell
-    /// apart: the device is paired again.
+    /// The key matches no device any more (re-paired or deleted: `device_key_unknown`,
+    /// `key_unknown`), another kind of key was revoked (`revoked`), lmgw got no certificate or a
+    /// credential besides it (`client_certificate_required`, `credential_on_device_listener`), or
+    /// a 401 Kai cannot tell apart: the device is paired again.
     PairAgain,
+    /// The device's certificate lapsed (401 `device_certificate_expired`, the kind
+    /// `certificate_expired`, or Kai's own date): paired again, Kai saying the date it knows.
+    Lapsed,
     /// The device is disabled on lmgw (`device_disabled`): the same key works once the owner
     /// enables it again, so Kai keeps it.
     Disabled,
@@ -111,11 +147,12 @@ impl KeyLoss {
     pub fn of_code(code: &str) -> Self {
         let refusal = lmgw_client::requests::ApiError {
             code: code.to_owned(),
-            message: String::new(),
+            ..Default::default()
         };
         match lmgw_client::requests::key_refused(&refusal) {
             Some(KeyRefused::Disabled) => Self::Disabled,
             Some(KeyRefused::Expired) => Self::Expired,
+            Some(KeyRefused::CertificateExpired) => Self::Lapsed,
             _ => Self::PairAgain,
         }
     }
@@ -129,7 +166,36 @@ impl KeyLoss {
             RevokeKind::DeviceDisabled => Some(Self::Disabled),
             RevokeKind::KeyExpired => Some(Self::Expired),
             RevokeKind::KeyUnknown | RevokeKind::Revoked => Some(Self::PairAgain),
+            // The device link's own kind (lmgw's device link §5.1): the certificate's `notAfter`
+            // passed while a link was open.
+            RevokeKind::CertificateExpired => Some(Self::Lapsed),
             _ => None,
+        }
+    }
+}
+
+/// What the feed's `hello` says about this device itself (lmgw's device link §7.2), as
+/// `lmgw-client`'s `FeedReader` keeps it: the URL list, the certificate's dates as lmgw holds them,
+/// and where lmgw's dashboard is for this device.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceFacts {
+    /// `hello.urls` (`FeedReader::urls`: the `https` ones, each once), which replace the pairing's
+    /// list; `None` when none is usable, and Kai keeps its list.
+    pub urls: Option<lmgw_client::pairing::Urls>,
+    /// `hello.cert` (`FeedReader::certificate`), which replace the stored dates the certificate's
+    /// notice and lapse go by; `None` when it carries none.
+    pub cert: Option<lmgw_client::requests::CertDates>,
+    /// `hello.dashboard_url` (`FeedReader::dashboard_url`), what Open in lmgw opens; `None` when
+    /// lmgw sends none: its dashboard listens on its own machine only, and this device is another.
+    pub dashboard: Option<String>,
+}
+
+impl DeviceFacts {
+    pub(crate) fn of(r: &lmgw_client::feed::FeedReader) -> Self {
+        Self {
+            urls: r.urls().cloned(),
+            cert: r.certificate(),
+            dashboard: r.dashboard_url().map(str::to_owned),
         }
     }
 }
@@ -137,7 +203,13 @@ impl KeyLoss {
 /// What the link reports to the core, which maps it onto the tray model.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LinkEvent {
-    /// The feed's `hello` arrived: the key is valid. `device` from `hello.principal.name`, `held`
+    /// lmgw answered the feed 403 `device_unconfirmed`: the owner has not confirmed this device's
+    /// code on the Devices card yet. `note` says when the feed asks again.
+    Unconfirmed { note: String },
+    /// What the feed's `hello` says about this device ([`DeviceFacts`]), right before
+    /// [`LinkEvent::Connected`].
+    Device(DeviceFacts),
+    /// The feed's `hello` arrived: the pairing is valid. `device` from `hello.principal.name`, `held`
     /// from `hello.hold.active`, `hosts_label` (the label Kai's hosted tools go under, §10.1)
     /// from `hello.hosts_label`, `admin` from `hello.self_admin`.
     Connected {
@@ -212,9 +284,9 @@ pub trait LmgwLink: Send + 'static {
     fn stop(&mut self);
 }
 
-/// A request header as the HTTP and WebSocket clients take it. `Authorization` (the device key) is
-/// marked sensitive, so no `Debug` of a request shows it (review KAI-2 K2-1; the log cap in
-/// `crate::logging` keeps the libraries' own traces of it out). An invalid header names itself,
+/// A request header as the HTTP and WebSocket clients take it. Kai sends no credential header (the
+/// device link authenticates by the certificate); an `Authorization` header, should a request
+/// carry one, is marked sensitive all the same (review KAI-2 K2-1). An invalid header names itself,
 /// never its value.
 pub(crate) fn header(
     h: &lmgw_client::requests::Header,
@@ -269,6 +341,7 @@ mod tests {
             ("key_expired", Some(KeyLoss::Expired)),
             ("key_unknown", Some(KeyLoss::PairAgain)),
             ("revoked", Some(KeyLoss::PairAgain)),
+            ("certificate_expired", Some(KeyLoss::Lapsed)),
             // A newer gateway's kind: Kai asks lmgw once.
             ("key_paused", None),
         ] {
@@ -288,12 +361,16 @@ mod tests {
                 Some(KeyLoss::Expired),
             ),
             (
-                "key_unknown: device 'desktop' was rotated — pair it again",
+                "key_unknown: the key of device 'desktop' was replaced — pair it again",
                 Some(KeyLoss::PairAgain),
             ),
             (
                 "revoked: key 'laptop' was disabled",
                 Some(KeyLoss::PairAgain),
+            ),
+            (
+                "certificate_expired: the certificate of device 'desktop' expired — pair it again",
+                Some(KeyLoss::Lapsed),
             ),
             ("key_paused: device 'desktop' was paused", None),
             // An older gateway's reason, with no token: its words are not read.

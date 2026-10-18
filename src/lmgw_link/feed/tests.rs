@@ -1,5 +1,6 @@
-//! The feed task against a scripted HTTP server on loopback (real time, waits of a few seconds:
-//! the backoff starts at 1 s), and the mapping of its events.
+//! The feed task against a scripted HTTP server behind the tests' device listener on loopback
+//! (`crate::lmgw_link::test_pki`; real time, waits of a few seconds: the backoff starts at 1 s), and
+//! the mapping of its events.
 
 use std::time::Duration;
 
@@ -7,11 +8,11 @@ use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
+use tokio_rustls::server::TlsStream;
 
 use super::*;
 use crate::lmgw_link::AdminLevel;
-use crate::pairing::DeviceKey;
-use crate::pairing::tests::KEY;
+use crate::lmgw_link::test_pki::{self, Gateway};
 
 const SSE_HEAD: &[u8] =
     b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncache-control: no-cache\r\n\r\n";
@@ -36,7 +37,7 @@ fn refusal(status: &str, code: &str, message: &str) -> String {
 }
 
 /// Accepts one connection and reads its request's head.
-async fn accept(l: &TcpListener) -> (TcpStream, String) {
+async fn accept(l: &Gateway) -> (TlsStream<TcpStream>, String) {
     let (mut s, _) = tokio::time::timeout(Duration::from_secs(10), l.accept())
         .await
         .expect("a connection")
@@ -61,13 +62,12 @@ fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
 struct Rig {
     link: FeedLink,
     events: mpsc::UnboundedReceiver<LinkEvent>,
-    listener: TcpListener,
+    listener: Gateway,
 }
 
 async fn rig(retry_max_s: u64) -> Rig {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}", listener.local_addr().unwrap());
-    let link = start(&url, retry_max_s);
+    let listener = Gateway::bind().await;
+    let link = start(&[&listener.url], retry_max_s);
     let (link, events) = link;
     Rig {
         link,
@@ -76,28 +76,117 @@ async fn rig(retry_max_s: u64) -> Rig {
     }
 }
 
-fn start(url: &str, retry_max_s: u64) -> (FeedLink, mpsc::UnboundedReceiver<LinkEvent>) {
+/// The feed of a pairing with the tests' gateway at `urls`.
+fn start(urls: &[&str], retry_max_s: u64) -> (FeedLink, mpsc::UnboundedReceiver<LinkEvent>) {
     let mut link = FeedLink::new(FeedSettings {
         retry_max: Duration::from_secs(retry_max_s),
         timeout: Duration::from_secs(2),
-    })
-    .unwrap();
+        stagger: Duration::from_millis(250),
+    });
     let (tx, events) = mpsc::unbounded_channel();
-    link.start(
-        Credentials {
-            url: url.to_owned(),
-            key: DeviceKey::parse(KEY).unwrap(),
-        },
-        tx,
-    );
+    let p = test_pki::PKI.paired(urls);
+    let creds = Credentials {
+        reach: crate::lmgw_link::tls::Reach::new(p.credentials.urls.clone()),
+        tls: test_pki::PKI.creds(urls[0]).tls,
+    };
+    link.start(creds, tx);
     (link, events)
 }
 
+/// The next event but what a `hello` says about the device ([`LinkEvent::Device`], which
+/// [`hellos_device_facts_come_right_before_connected`] checks).
 async fn next(events: &mut mpsc::UnboundedReceiver<LinkEvent>) -> LinkEvent {
+    loop {
+        match next_any(events).await {
+            LinkEvent::Device(_) => continue,
+            e => return e,
+        }
+    }
+}
+
+async fn next_any(events: &mut mpsc::UnboundedReceiver<LinkEvent>) -> LinkEvent {
     tokio::time::timeout(Duration::from_secs(10), events.recv())
         .await
         .expect("a link event")
         .expect("the link runs")
+}
+
+/// lmgw's device link §7.2: a device's `hello` says what lmgw holds about it (its URLs, its
+/// certificate's dates, its dashboard), which the feed passes on as `lmgw-client`'s reader kept it
+/// (the `https` URLs, each once; the dates in unix milliseconds), right before the connection is
+/// said; a `hello` without them says none.
+#[tokio::test]
+async fn hellos_device_facts_come_right_before_connected() {
+    let mut r = rig(30).await;
+    let (mut s, _) = accept(&r.listener).await;
+    s.write_all(SSE_HEAD).await.unwrap();
+    let mut h: serde_json::Value = serde_json::from_str(
+        hello("desktop", 15)
+            .trim_start_matches("event: hello\ndata: ")
+            .trim_end(),
+    )
+    .unwrap();
+    h["urls"] = json!([
+        "https://192.0.2.1:8788",
+        "http://192.0.2.1:8787",
+        "https://192.0.2.1:8788/",
+        "https://198.51.100.20:8788"
+    ]);
+    h["cert"] =
+        json!({"not_after": "2027-10-14T14:03:11Z", "notice_after": "2027-06-14T14:03:11Z"});
+    h["dashboard_url"] = json!("http://198.51.100.20:8787/");
+    s.write_all(format!("event: hello\ndata: {h}\n\n").as_bytes())
+        .await
+        .unwrap();
+    let LinkEvent::Device(facts) = next_any(&mut r.events).await else {
+        panic!("the device's facts first");
+    };
+    assert_eq!(
+        facts.urls.as_ref().map(|u| u.as_slice().to_vec()),
+        Some(vec![
+            "https://192.0.2.1:8788".to_owned(),
+            "https://198.51.100.20:8788".to_owned()
+        ]),
+        "the https ones, each once"
+    );
+    assert_eq!(
+        facts.cert,
+        Some(lmgw_client::requests::CertDates {
+            not_after_ms: 1_823_522_591_000,
+            notice_after_ms: 1_812_981_791_000,
+        })
+    );
+    assert_eq!(
+        facts.dashboard.as_deref(),
+        Some("http://198.51.100.20:8787/")
+    );
+    assert!(matches!(
+        next_any(&mut r.events).await,
+        LinkEvent::Connected { .. }
+    ));
+    // The next connection's hello carries none: none said.
+    drop(s);
+    let (mut s, _) = accept(&r.listener).await;
+    s.write_all(SSE_HEAD).await.unwrap();
+    s.write_all(hello("desktop", 15).as_bytes()).await.unwrap();
+    loop {
+        match next_any(&mut r.events).await {
+            LinkEvent::Device(facts) => {
+                assert_eq!(
+                    facts,
+                    DeviceFacts {
+                        urls: None,
+                        cert: None,
+                        dashboard: None
+                    }
+                );
+                break;
+            }
+            LinkEvent::Down { .. } | LinkEvent::Fact(_) => {}
+            other => panic!("{other:?}"),
+        }
+    }
+    r.link.stop();
 }
 
 fn down(e: LinkEvent) -> String {
@@ -124,7 +213,8 @@ async fn hello_names_the_device_marks_kais_own_and_a_drop_resumes_with_the_curso
     );
     assert_eq!(
         header(&head, "authorization"),
-        Some(format!("Bearer {KEY}").as_str())
+        None,
+        "the device's certificate authenticates it"
     );
     assert_eq!(header(&head, "accept"), Some("text/event-stream"));
     assert_eq!(
@@ -166,6 +256,8 @@ async fn hello_names_the_device_marks_kais_own_and_a_drop_resumes_with_the_curso
         })
     );
     assert_eq!(next(&mut r.events).await, LinkEvent::Hold { active: true });
+    // lmgw ends the stream: TLS's close_notify, then the connection closes.
+    s.shutdown().await.unwrap();
     drop(s);
     let note = down(next(&mut r.events).await);
     assert!(
@@ -225,7 +317,7 @@ async fn the_revoked_event_ends_the_link() {
         LinkEvent::Connected { .. }
     ));
     next(&mut r.events).await;
-    let msg = "device 'desktop' was rotated — pair it again";
+    let msg = "the key of device 'desktop' was replaced — pair it again";
     let rec = json!({"reason": "rotated", "message": msg, "kind": "key_unknown"});
     s.write_all(format!("event: revoked\ndata: {rec}\n\n").as_bytes())
         .await
@@ -403,6 +495,8 @@ async fn a_feed_that_began_without_hello_and_falls_silent_is_dropped_after_two_i
         LinkEvent::Connected { .. }
     ));
     next(&mut r.events).await;
+    // lmgw ends the stream: TLS's close_notify, then the connection closes.
+    s.shutdown().await.unwrap();
     drop(s);
     let note = down(next(&mut r.events).await);
     assert!(note.contains("lmgw closed the feed"), "{note}");
@@ -424,9 +518,9 @@ async fn a_feed_that_began_without_hello_and_falls_silent_is_dropped_after_two_i
 async fn the_backoff_doubles_up_to_lmgw_retry_max_s() {
     // A port nothing listens on: every try is refused at once.
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}", l.local_addr().unwrap());
+    let url = format!("https://{}", l.local_addr().unwrap());
     drop(l);
-    let (mut link, mut events) = start(&url, 2);
+    let (mut link, mut events) = start(&[&url], 2);
     let mut waits = Vec::new();
     for _ in 0..3 {
         let note = down(next(&mut events).await);
@@ -435,6 +529,207 @@ async fn the_backoff_doubles_up_to_lmgw_retry_max_s() {
         waits.push(s.split(' ').next().unwrap().to_owned());
     }
     assert_eq!(waits, ["1", "2", "2"]);
+    link.stop();
+}
+
+/// Device link §3.5: lmgw's 403 `device_unconfirmed` is said (the tray shows Kai's own code) and
+/// asked again on the backoff; once the owner confirmed, the feed comes up.
+#[tokio::test]
+async fn an_unconfirmed_device_is_said_and_asked_again() {
+    let mut r = rig(30).await;
+    let (mut s, _) = accept(&r.listener).await;
+    let words = "confirm 7F3A-91C2 on lmgw's Devices card";
+    s.write_all(refusal("403 Forbidden", "device_unconfirmed", words).as_bytes())
+        .await
+        .unwrap();
+    match next(&mut r.events).await {
+        LinkEvent::Unconfirmed { note } => {
+            assert!(note.contains("Kai asks again in 1 s"), "{note}")
+        }
+        other => panic!("not Unconfirmed: {other:?}"),
+    }
+    let (mut s, _) = accept(&r.listener).await;
+    s.write_all(SSE_HEAD).await.unwrap();
+    s.write_all(hello("desktop", 15).as_bytes()).await.unwrap();
+    assert!(matches!(
+        next(&mut r.events).await,
+        LinkEvent::Connected { .. }
+    ));
+    r.link.stop();
+}
+
+/// The device link's refusals of the device (device link §4.7) end the link: a lapsed
+/// certificate, no certificate, a credential beside it.
+#[tokio::test]
+async fn the_device_listeners_refusals_end_the_link() {
+    for (status, code, loss) in [
+        (
+            "401 Unauthorized",
+            "device_certificate_expired",
+            KeyLoss::Lapsed,
+        ),
+        (
+            "401 Unauthorized",
+            "client_certificate_required",
+            KeyLoss::PairAgain,
+        ),
+        (
+            "400 Bad Request",
+            "credential_on_device_listener",
+            KeyLoss::PairAgain,
+        ),
+    ] {
+        let mut r = rig(30).await;
+        let (mut s, _) = accept(&r.listener).await;
+        s.write_all(refusal(status, code, "lmgw's words").as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(
+            next(&mut r.events).await,
+            LinkEvent::Revoked {
+                reason: "lmgw's words".into(),
+                loss: Some(loss),
+            },
+            "{code}"
+        );
+    }
+}
+
+/// The feed of a pairing with the tests' gateway at `url`, whose stored certificate is `cert` and
+/// whose `not_after` by Kai's date is `not_after_ms`.
+fn start_with(
+    url: &str,
+    cert: Option<Vec<u8>>,
+    not_after_ms: i64,
+) -> (FeedLink, mpsc::UnboundedReceiver<LinkEvent>) {
+    let mut p = test_pki::PKI.paired(&[url]);
+    if let Some(c) = cert {
+        p.credentials.certificate = c;
+    }
+    p.credentials.not_after_ms = not_after_ms;
+    let creds = Credentials {
+        reach: crate::lmgw_link::tls::Reach::new(p.credentials.urls.clone()),
+        tls: crate::lmgw_link::tls::Tls::paired(
+            &p.credentials,
+            &test_pki::PKI.device_key,
+            Duration::from_secs(5),
+        )
+        .unwrap(),
+    };
+    let mut link = FeedLink::new(FeedSettings {
+        retry_max: Duration::from_secs(30),
+        timeout: Duration::from_secs(5),
+        stagger: Duration::from_millis(250),
+    });
+    let (tx, events) = mpsc::unbounded_channel();
+    link.start(creds, tx);
+    (link, events)
+}
+
+/// The security review's B1: a port squatter's plaintext alert right after the ClientHello, before
+/// it proved anything, never ends the feed: each is said, by TLS's name, and the feed tries again
+/// on its backoff.
+#[tokio::test]
+async fn a_plaintext_alert_never_ends_the_feed() {
+    let squatter = test_pki::Squatter::bind().await;
+    let (mut link, mut events) = start(&[&squatter.url], 1);
+    for (alert, name) in [
+        (test_pki::BAD_CERTIFICATE, "bad_certificate"),
+        (test_pki::UNKNOWN_CA, "unknown_ca"),
+        (test_pki::CERTIFICATE_EXPIRED, "certificate_expired"),
+    ] {
+        tokio::time::timeout(Duration::from_secs(10), squatter.answer(alert))
+            .await
+            .expect("the feed tried again");
+        let note = down(next(&mut events).await);
+        assert!(
+            note.contains(name) && note.contains("tries again") && !note.contains("pair again"),
+            "{note}"
+        );
+        // A lapse an alert claims while Kai's date holds the certificate is said as the clocks
+        // disagreeing.
+        if alert == test_pki::CERTIFICATE_EXPIRED {
+            assert!(note.contains("holds until 2100-01-01"), "{note}");
+        }
+    }
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        squatter.answer(test_pki::BAD_CERTIFICATE),
+    )
+    .await
+    .expect("the feed still tries");
+    link.stop();
+}
+
+/// lmgw's own `certificate_expired` alert for a certificate past its date (device link §5.3) while
+/// Kai's date still holds it: said, with Kai's date, and tried again (the clocks disagree).
+#[tokio::test]
+async fn an_alert_against_kais_date_is_said_and_tried_again() {
+    let g = Gateway::bind().await;
+    let old = test_pki::device_cert(
+        &test_pki::PKI.ca,
+        &test_pki::PKI.device_key.public_key().unwrap(),
+        (2020, 2021),
+    );
+    let (mut link, mut events) = start_with(&g.url, Some(old), 4_102_444_800_000);
+    let _ = g.accept().await;
+    let note = down(next(&mut events).await);
+    assert!(
+        note.contains("certificate_expired") && note.contains("holds until 2100-01-01"),
+        "{note}"
+    );
+    let again = tokio::time::timeout(Duration::from_secs(10), g.accept()).await;
+    assert!(again.is_ok(), "the feed tried again");
+    link.stop();
+}
+
+/// A certificate past its date by Kai's own clock (device link §5.3) ends the feed before it
+/// tries: lapsed, with the date.
+#[tokio::test]
+async fn a_certificate_lapsed_by_kais_date_ends_the_feed_untried() {
+    let g = Gateway::bind().await;
+    let (_link, mut events) = start_with(&g.url, None, 86_400_000);
+    match next(&mut events).await {
+        LinkEvent::Revoked { reason, loss } => {
+            assert_eq!(loss, Some(KeyLoss::Lapsed));
+            assert!(reason.contains("1970-01-02"), "{reason}");
+        }
+        other => panic!("not Revoked: {other:?}"),
+    }
+    let tried = tokio::time::timeout(Duration::from_millis(500), g.accept()).await;
+    assert!(tried.is_err(), "the feed tried a lapsed certificate");
+}
+
+/// Device link §6.3: with several URLs the feed tries the next when one does not answer, and every
+/// other connection goes to the one that did.
+#[tokio::test]
+async fn the_feed_reaches_lmgw_at_the_url_that_answers() {
+    let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dead_url = format!("https://{}", dead.local_addr().unwrap());
+    drop(dead);
+    let g = Gateway::bind().await;
+    let p = test_pki::PKI.paired(&[&dead_url, &g.url]);
+    let reach = crate::lmgw_link::tls::Reach::new(p.credentials.urls.clone());
+    let creds = Credentials {
+        reach: reach.clone(),
+        tls: test_pki::PKI.creds(&g.url).tls,
+    };
+    assert_eq!(reach.base(), dead_url);
+    let mut link = FeedLink::new(FeedSettings {
+        retry_max: Duration::from_secs(30),
+        timeout: Duration::from_secs(5),
+        stagger: Duration::from_millis(250),
+    });
+    let (tx, mut events) = mpsc::unbounded_channel();
+    link.start(creds, tx);
+    let (mut s, _) = accept(&g).await;
+    s.write_all(SSE_HEAD).await.unwrap();
+    s.write_all(hello("desktop", 15).as_bytes()).await.unwrap();
+    assert!(matches!(
+        next(&mut events).await,
+        LinkEvent::Connected { .. }
+    ));
+    assert_eq!(reach.base(), g.url);
     link.stop();
 }
 
@@ -697,60 +992,79 @@ fn device_revoked_names_the_deleted_device() {
     );
 }
 
-/// WP19: `approval.*` become the approval card's facts; an approved call that never ran
-/// (`not_run`) is said as not approved.
+/// WP19 and device link §7.3: the approval card's facts come from the reader's open set, never
+/// from the `approval.*` events themselves. `hello`'s set is handed over whole at `caught_up`; a
+/// request and its decision in the catch-up change nothing; after `caught_up` a request adds and a
+/// decision withdraws.
 #[test]
-fn approval_events_become_the_cards_facts() {
-    let mut t = Translate::default();
-    let ev =
-        |name: &str, data: serde_json::Value| FeedEvent::parse(name, &data.to_string()).unwrap();
-    let Step::Events(e) = t.event(ev(
-        "approval.requested",
-        json!({"thread_id": 7, "message_id": 40, "approval_request_id": "mcpr_1",
+fn the_cards_facts_follow_the_feeds_open_set() {
+    let call = |id: &str| {
+        json!({"thread_id": 7, "message_id": 40, "approval_request_id": id,
                "server_label": "kai", "name": "clipboard_set", "arguments": "{\"text\":\"x\"}",
-               "call_id": "call_7"}),
-    )) else {
-        panic!()
+               "call_id": "call_7", "thread_title": "Kai"})
     };
-    assert_eq!(
-        e,
-        vec![LinkEvent::Fact(FeedFact::ApprovalRequested(
-            crate::approvals::Requested {
-                thread_id: 7,
-                request: lmgw_client::requests::approvals::ApprovalRequest {
-                    approval_request_id: "mcpr_1".into(),
-                    server_label: "kai".into(),
-                    name: "clipboard_set".into(),
-                    arguments: r#"{"text":"x"}"#.into(),
-                    call_id: Some("call_7".into()),
-                },
-            }
-        ))]
+    let decided = |id: &str| {
+        json!({"thread_id": 7, "message_id": 40, "approval_request_id": id,
+               "approve": false, "by": "device 'phone'", "not_run": true})
+    };
+    let requested = |id: &str| crate::approvals::Requested {
+        thread_id: 7,
+        request: lmgw_client::requests::approvals::ApprovalRequest {
+            approval_request_id: id.into(),
+            server_label: "kai".into(),
+            name: "clipboard_set".into(),
+            arguments: r#"{"text":"x"}"#.into(),
+            call_id: Some("call_7".into()),
+        },
+    };
+    let mut h: serde_json::Value = serde_json::from_str(
+        hello("desktop", 15)
+            .trim()
+            .strip_prefix("event: hello\ndata: ")
+            .unwrap(),
+    )
+    .unwrap();
+    h["open_approvals"] = json!([call("mcpr_1")]);
+    let stream = format!(
+        "event: hello\ndata: {h}\n\n\
+         id: e1:5:bb\nevent: approval.requested\ndata: {}\n\n\
+         id: e1:6:cc\nevent: approval.decided\ndata: {}\n\n\
+         event: caught_up\ndata: {}\n\n\
+         id: e1:7:dd\nevent: approval.requested\ndata: {}\n\n\
+         id: e1:8:ee\nevent: approval.decided\ndata: {}\n\n",
+        call("mcpr_0"),
+        decided("mcpr_0"),
+        json!({"cursor": "e1:6:cc"}),
+        call("mcpr_2"),
+        decided("mcpr_1"),
     );
-    // Its Debug carries no argument.
-    assert!(!format!("{e:?}").contains("text"));
-    for (data, approve) in [
-        (
-            json!({"thread_id": 7, "message_id": 40, "approval_request_id": "mcpr_1",
-                "approve": true, "by": "the dashboard"}),
-            true,
-        ),
-        (
-            json!({"thread_id": 7, "message_id": 40, "approval_request_id": "mcpr_1",
-                "approve": false, "by": "device 'phone'", "not_run": true}),
-            false,
-        ),
-    ] {
-        let by = data["by"].as_str().map(str::to_owned);
-        assert_eq!(
-            t.event(ev("approval.decided", data)),
-            Step::Events(vec![LinkEvent::Fact(FeedFact::ApprovalDecided {
-                id: "mcpr_1".into(),
-                approve,
-                by,
-            })])
-        );
+    let mut t = Translate::default();
+    let mut facts = Vec::new();
+    for item in FeedReader::new(None).push(stream.as_bytes()) {
+        match item {
+            FeedItem::Event(ev) => match t.event(ev) {
+                Step::Events(evs) => facts.extend(evs.into_iter().filter(|e| {
+                    matches!(e, LinkEvent::Fact(f) if matches!(f,
+                            FeedFact::ApprovalsOpen(_)
+                            | FeedFact::ApprovalRequested(_)
+                            | FeedFact::ApprovalsWithdrawn(_)))
+                })),
+                Step::Revoked(..) => panic!("no revocation"),
+            },
+            FeedItem::Approvals(c) => facts.extend(Translate::approvals(c)),
+            _ => {}
+        }
     }
+    assert_eq!(
+        facts,
+        vec![
+            LinkEvent::Fact(FeedFact::ApprovalsOpen(vec![requested("mcpr_1")])),
+            LinkEvent::Fact(FeedFact::ApprovalRequested(requested("mcpr_2"))),
+            LinkEvent::Fact(FeedFact::ApprovalsWithdrawn(vec!["mcpr_1".into()])),
+        ]
+    );
+    // Their Debug carries no argument.
+    assert!(!format!("{facts:?}").contains("text"));
 }
 
 #[tokio::test]

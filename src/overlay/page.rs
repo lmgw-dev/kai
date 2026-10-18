@@ -2,6 +2,7 @@
 //! and both directions of the bridge: calls into `window.__kai` (assets/overlay/boot.js) and the
 //! page's messages.
 
+use lmgw_client::realtime::VoiceTiming;
 use serde_json::{Value, json};
 
 use super::lifecycle::PageState;
@@ -129,8 +130,12 @@ pub fn feed_js(output: &Levels, input: &Levels) -> String {
     s
 }
 
-pub fn timing_js(timing: Option<&Value>) -> String {
-    format!("__kai.setTiming({})", timing.unwrap_or(&Value::Null))
+pub fn timing_js(timing: Option<&VoiceTiming>) -> String {
+    let json = match timing {
+        Some(t) => serde_json::to_string(t).unwrap_or_else(|_| "null".to_owned()),
+        None => "null".to_owned(),
+    };
+    format!("__kai.setTiming({json})")
 }
 
 pub fn reduced_js(reduced: bool) -> String {
@@ -239,10 +244,18 @@ mod tests {
         assert_eq!(js.matches(',').count(), 2 + 2 * (BANDS - 1) + 1, "{js}");
         assert!(js.len() < 720, "{} bytes", js.len());
         assert_eq!(timing_js(None), "__kai.setTiming(null)");
-        assert_eq!(
-            timing_js(Some(&json!({"first_audio_ms": 800}))),
-            r#"__kai.setTiming({"first_audio_ms":800})"#
-        );
+        let js = timing_js(Some(&VoiceTiming {
+            first_audio_ms: Some(800),
+            cold: vec!["tts".into()],
+            ..VoiceTiming::default()
+        }));
+        let payload = js
+            .strip_prefix("__kai.setTiming(")
+            .and_then(|r| r.strip_suffix(')'))
+            .expect("a setTiming call");
+        let back: serde_json::Value = serde_json::from_str(payload).unwrap();
+        assert_eq!(back["first_audio_ms"], 800, "{js}");
+        assert_eq!(back["cold"], json!(["tts"]), "{js}");
         assert_eq!(reduced_js(true), "__kai.setReduced(true)");
     }
 }

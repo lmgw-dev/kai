@@ -15,7 +15,9 @@
 # and no widget content in a trace log (src/widgets/live_tests.rs); WP12's MCP Apps bridge (section
 # apps: the postMessage path into Kai's isolated world, then overlay_app against a dev lmgw on
 # 127.0.0.1:8897, the checkout's headless example on its own data dir, with
-# scripts/mcp-apps-fixture.py registered under the prefix fx and a device key minted for the check;
+# scripts/mcp-apps-fixture.py registered under the prefix fx and a device paired for the check over
+# lmgw's device link (scripts/live-device-link.sh: the device listener on 127.0.0.1:8898, a v2 link
+# for this computer, Kai's enrolment of its own key by the test binary, the owner's Confirm);
 # nothing talks to 127.0.0.1:8001); then a second run under
 # WAYLAND_DEBUG=client whose log shows the widgets' input regions
 # (scripts/wayland-input-regions.py).
@@ -57,15 +59,18 @@ stop_lmgw() {
 }
 cleanup_apps() {
     stop_lmgw
-    # The dev lmgw's log carries its owner login link, its data dir and the key file the key.
-    rm -rf "$out/lmgw-data" "$out/lmgw.log" "$out/headless" "$out/apps-lmgw"
+    # The dev lmgw's log carries its owner login link, its data dir the device CA, the pairing
+    # directory the device's key.
+    rm -rf "$out/lmgw-data" "$out/lmgw.log" "$out/headless" "$out/apps-lmgw" "$out/apps-pairing"
 }
 trap cleanup_apps EXIT
 sections=${KAI_LIVE_SECTIONS:-}
 if [[ -z $sections || ,$sections, == *,apps,* ]]; then
     [[ -x $LMGW/target/debug/examples/headless ]] \
         || { echo "FAIL no dev lmgw build: cargo build -p lmgw-core --example headless in $LMGW"; exit 1; }
-    if ss -ltnH "sport = :8897" | grep -q .; then echo "FAIL something listens on 8897 already"; exit 1; fi
+    for port in 8897 8898; do
+        if ss -ltnH "sport = :$port" | grep -q .; then echo "FAIL something listens on $port already"; exit 1; fi
+    done
     scripts/lmgw-pin.sh check "$LMGW" || true
     cp --reflink=auto "$LMGW/target/debug/examples/headless" "$out/headless"
     mkdir -p "$out/lmgw-data"
@@ -84,13 +89,17 @@ if [[ -z $sections || ,$sections, == *,apps,* ]]; then
         printf 'Authorization: Bearer %s\n' "$token" | curl -sS --max-time 10 -X POST \
             "$URL/api/op/$1" -H @- -H 'Content-Type: application/json' -d "$2"
     }
+    owner_get() { printf 'Authorization: Bearer %s\n' "$token" | curl -sS --max-time 10 "$URL$1" -H @-; }
+    fail() { echo "FAIL $*"; exit 1; }
+    # shellcheck source=scripts/live-device-link.sh
+    source scripts/live-device-link.sh
     made=$(op mcp_server_set "{\"action\": \"create\", \"name\": \"kai-apps-fixture\", \"transport\": \"stdio\", \"command\": \"python3\", \"args\": \"-I $here/scripts/mcp-apps-fixture.py\", \"tool_prefix\": \"fx\"}")
     echo "$made" | jq -e '.id // .ok' >/dev/null 2>&1 || { echo "FAIL the fixture was not registered: $made"; exit 1; }
-    created=$(op key_create "{\"kind\": \"device\", \"name\": \"kai-apps-live\", \"url\": \"$URL\"}")
-    key=$(echo "$created" | jq -r .key)
-    [[ -n $key && $key != null ]] || { echo "FAIL no device key: $(echo "$created" | jq -c 'del(.. | .key?, .link?)')"; exit 1; }
+    devices_on
+    mint kai-apps-live
+    enrol_files "$test_bin" "$out/apps-pairing"
     apps_file=$out/apps-lmgw
-    (umask 077; printf '%s\n%s\n' "$URL" "$key" >"$apps_file")
+    printf '%s\n%s\n' "$out/apps-pairing/device-link.json" "$out/apps-pairing/key.pem" >"$apps_file"
     echo "apps: dev lmgw on $URL ($(git -C "$LMGW" rev-parse --short HEAD)) with the fixture under fx"
 fi
 

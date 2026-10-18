@@ -7,10 +7,11 @@
 //! `KAI_LOG`, however specific, can lift it.
 //!
 //! - **The HTTP and WebSocket stack** at `info`: tungstenite traces a handshake's whole request
-//!   head, `Authorization: Bearer <device key>` included, and hyper, h2, reqwest and rustls see
-//!   the feed's and the folder requests' headers.
+//!   head, and hyper, h2, reqwest and rustls see the feed's and the folder requests' headers. No
+//!   request carries a credential since the device link (its certificate's key stays in rustls),
+//!   and the cap stays for whatever a library traces.
 //! - **D-Bus** at `warn`: zbus, ksni and the Secret Service crate see every message, the `Pair`
-//!   call's link with its key among them.
+//!   call's link with its one-time token and the device's key in the wallet among them.
 //! - **rmcp** at `warn`: its traces carry every MCP message of the tool link whole, a call's
 //!   arguments and its result among them (the hosted server logs a call by its tool and caller).
 //!

@@ -33,15 +33,6 @@ pub struct WidgetTools {
 /// for `overlay_app` the pairing's credentials and K15's dialog.
 pub fn provider(deps: &Deps) -> WidgetTools {
     let connect = deps.config.lmgw.timeout();
-    // No proxy: Kai talks to its gateway directly, as the feed does.
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .connect_timeout(connect)
-        .build()
-        .unwrap_or_else(|e| {
-            tracing::error!("widgets: the HTTP client for overlay_app: {e}; using the default");
-            reqwest::Client::new()
-        });
     super::set_held_margin(settings::of(&deps.config.overlay, Kind::App).margin);
     let tools = WidgetTools {
         ui: deps.ui.clone(),
@@ -49,7 +40,6 @@ pub fn provider(deps: &Deps) -> WidgetTools {
         from: Arc::new(Sources::of(&deps.config.overlay, &deps.config.weather)),
         apps: Arc::new(Apps {
             creds: deps.creds.clone(),
-            client,
             connect,
             bound: app_bound(&deps.config.overlay),
             calls: app_calls(&deps.config.overlay),
@@ -288,7 +278,6 @@ mod tests {
             WidgetTools {
                 apps: Arc::new(Apps {
                     creds: tokio::sync::watch::channel(None).1,
-                    client: reqwest::Client::new(),
                     connect: Duration::from_secs(10),
                     bound: app_bound(&overlay),
                     calls: app_calls(&overlay),

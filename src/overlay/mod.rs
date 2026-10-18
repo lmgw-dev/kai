@@ -39,7 +39,6 @@ use std::time::{Duration, Instant};
 
 use gtk::prelude::*;
 use gtk::{gdk, gio, glib};
-use serde_json::Value;
 use webkit2gtk::WebViewExt;
 
 use crate::audio::{LevelTaps, Tap};
@@ -85,7 +84,7 @@ pub enum OverlayCmd {
     Ring(RingInput),
     /// `lmgw.response.timing` of the last turn, or `None` (§9.3 `setTiming`).
     #[allow(dead_code)] // the voice session (WP4)
-    Timing(Option<Value>),
+    Timing(Option<Box<lmgw_client::realtime::VoiceTiming>>),
     /// `overlay.ring_over_fullscreen`: a ring that is up moves to that layer at once (review KAI-5
     /// R5-2), a hidden one from the next time it shows.
     RingOverFullscreen(bool),
@@ -317,7 +316,7 @@ struct Overlay {
     /// What the tray was last told.
     note: Option<String>,
     reduced: bool,
-    timing: Option<Value>,
+    timing: Option<Box<lmgw_client::realtime::VoiceTiming>>,
     tx: async_channel::Sender<Event>,
     created_at: Option<Instant>,
     show_at: Option<Instant>,
@@ -536,7 +535,7 @@ impl Overlay {
             OverlayCmd::Timing(t) => {
                 self.timing = t;
                 if let Some(v) = &self.view {
-                    v.eval(&page::timing_js(self.timing.as_ref()));
+                    v.eval(&page::timing_js(self.timing.as_deref()));
                 }
             }
             OverlayCmd::RingOverFullscreen(on) => {
@@ -592,7 +591,7 @@ impl Overlay {
                 #[cfg(test)]
                 self.probe(Probe::Ready { ms });
                 if let (Some(v), Some(_)) = (&self.view, &self.timing) {
-                    v.eval(&page::timing_js(self.timing.as_ref()));
+                    v.eval(&page::timing_js(self.timing.as_deref()));
                 }
                 let actions = self.life.ready();
                 self.apply(actions);

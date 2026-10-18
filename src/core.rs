@@ -27,9 +27,13 @@ use crate::autostart;
 use crate::config::{self, Config};
 use crate::conversation::{self, Conversation, FolderInfo};
 use crate::instance::{PairGate, WAITING};
-use crate::lmgw_link::{Credentials, FolderEvent, KeyLoss, LinkEvent, LmgwLink};
+use crate::lmgw_link::tls::{Reach, Tls};
+use crate::lmgw_link::{Credentials, DeviceFacts, FolderEvent, KeyLoss, LinkEvent, LmgwLink};
 use crate::overlay::{OverlayCmd, RingInput};
-use crate::pairing::{self, Committed, DeviceKey, PairError, PairFacts, PairingLink};
+use crate::pairing::{
+    self, Enrolled, NotStored, PairError, PairFacts, Paired, PairingLink, StoredParts, TlsKey,
+    now_ms,
+};
 use crate::paths::Paths;
 use crate::secret::{Lookup, Removed, SecretError, SecretStore};
 use crate::tray::model::{DISABLED, EXPIRED, Link, LinkWait, Pairing, TrayModel};
@@ -51,10 +55,10 @@ pub enum Command {
         accept: bool,
     },
     /// The paste dialog's Pair: the dialog showed the parsed gateway and device first, so the
-    /// owner confirmed there. `shown` is the pairing the dialog said the link replaces (the
-    /// configured `lmgw.url` as it last heard); a pairing that changed meanwhile is refused, so no
-    /// key is deleted the owner was not shown (review KAI-2 K2-5). The answer goes back to the
-    /// dialog.
+    /// owner confirmed there. `shown` is the pairing the dialog said the link replaces (its first
+    /// URL as the dialog last heard); a pairing that changed meanwhile is refused, so no key is
+    /// deleted the owner was not shown (review KAI-2 K2-5). The answer goes back to the dialog once
+    /// the enrolment is done.
     PairPasted {
         link: PairingLink,
         shown: Option<String>,
@@ -70,13 +74,18 @@ pub enum Command {
         request: crate::settings::Request,
         reply: oneshot::Sender<Result<crate::settings::Response, crate::settings::Refusal>>,
     },
+    /// The owner ticked "always allow" in a hosted tool's confirmation and allowed the call
+    /// (`crate::host::server::Shared::always_option`): `policy.tools.<tool> = "allow_trusted"`.
+    AllowAlways {
+        tool: String,
+    },
     /// The configuration window's Personality page: what the core knows of Kai's conversation
     /// (`crate::settings::window::profiles::Conversation`).
     WindowConversation {
         reply: oneshot::Sender<crate::settings::window::profiles::Conversation>,
     },
-    /// One of the Personality page's profile-editor requests: sent to the paired lmgw with the
-    /// device key, lmgw's answer (or the refusal) going back to the scheme handler.
+    /// One of the Personality page's profile-editor requests: sent to the paired lmgw over the
+    /// device link, lmgw's answer (or the refusal) going back to the scheme handler.
     WindowProxy {
         forward: crate::lmgw_link::proxy::Forward,
         reply: oneshot::Sender<crate::lmgw_link::proxy::Proxied>,
@@ -172,6 +181,18 @@ impl std::fmt::Display for PasteError {
     }
 }
 
+/// Which pairing a request went under: the SHA-256 of the device's certificate
+/// (`crate::lmgw_link::tls::Tls::identity`).
+type Identity = [u8; 32];
+
+/// A request to lmgw on its way, and the pairing it went under: its key refusal answers for that
+/// pairing only (the security review's S1: a request of the pairing a same-lmgw re-pair replaced
+/// must not revoke the new one).
+struct Asked<T> {
+    by: Option<Identity>,
+    call: Pending<T>,
+}
+
 /// A folder request's answer (§4's lookup and creation).
 enum FolderAnswer {
     Listed(Result<Vec<FolderInfo>, Refusal>),
@@ -190,7 +211,39 @@ pub enum DashboardPage {
     Chat,
 }
 
-/// The dashboard URL for `page` under the paired base URL.
+/// Where lmgw's dashboard is for this device, as the feed's last `hello` on this pairing said it
+/// (lmgw's device link §7.2): what Open in lmgw opens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Dashboard {
+    /// No `hello` on this pairing yet.
+    NotConnected,
+    /// lmgw sent none: its dashboard listens on its own machine only, and this device is another.
+    NotOffered,
+    /// `hello.dashboard_url` as lmgw sent it.
+    At(String),
+}
+
+/// lmgw's dashboard address as Open in lmgw hands it to `xdg-open`: an `http` or `https` URL with a
+/// host and no user info, query or fragment, returned without a trailing slash. The error is the
+/// rule.
+fn dashboard_base(s: &str) -> Result<String, String> {
+    let u = url::Url::parse(s.trim()).map_err(|e| format!("not a URL ({e})"))?;
+    if !matches!(u.scheme(), "http" | "https") {
+        return Err("the scheme must be http or https".into());
+    }
+    if u.host_str().is_none_or(str::is_empty) {
+        return Err("it has no host".into());
+    }
+    if !u.username().is_empty() || u.password().is_some() || u.query().is_some() {
+        return Err("it must not carry a user name, password or query".into());
+    }
+    if u.fragment().is_some() {
+        return Err("it must not carry a fragment (#…)".into());
+    }
+    Ok(u.as_str().trim_end_matches('/').to_owned())
+}
+
+/// The dashboard URL for `page` under lmgw's dashboard address.
 pub fn dashboard_url(base: &str, page: DashboardPage) -> String {
     let base = base.trim_end_matches('/');
     match page {
@@ -200,6 +253,81 @@ pub fn dashboard_url(base: &str, page: DashboardPage) -> String {
         }
         DashboardPage::Chat => format!("{base}/chat"),
     }
+}
+
+/// The enrolment's call (`crate::pairing::enrol` of the link and the key it sends, bounded by
+/// `lmgw.timeout_s`); the tests give their own.
+pub type Enroller = std::sync::Arc<
+    dyn Fn(PairingLink, TlsKey) -> Pending<Result<Enrolled, PairError>> + Send + Sync,
+>;
+
+/// The key an enrolment sends with a link's token (lmgw's device link §3.3, D8's lost answer): one
+/// per token, kept in memory until another link's enrolment replaces it, so trying the same link
+/// again (the paste dialog's Pair, the link clicked again) sends the same key. While the token
+/// lives lmgw answers that key what it answered it, the same certificate, so an answer lost on the
+/// way (a connection that broke, `lmgw.timeout_s` passing) comes back; a new key would meet 410
+/// `pairing_token_used` and mark the row contested.
+struct EnrolKey {
+    /// The token's SHA-256: the token itself is not kept.
+    token: [u8; 32],
+    key: TlsKey,
+}
+
+/// A confirmed link on its way to lmgw (lmgw's device link §3.4): the link, the paste dialog's
+/// answer when the paste dialog asked, and the call.
+struct Enrolling {
+    link: PairingLink,
+    reply: Option<oneshot::Sender<Result<(), PasteError>>>,
+    call: Pending<Result<Enrolled, PairError>>,
+}
+
+/// A pairing Kai runs from memory because part of it is not stored yet (decision 5 as the owner
+/// settled it, 2026-10-15; the security review's S4): lmgw enrolled it, so Kai connects with it at
+/// once, stores what is missing every `wallet.retry_s`, and says at quit that the pairing is lost
+/// when it still could not.
+struct Unstored {
+    enrolled: Enrolled,
+    /// What is stored already (the wallet's item, `device-link.json`).
+    done: StoredParts,
+    /// Why the rest is not.
+    why: NotStored,
+    /// What the pairing it replaced leaves (another gateway's key item, the bearer key and
+    /// `lmgw.url` from before TLS): deleted once this one is stored, so a restart before then finds
+    /// the old pairing as it was.
+    old: Option<Paired>,
+    v1: Option<String>,
+}
+
+/// A link's first URL, which names it in the dialogs and the tooltip.
+fn first_url(link: &PairingLink) -> String {
+    link.urls.as_slice()[0].clone()
+}
+
+/// What a pairing from before TLS says (lmgw's device link §12).
+fn before_tls(url: &str) -> String {
+    format!(
+        "Kai was paired with lmgw at {url} before TLS, which lmgw no longer accepts: pair it again \
+         with a new link from lmgw's Devices card"
+    )
+}
+
+/// What a lapsed certificate says (lmgw's device link §5.3): Kai knows its own date.
+fn lapsed(p: &Paired) -> String {
+    format!(
+        "this device's certificate lapsed on {}; pair it again",
+        p.not_after()
+    )
+}
+
+/// The tooltip's line from the certificate's `notice_after` on (lmgw's device link §5.3); `None`
+/// before it.
+fn certificate_note(p: &Paired) -> Option<String> {
+    (p.credentials.state(now_ms()) != lmgw_client::requests::CredentialState::Valid).then(|| {
+        format!(
+            "this device's certificate lapses on {}; pair it again before then",
+            p.not_after()
+        )
+    })
 }
 
 /// A link from the scheme handler on its way to the owner (K13). It lives only in memory: it
@@ -262,10 +390,13 @@ pub struct Core<S, L, A, V> {
     /// The Kai conversation's folder (§4).
     conversation: Conversation,
     /// The folder lookup or creation on its way (a newer one replaces it).
-    folder_req: Option<Pending<FolderAnswer>>,
+    folder_req: Option<Asked<FolderAnswer>>,
     /// The one question after the feed's `revoked` of a kind Kai does not know: does the key
     /// still open lmgw (§3.3, [`Core::revoked_unknown`])?
-    key_ask: Option<Pending<Result<(), Refusal>>>,
+    key_ask: Option<Asked<Result<(), Refusal>>>,
+    /// The pairing the link runs now (`None` while none runs): what a request is tagged with
+    /// ([`Asked`]).
+    identity: Option<Identity>,
     /// The last sentence of a revocation of a kind Kai does not know that was said: said once per
     /// reason (review KAI-4 K4-7); a revocation that decides clears it.
     unknown_said: Option<String>,
@@ -277,6 +408,20 @@ pub struct Core<S, L, A, V> {
     sets: personality::Sets,
     /// Writing `conversation.folder_id` failed: why (a tooltip line until it works).
     remember_error: Option<String>,
+    /// The stored pairing (`device-link.json`): lmgw's URLs, the certificates, the dates.
+    paired: Option<Paired>,
+    /// A confirmed link's enrolment on its way (one at a time).
+    enrolling: Option<Enrolling>,
+    /// The pairing Kai runs from memory while part of it is not stored yet ([`Unstored`]).
+    unstored: Option<Unstored>,
+    enroller: Enroller,
+    /// The key the last link's enrolment sent ([`EnrolKey`]).
+    enrol_key: Option<EnrolKey>,
+    /// What the link of the pairing that runs connects with (its reach and TLS, shared with the
+    /// feed, the voice and the host link): the feed's `hello` refreshes them.
+    link_creds: Option<Credentials>,
+    /// lmgw's dashboard for this device, from the feed's `hello` ([`Dashboard`]).
+    dashboard: Dashboard,
     /// The updater's requests (the tray's check); `None` in tests that run none.
     updates: Option<mpsc::UnboundedSender<crate::update::Request>>,
     /// The hosted MCP server (PD2).
@@ -328,6 +473,12 @@ impl<S: SecretStore, L: LmgwLink, A: AudioPort, V: VoiceLink> Core<S, L, A, V> {
         voice.set_folder(conversation.initial());
         model.voice = voice.model(Instant::now());
         let start_listening = config.voice.on_at_start;
+        let (timeout, stagger) = (config.lmgw.timeout(), config.lmgw.url_stagger());
+        let enroller: Enroller = std::sync::Arc::new(move |link: PairingLink, key: TlsKey| {
+            Box::pin(async move {
+                pairing::enrol(&link, &key, &pairing::client_text(), timeout, stagger).await
+            })
+        });
         let (_, link_events) = mpsc::unbounded_channel();
         let (audio, audio_events) = audio;
         Self {
@@ -358,8 +509,16 @@ impl<S: SecretStore, L: LmgwLink, A: AudioPort, V: VoiceLink> Core<S, L, A, V> {
             profiles_req: None,
             sets: personality::Sets::default(),
             key_ask: None,
+            identity: None,
             unknown_said: None,
             remember_error: None,
+            paired: None,
+            enrolling: None,
+            unstored: None,
+            enroller,
+            enrol_key: None,
+            link_creds: None,
+            dashboard: Dashboard::NotConnected,
             updates: None,
             hosting: hosting::Hosting::default(),
             screen: crate::screen_lock::ScreenLock::default(),
@@ -372,6 +531,12 @@ impl<S: SecretStore, L: LmgwLink, A: AudioPort, V: VoiceLink> Core<S, L, A, V> {
             #[cfg(test)]
             opened: None,
         }
+    }
+
+    /// The enrolment's call (the tests' own).
+    #[cfg(test)]
+    pub fn set_enroller(&mut self, enroller: Enroller) {
+        self.enroller = enroller;
     }
 
     /// The gate the D-Bus `Pair` shares (`instance::PairingService`).
@@ -442,12 +607,12 @@ impl<S: SecretStore, L: LmgwLink, A: AudioPort, V: VoiceLink> Core<S, L, A, V> {
                 wake = self.voice.next() => self.voice.handle(wake, &self.audio).await,
                 answer = async {
                     match self.folder_req.as_mut() {
-                        Some(f) => f.as_mut().await,
+                        Some(f) => f.call.as_mut().await,
                         None => std::future::pending().await,
                     }
                 } => {
-                    self.folder_req = None;
-                    self.on_folder_answer(answer).await;
+                    let by = self.folder_req.take().and_then(|f| f.by);
+                    self.on_folder_answer(by, answer).await;
                 }
                 answer = async {
                     match self.profiles_req.as_mut() {
@@ -459,14 +624,23 @@ impl<S: SecretStore, L: LmgwLink, A: AudioPort, V: VoiceLink> Core<S, L, A, V> {
                     self.on_profiles_answer(answer);
                 }
                 Some((id, step)) = self.sets.next() => self.on_personality_step(id, step).await,
-                answer = async {
-                    match self.key_ask.as_mut() {
-                        Some(f) => f.as_mut().await,
+                done = async {
+                    match self.enrolling.as_mut() {
+                        Some(e) => e.call.as_mut().await,
                         None => std::future::pending().await,
                     }
                 } => {
-                    self.key_ask = None;
-                    self.on_key_answer(answer).await;
+                    let e = self.enrolling.take().expect("polled above");
+                    self.enrolled(e, done).await;
+                }
+                answer = async {
+                    match self.key_ask.as_mut() {
+                        Some(f) => f.call.as_mut().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    let by = self.key_ask.take().and_then(|f| f.by);
+                    self.on_key_answer(by, answer).await;
                 }
                 () = tokio::time::sleep_until(retry_at.unwrap_or_else(Instant::now)), if retry_at.is_some() => {
                     self.retry_at = None;
@@ -517,7 +691,7 @@ impl<S: SecretStore, L: LmgwLink, A: AudioPort, V: VoiceLink> Core<S, L, A, V> {
             }
         }
         if let Some(t) = self.voice.take_timing() {
-            self.set_ring_timing(Some(t));
+            self.set_ring_timing(Some(Box::new(t)));
         }
         let ring = self.voice.ring(now);
         self.set_ring(ring);
@@ -556,41 +730,66 @@ impl<S: SecretStore, L: LmgwLink, A: AudioPort, V: VoiceLink> Core<S, L, A, V> {
         matches!(self.model.pairing, Pairing::Paired { .. })
     }
 
+    /// What a voice command says while Kai has no working pairing: why, as the tray says it.
     fn not_paired(&self) {
         tracing::info!("voice: not paired");
-        if matches!(self.model.pairing, Pairing::Disabled { .. }) {
-            return self.notify(
+        const PAIR: &str = "the tray's \"Pair with lmgw…\"";
+        match &self.model.pairing {
+            Pairing::Disabled { .. } => self.notify(
                 "Kai: this device is disabled",
                 format!("{DISABLED}; then the tray's \"Try again\""),
-            );
-        }
-        if matches!(self.model.pairing, Pairing::Expired { .. }) {
-            return self.notify(
+            ),
+            Pairing::Expired { .. } => self.notify(
                 "Kai: this device's key expired",
                 format!("{EXPIRED}; then the tray's \"Try again\""),
-            );
+            ),
+            Pairing::PairAgain { why } => self.notify("Kai: pair again", format!("{why} ({PAIR})")),
+            Pairing::Revoked { reason } => self.notify(
+                "Kai: pair again",
+                format!("this device's key was revoked ({reason}); pair again ({PAIR})"),
+            ),
+            Pairing::WalletLocked { .. } => self.notify(
+                "Kai: the wallet is locked",
+                "unlock KWallet: Kai reads its pairing then".to_owned(),
+            ),
+            Pairing::WalletError { message, .. } => self.notify(
+                "Kai: the wallet is not available",
+                format!("{message}; Kai reads its pairing once it is"),
+            ),
+            _ => self.notify("Kai is not paired", format!("pair with lmgw first: {PAIR}")),
         }
+    }
+
+    /// lmgw waits for the owner to confirm this device's code (lmgw's device link §3.5): a voice
+    /// command says so instead of "lmgw is not running". `true` when it was said.
+    fn says_unconfirmed(&self) -> bool {
+        let Pairing::Paired {
+            link: Link::Unconfirmed { code, .. },
+            ..
+        } = &self.model.pairing
+        else {
+            return false;
+        };
         self.notify(
-            "Kai is not paired",
-            "pair with lmgw first: the tray's \"Pair with lmgw…\"".to_owned(),
+            "Kai waits for your confirmation",
+            format!("confirm the code {code} on lmgw's Devices card; Kai connects then"),
         );
+        true
     }
 
     async fn handle(&mut self, cmd: Command) {
         match cmd {
             Command::Arrived(link) => self.arrived(link).await,
             Command::ConfirmPair { id, accept } => self.confirmed(id, accept).await,
-            Command::PairPasted { link, shown, reply } => {
-                let result = self.pasted(link, shown).await;
-                let _ = reply.send(result);
-            }
+            Command::PairPasted { link, shown, reply } => self.pasted(link, shown, reply).await,
             Command::OpenPairDialog => self.ui_send(UiCmd::ShowPairDialog {
-                current: self.config.lmgw.url.clone(),
+                current: self.current_url(),
             }),
             Command::OpenSettings => self.ui_send(UiCmd::ShowSettings),
             Command::Setting { request, reply } => {
                 let _ = reply.send(self.apply_request(request));
             }
+            Command::AllowAlways { tool } => self.allow_always(&tool),
             Command::WindowConversation { reply } => {
                 let _ = reply.send(self.window_conversation());
             }
@@ -652,16 +851,22 @@ impl<S: SecretStore, L: LmgwLink, A: AudioPort, V: VoiceLink> Core<S, L, A, V> {
                         self.not_paired();
                     }
                 } else if down {
-                    self.voice.talk_press(&self.audio).await;
+                    if !self.says_unconfirmed() {
+                        self.voice.talk_press(&self.audio).await;
+                    }
                 } else {
                     self.voice.talk_release(&self.audio).await;
                 }
             }
             Command::ToggleListening if self.paired() => {
-                self.voice.toggle_listening(&self.audio).await
+                if !self.says_unconfirmed() {
+                    self.voice.toggle_listening(&self.audio).await
+                }
             }
             Command::SetListening(on) if self.paired() => {
-                self.voice.set_listening(on, &self.audio).await
+                if !(on && self.says_unconfirmed()) {
+                    self.voice.set_listening(on, &self.audio).await
+                }
             }
             Command::ToggleListening | Command::SetListening(_) => self.not_paired(),
             Command::ToggleMute => self.voice.toggle_mute(),
@@ -705,16 +910,52 @@ impl<S: SecretStore, L: LmgwLink, A: AudioPort, V: VoiceLink> Core<S, L, A, V> {
         }
     }
 
-    /// Reads the key for the configured `lmgw.url` and starts the link when there is one.
+    /// The pairing's first URL, which names it in the dialogs (`None`: not paired).
+    fn current_url(&self) -> Option<String> {
+        self.paired.as_ref().map(|p| p.first_url().to_owned())
+    }
+
+    /// Reads the stored pairing and its key, and starts the link when there is one. A pairing whose
+    /// certificate lapsed is not tried (lmgw's device link §5.3: Kai knows its own date). Nothing
+    /// is loaded while a pairing is on its way (an enrolment, or one the wallet has not taken
+    /// yet): the stored one must not connect beside it (the security review's S2).
     async fn load(&mut self) {
-        let Some(url) = self.config.lmgw.url.clone() else {
-            tracing::info!("not paired (no lmgw.url in the configuration)");
+        if self.enrolling.is_some() || self.unstored.is_some() {
+            tracing::info!("a pairing is on its way: the stored one is not loaded meanwhile");
+            return;
+        }
+        let paired = match Paired::load(&self.paths.device_link_file) {
+            Ok(p) => p,
+            Err(why) => {
+                tracing::warn!("the stored pairing: {why}");
+                self.paired = None;
+                return self.set_pairing(Pairing::PairAgain { why });
+            }
+        };
+        self.paired = paired.clone();
+        let Some(paired) = paired else {
+            if let Some(url) = self.config.lmgw.url.clone() {
+                tracing::info!(%url, "paired before TLS (lmgw.url): Kai asks to pair again");
+                return self.set_pairing(Pairing::PairAgain {
+                    why: before_tls(&url),
+                });
+            }
+            tracing::info!("not paired (no device-link.json)");
             return self.set_pairing(Pairing::NotPaired);
         };
-        match self.store.load(&url).await {
-            Ok(Lookup::Found(key)) => self.connect(url, key),
+        if paired.credentials.state(now_ms()) == lmgw_client::requests::CredentialState::Lapsed {
+            tracing::info!(
+                not_after = %paired.not_after(),
+                "the device's certificate lapsed; Kai asks to pair again"
+            );
+            return self.set_pairing(Pairing::PairAgain {
+                why: lapsed(&paired),
+            });
+        }
+        match self.store.load(&paired.fp).await {
+            Ok(Lookup::Found(key)) => self.connect(&paired, &key),
             Ok(Lookup::NotFound) => {
-                tracing::info!(%url, "not paired (no key in the wallet for this lmgw)");
+                tracing::info!(url = %paired.first_url(), "not paired (no key in the wallet for this pairing)");
                 self.set_pairing(Pairing::NotPaired);
             }
             Ok(Lookup::Locked) => self.wallet_locked(),
@@ -724,8 +965,9 @@ impl<S: SecretStore, L: LmgwLink, A: AudioPort, V: VoiceLink> Core<S, L, A, V> {
 
     /// The tray's Try again (§3.3, review KAI-3 K3-6): the device was disabled on lmgw, or its key
     /// expired, and the owner says it may be enabled again or its expiry was moved. The stored key
-    /// opens the feed once more; its `hello` is connected, and a device still disabled or a key
-    /// still expired answers 401 `device_disabled` or `key_expired` again.
+    /// (or the one Kai runs from memory, [`Unstored`]) opens the feed once more; its `hello` is
+    /// connected, and a device still disabled or a key still expired answers 401 `device_disabled`
+    /// or `key_expired` again. Nothing while an enrolment is on its way (S2).
     async fn try_again(&mut self) {
         if !matches!(
             self.model.pairing,
@@ -733,13 +975,25 @@ impl<S: SecretStore, L: LmgwLink, A: AudioPort, V: VoiceLink> Core<S, L, A, V> {
         ) {
             return;
         }
-        tracing::info!("the owner asked to try the stored device key again");
+        if self.enrolling.is_some() {
+            tracing::info!("Try again while Kai enrols: the enrolment decides");
+            return;
+        }
+        if let Some(u) = &self.unstored {
+            tracing::info!("the owner asked to try the pairing Kai runs from memory again");
+            let (paired, key) = (u.enrolled.paired.clone(), u.enrolled.key.clone());
+            return self.connect(&paired, &key);
+        }
+        tracing::info!("the owner asked to try the stored pairing again");
         self.load().await;
     }
 
-    /// The wallet check every `wallet.retry_s`: Kai's own key while the wallet was locked or
-    /// failing, and a link that waits for the wallet.
+    /// The wallet check every `wallet.retry_s`: what of the pairing Kai runs is not stored yet,
+    /// Kai's own key while the wallet was locked or failing, and a link that waits for the wallet.
     async fn retry(&mut self) {
+        if self.unstored.is_some() {
+            self.store_unstored().await;
+        }
         if matches!(
             self.model.pairing,
             Pairing::WalletLocked { .. } | Pairing::WalletError { .. }
@@ -762,27 +1016,15 @@ impl<S: SecretStore, L: LmgwLink, A: AudioPort, V: VoiceLink> Core<S, L, A, V> {
     /// further link is refused and the waiting one stays as it is (review KAI-2 K2-4; the D-Bus
     /// `Pair` refuses it before it gets here, through the gate).
     async fn arrived(&mut self, link: PairingLink) {
-        if let Err(why) = pairing::verify_fingerprint(&link) {
-            tracing::warn!("pairing link refused: {why}");
-            if self.arrival.is_none() {
-                self.gate.release();
-            }
-            self.model.pair_error = Some(why.clone());
-            self.publish();
-            self.notify("Kai could not pair", why);
-            return;
-        }
         if let Some(waiting) = &self.arrival {
+            let url = first_url(&waiting.link);
             tracing::warn!(
-                waiting = %waiting.link.url,
+                waiting = %url,
                 "a pairing link arrived while another waits: refused ({WAITING})"
             );
             self.notify(
                 "Kai could not pair",
-                format!(
-                    "{WAITING} (for {}): answer that first; this link was not kept",
-                    waiting.link.url
-                ),
+                format!("{WAITING} (for {url}): answer that first; this link was not kept"),
             );
             return;
         }
@@ -790,7 +1032,7 @@ impl<S: SecretStore, L: LmgwLink, A: AudioPort, V: VoiceLink> Core<S, L, A, V> {
         // The caller is not authenticated (any process of the session can hand a link over, any
         // web page can open one): the owner decides.
         tracing::info!(
-            url = %link.url,
+            url = %first_url(&link),
             device = %link.name,
             "a pairing link arrived; Kai asks the owner to confirm it"
         );
@@ -810,16 +1052,17 @@ impl<S: SecretStore, L: LmgwLink, A: AudioPort, V: VoiceLink> Core<S, L, A, V> {
         let Some(a) = self.arrival.as_ref().filter(|a| a.stage == Stage::Wallet) else {
             return;
         };
-        let url = a.link.url.clone();
+        let url = first_url(&a.link);
         match self.store.locked().await {
             Ok(false) => {
+                let current = self.current_url();
                 let a = self.arrival.as_mut().expect("checked above");
                 a.stage = Stage::Owner;
                 let request = ConfirmRequest {
                     id: a.id,
-                    facts: PairFacts::new(&a.link, self.config.lmgw.url.as_deref()),
+                    facts: PairFacts::new(&a.link, current.as_deref()),
                     #[cfg(feature = "live-test")]
-                    live_accept: crate::live_test::accepts(&a.link.url, a.link.key.expose()),
+                    live_accept: crate::live_test::accepts(&url, a.link.token.expose()),
                 };
                 self.model.link_wait = Some(LinkWait::Owner { url });
                 self.ui_send(UiCmd::ConfirmPair(request));
@@ -852,7 +1095,7 @@ impl<S: SecretStore, L: LmgwLink, A: AudioPort, V: VoiceLink> Core<S, L, A, V> {
         self.publish();
     }
 
-    /// The owner's answer in the confirmation dialog. Declining changes nothing.
+    /// The owner's answer in the confirmation dialog. Declining changes nothing; confirming enrols.
     async fn confirmed(&mut self, id: u64, accept: bool) {
         let Some(a) = self
             .arrival
@@ -864,142 +1107,363 @@ impl<S: SecretStore, L: LmgwLink, A: AudioPort, V: VoiceLink> Core<S, L, A, V> {
         self.model.link_wait = None;
         self.gate.release();
         if !accept {
-            tracing::info!(url = %a.link.url, "the owner declined the pairing link; nothing changed");
+            tracing::info!(url = %first_url(&a.link), "the owner declined the pairing link; nothing changed");
             self.publish();
             return;
         }
-        tracing::info!(url = %a.link.url, "the owner confirmed the pairing link");
-        match self.commit(&a.link).await {
-            Ok(Committed::Stored { .. }) => self.notify(
-                "Kai is paired with lmgw",
-                format!("device '{}' at {}", a.link.name, a.link.url),
-            ),
-            Ok(Committed::WalletLocked) => {
-                tracing::info!(
-                    "the wallet locked before the link was stored; Kai asks again once it opens"
-                );
-                self.gate.hold();
-                self.arrival = Some(Arrival {
-                    stage: Stage::Wallet,
-                    told_locked: false,
-                    ..a
-                });
-                self.offer_arrival().await;
-            }
-            Err(e) => self.pair_failed(e),
-        }
+        tracing::info!(url = %first_url(&a.link), "the owner confirmed the pairing link");
+        self.begin_enrol(a.link, None).await;
     }
 
     /// The paste dialog's Pair (it showed the facts first). A locked wallet is said in the dialog:
     /// the owner is right there, so nothing waits. The pairing it replaces is checked against what
-    /// the dialog showed, here at the commit, where nothing can change it in between (K2-5).
-    async fn pasted(&mut self, link: PairingLink, shown: Option<String>) -> Result<(), PasteError> {
-        if shown != self.config.lmgw.url {
+    /// the dialog showed, here at the commit, where nothing can change it in between (K2-5). The
+    /// answer goes back once the enrolment is done.
+    async fn pasted(
+        &mut self,
+        link: PairingLink,
+        shown: Option<String>,
+        reply: oneshot::Sender<Result<(), PasteError>>,
+    ) {
+        let current = self.current_url();
+        if shown != current {
             tracing::info!(
                 shown = ?shown,
-                now = ?self.config.lmgw.url,
+                now = ?current,
                 "the paste dialog showed another pairing than Kai has now; it shows the facts again"
             );
-            return Err(PasteError::Changed {
-                current: self.config.lmgw.url.clone(),
-            });
+            let _ = reply.send(Err(PasteError::Changed { current }));
+            return;
         }
-        match self.commit(&link).await {
-            Ok(Committed::Stored { .. }) => {
-                if let Some(a) = self.arrival.take() {
-                    tracing::info!(
-                        url = %a.link.url,
-                        "the owner paired by paste; the link that waited is dropped"
-                    );
-                    self.model.link_wait = None;
-                    self.gate.release();
-                    self.ui_send(UiCmd::WithdrawConfirm(a.id));
-                    self.publish();
-                }
-                Ok(())
-            }
-            Ok(Committed::WalletLocked) => Err(PasteError::Failed(
-                "KWallet is locked: unlock it, then press Pair again (nothing was stored)".into(),
+        let refused = match self.store.locked().await {
+            Ok(false) => None,
+            Ok(true) => Some(
+                "KWallet is locked: unlock it, then press Pair again (nothing was sent to lmgw)"
+                    .to_owned(),
+            ),
+            Err(e) => Some(format!(
+                "the wallet is not available ({e}): nothing was sent to lmgw"
             )),
-            Err(e) => {
-                let msg = e.to_string();
-                tracing::warn!("pairing failed: {msg}");
-                self.model.pair_error = Some(msg.clone());
-                self.publish();
-                Err(PasteError::Failed(msg))
-            }
+        };
+        if let Some(why) = refused {
+            let _ = reply.send(Err(PasteError::Failed(why)));
+            return;
         }
+        if let Some(a) = self.arrival.take() {
+            tracing::info!(
+                url = %first_url(&a.link),
+                "the owner paired by paste; the link that waited is dropped"
+            );
+            self.model.link_wait = None;
+            self.gate.release();
+            self.ui_send(UiCmd::WithdrawConfirm(a.id));
+        }
+        self.begin_enrol(link, Some(reply)).await;
     }
 
-    /// Stores a link the owner confirmed (§3.1 step 3) and switches to it. A first pairing turns
-    /// "Start with Plasma" on (§13).
-    async fn commit(&mut self, link: &PairingLink) -> Result<Committed, PairError> {
-        self.model.pair_error = None;
-        let current = self.config.lmgw.url.clone();
-        let done = pairing::commit(&self.store, &self.paths, current.as_deref(), link).await?;
-        if let Committed::Stored { first } = done {
-            tracing::info!(url = %link.url, device = %link.name, first, "paired: the device key is stored");
-            self.config.lmgw.url = Some(link.url.clone());
-            if first {
-                self.set_autostart(true);
-            }
-            // The session bound on the gateway (or under the key) this pairing replaces ends.
-            self.voice.leave_gateway().await;
-            self.voice.feed(false, Some("connecting".into()));
-            // The jobs the old key's link admitted: no link of the new key follows them (WP18).
-            if current.is_some() {
-                self.jobs.cancel_all("Kai: its pairing was replaced");
-            }
-            if current.as_deref() != Some(link.url.as_str()) {
-                // Another gateway: its folders are not the old one's (§4).
-                self.folder_req = None;
-                self.profiles_req = None;
-                self.personality.reset();
-                self.drop_personality_sets();
-                self.conversation.reset();
-                self.voice.set_folder(None);
-                if self.config.conversation.folder_id.is_some() {
-                    self.remember_folder(None);
+    /// Enrols a link the owner confirmed (lmgw's device link §3.4). The pairing it replaces drops
+    /// its connections first (kai §3.1's order: lmgw ends the old key's links when the token is
+    /// used, which must not read as a revocation here), and comes back when the enrolment fails.
+    async fn begin_enrol(
+        &mut self,
+        link: PairingLink,
+        reply: Option<oneshot::Sender<Result<(), PasteError>>>,
+    ) {
+        if self.enrolling.is_some() || self.unstored.is_some() {
+            let why = match &self.unstored {
+                Some(u) => format!(
+                    "Kai's pairing with lmgw at {} is not stored yet ({}): Kai pairs again once it \
+                     is",
+                    u.enrolled.paired.first_url(),
+                    u.why
+                ),
+                None => "Kai is pairing already: wait for it to finish, then try again".to_owned(),
+            };
+            tracing::info!("a second enrolment while one is on its way: refused");
+            match reply {
+                Some(r) => {
+                    let _ = r.send(Err(PasteError::Failed(why)));
                 }
-                self.model.conversation = self.conversation_notes();
+                None => self.notify("Kai could not pair", why),
             }
-            self.connect(link.url.clone(), link.key.clone());
-            // The owner's decision (2026-10-07): a re-pair to another gateway deletes Kai's own
-            // key for the old one. The same URL's item was replaced by the store.
-            if let Some(old) = current.filter(|old| *old != link.url) {
-                self.forget_key(&old).await;
-            }
+            return;
         }
-        Ok(done)
+        let url = first_url(&link);
+        let key = match self.key_for(&link) {
+            Ok(key) => key,
+            Err(why) => {
+                tracing::warn!(%url, "pairing failed: {why}");
+                return self.pairing_failed(format!("cannot make the device's key: {why}"), reply);
+            }
+        };
+        self.model.pair_error = None;
+        self.model.link_wait = Some(LinkWait::Enrolling { url: url.clone() });
+        self.leave_pairing(&format!("paused while Kai pairs with {url}"))
+            .await;
+        let call = (self.enroller)(link.clone(), key);
+        self.enrolling = Some(Enrolling { link, reply, call });
+        self.publish();
     }
 
-    /// Deletes Kai's own wallet item for `url` (a gateway Kai no longer pairs with). A failure
+    /// The key to enrol with `link` ([`EnrolKey`]): the one sent with its token before, else a new
+    /// one, kept for the token.
+    fn key_for(&mut self, link: &PairingLink) -> Result<TlsKey, String> {
+        use sha2::Digest;
+        let token: [u8; 32] = sha2::Sha256::digest(link.token.expose().as_bytes()).into();
+        if let Some(k) = self.enrol_key.as_ref().filter(|k| k.token == token) {
+            tracing::info!(url = %first_url(link), "pairing: this link again; Kai enrols the key it sent with it before");
+            return Ok(k.key.clone());
+        }
+        let key = TlsKey::generate()?;
+        tracing::info!(url = %first_url(link), "pairing: enrolling a new key");
+        self.enrol_key = Some(EnrolKey {
+            token,
+            key: key.clone(),
+        });
+        Ok(key)
+    }
+
+    /// Ends what the current pairing runs (the feed, the tool link, the voice session) without
+    /// forgetting it. Its requests on their way go too (the folder's, the profiles', the
+    /// personality's, the key's question): each went under this pairing, and is asked again at the
+    /// next `hello` (the security review's S1).
+    async fn leave_pairing(&mut self, note: &str) {
+        self.voice.leave_gateway().await;
+        self.voice.link_mut().set_credentials(None);
+        self.voice.feed(false, Some(note.to_owned()));
+        self.link.stop();
+        self.host_stop();
+        self.link_events = mpsc::unbounded_channel().1;
+        self.link_creds = None;
+        self.drop_requests();
+        if let Pairing::Paired { link, .. } = &mut self.model.pairing {
+            *link = Link::Down {
+                note: note.to_owned(),
+            };
+        }
+    }
+
+    /// The enrolment's answer: stored and switched to, or said; on any failure the pairing Kai had
+    /// connects again.
+    async fn enrolled(&mut self, e: Enrolling, done: Result<Enrolled, PairError>) {
+        self.model.link_wait = None;
+        match done {
+            Ok(enrolled) => self.store_enrolled(enrolled, e.reply).await,
+            Err(err) => {
+                tracing::warn!(url = %first_url(&e.link), "pairing failed: {err}");
+                self.pairing_failed(err.to_string(), e.reply);
+                self.load().await;
+            }
+        }
+    }
+
+    /// Stores an enrolment (the key in the wallet, the rest in `device-link.json`) and switches to
+    /// it. lmgw has enrolled the key and its token is used, so Kai connects with the enrolment
+    /// whether or not it could store it: what is missing (a wallet that locked meanwhile or fails,
+    /// a write that failed) is stored every `wallet.retry_s` ([`Unstored`]; decision 5 as the owner
+    /// settled it, 2026-10-15, and the security review's S4).
+    async fn store_enrolled(
+        &mut self,
+        enrolled: Enrolled,
+        reply: Option<oneshot::Sender<Result<(), PasteError>>>,
+    ) {
+        self.model.link_wait = None;
+        let mut done = StoredParts::default();
+        let stored = pairing::store(&self.store, &self.paths, &enrolled, &mut done).await;
+        if let Some(r) = reply {
+            let _ = r.send(Ok(()));
+        }
+        let (old, v1) = self.switch_to(&enrolled).await;
+        match stored {
+            Ok(()) => self.forget_old(old, v1).await,
+            Err(why) => {
+                let url = enrolled.paired.first_url().to_owned();
+                tracing::warn!(%url, ?done, "the new pairing is not stored yet: {why}; Kai runs it from memory");
+                self.notify(
+                    "Kai: the pairing is not stored yet",
+                    format!(
+                        "Kai is paired with lmgw at {url} and connects, but could not store the \
+                         pairing yet ({why}). Kai tries again every {} s; quitting Kai before then \
+                         loses the pairing",
+                        self.config.wallet.retry_s
+                    ),
+                );
+                self.unstored = Some(Unstored {
+                    enrolled,
+                    done,
+                    why,
+                    old,
+                    v1,
+                });
+                self.show_unstored();
+                self.schedule_retry();
+            }
+        }
+    }
+
+    /// Stores what of the pairing Kai runs from memory is still missing; once it is all stored,
+    /// the pairing it replaced is cleaned up and the tooltip's line goes.
+    async fn store_unstored(&mut self) {
+        let Some(mut u) = self.unstored.take() else {
+            return;
+        };
+        match pairing::store(&self.store, &self.paths, &u.enrolled, &mut u.done).await {
+            Ok(()) => {
+                let url = u.enrolled.paired.first_url().to_owned();
+                tracing::info!(%url, "the pairing Kai ran from memory is stored now");
+                self.notify(
+                    "Kai stored its pairing",
+                    format!("the pairing with lmgw at {url} is stored now and survives a restart"),
+                );
+                self.show_unstored();
+                self.forget_old(u.old, u.v1).await;
+            }
+            Err(why) => {
+                tracing::info!(done = ?u.done, "the pairing is still not stored: {why}");
+                u.why = why;
+                self.unstored = Some(u);
+                self.show_unstored();
+                self.schedule_retry();
+            }
+        }
+    }
+
+    /// The tooltip's line for the pairing Kai runs from memory, or none.
+    fn show_unstored(&mut self) {
+        self.model.unstored = self.unstored.as_ref().map(|u| {
+            format!(
+                "the pairing is not stored yet ({}): Kai tries again every {} s; quitting Kai \
+                 before then loses it",
+                u.why, self.config.wallet.retry_s
+            )
+        });
+        self.publish();
+    }
+
+    /// A pairing that did not complete: said in the paste dialog when it asked, else as a
+    /// notification; the tooltip says it until the next attempt.
+    fn pairing_failed(
+        &mut self,
+        msg: String,
+        reply: Option<oneshot::Sender<Result<(), PasteError>>>,
+    ) {
+        self.model.pair_error = Some(msg.clone());
+        self.publish();
+        match reply {
+            Some(r) => {
+                let _ = r.send(Err(PasteError::Failed(msg)));
+            }
+            None => self.notify("Kai could not pair", msg),
+        }
+    }
+
+    /// Switches to an enrolment (§3.1 step 3). A first pairing turns "Start with Plasma" on
+    /// (§13). The owner confirms the code on lmgw's Devices card, checking the one it shows against
+    /// Kai's or entering Kai's (Kai never confirms itself: lmgw's `device_confirm` is the owner's);
+    /// until then lmgw answers the feed `device_unconfirmed`, which the tray shows with the code.
+    /// Returns what the pairing it replaced leaves, for [`Core::forget_old`] once the new one is
+    /// stored: another gateway's pairing, and `lmgw.url` from before TLS.
+    async fn switch_to(&mut self, enrolled: &Enrolled) -> (Option<Paired>, Option<String>) {
+        let p = &enrolled.paired;
+        let old = self.paired.replace(p.clone());
+        let v1 = self.config.lmgw.url.clone();
+        let first = old.is_none() && v1.is_none();
+        tracing::info!(urls = ?p.credentials.urls.as_slice(), device = %p.name, first, "paired with the new key");
+        if first {
+            self.set_autostart(true);
+        }
+        self.voice.feed(false, Some("connecting".into()));
+        // The jobs the old pairing's link admitted: no link of the new one follows them (WP18).
+        if old.is_some() || v1.is_some() {
+            self.jobs.cancel_all("Kai: its pairing was replaced");
+        }
+        if old.as_ref().is_none_or(|o| o.fp != p.fp) {
+            // Another gateway: its folders are not the old one's (§4).
+            self.folder_req = None;
+            self.profiles_req = None;
+            self.personality.reset();
+            self.drop_personality_sets();
+            self.conversation.reset();
+            self.voice.set_folder(None);
+            if self.config.conversation.folder_id.is_some() {
+                self.remember_folder(None);
+            }
+            self.model.conversation = self.conversation_notes();
+        }
+        self.connect(p, &enrolled.key);
+        self.notify(
+            "Kai is paired with lmgw",
+            format!(
+                "device '{}' at {}: confirm the code {code} on lmgw's Devices card (check that \
+                 the card shows {code}, or enter it where the card asks for it); Kai connects then",
+                p.name,
+                p.first_url(),
+                code = p.credentials.confirm_code
+            ),
+        );
+        (old.filter(|o| o.fp != p.fp), v1)
+    }
+
+    /// What the replaced pairing leaves goes once the new one is stored. The owner's decision
+    /// (2026-10-07): a re-pair to another gateway deletes Kai's own key for the old one (the same
+    /// gateway's item was replaced by the store); and the pairing from before TLS goes.
+    async fn forget_old(&mut self, old: Option<Paired>, v1: Option<String>) {
+        if let Some(old) = old {
+            self.forget_key(&old).await;
+        }
+        if let Some(url) = v1 {
+            self.forget_v1(&url).await;
+        }
+    }
+
+    /// Deletes Kai's own wallet item for `old` (a gateway Kai no longer pairs with). A failure
     /// leaves it, logged and said.
-    async fn forget_key(&mut self, url: &str) {
-        let why = match self.store.delete(url).await {
+    async fn forget_key(&mut self, old: &Paired) {
+        let url = old.first_url();
+        let why = match self.store.delete(&old.fp).await {
             Ok(Removed::Items(n)) => {
-                tracing::info!(%url, items = n, "the old gateway's device key is deleted from the wallet");
+                tracing::info!(%url, items = n, "the old gateway's key is deleted from the wallet");
                 return;
             }
             Ok(Removed::Locked) => "the wallet is locked".to_owned(),
             Err(e) => e.to_string(),
         };
-        tracing::warn!(%url, "the old gateway's device key stays in the wallet: {why}");
+        tracing::warn!(%url, "the old gateway's key stays in the wallet: {why}");
         self.notify(
-            "Kai: the old device key stays",
+            "Kai: the old key stays",
             format!(
-                "Kai could not delete the device key it kept for {url} ({why}); delete Kai's item \
-                 for {url} in KWallet"
+                "Kai could not delete the key it kept for lmgw at {url} ({why}); delete Kai's item \
+                 for {} in KWallet",
+                old.fp
             ),
         );
     }
 
-    fn pair_failed(&mut self, e: PairError) {
-        let msg = e.to_string();
-        tracing::warn!("pairing failed: {msg}");
-        self.model.pair_error = Some(msg.clone());
-        self.publish();
-        self.notify("Kai could not pair", msg);
+    /// The pairing from before TLS (lmgw's device link §12) goes once Kai is paired again: its
+    /// bearer key's wallet item and `lmgw.url`. A failure leaves them, logged and said.
+    async fn forget_v1(&mut self, url: &str) {
+        let why = match self.store.delete_v1(url).await {
+            Ok(Removed::Items(n)) => {
+                tracing::info!(%url, items = n, "the bearer key from before TLS is deleted from the wallet");
+                None
+            }
+            Ok(Removed::Locked) => Some("the wallet is locked".to_owned()),
+            Err(e) => Some(e.to_string()),
+        };
+        if let Some(why) = why {
+            tracing::warn!(%url, "the bearer key from before TLS stays in the wallet: {why}");
+            self.notify(
+                "Kai: the old device key stays",
+                format!(
+                    "Kai could not delete the device key it kept for {url} before TLS ({why}); \
+                     delete Kai's item for {url} in KWallet"
+                ),
+            );
+        }
+        match config::set_value(&self.paths.config_file, "lmgw", "url", None) {
+            Ok(()) => self.config.lmgw.url = None,
+            Err(e) => tracing::warn!("cannot remove lmgw.url from the configuration: {e}"),
+        }
     }
 
     fn ui_send(&self, cmd: UiCmd) {
@@ -1008,21 +1472,49 @@ impl<S: SecretStore, L: LmgwLink, A: AudioPort, V: VoiceLink> Core<S, L, A, V> {
         }
     }
 
-    /// Starts the link for a stored key; each start gets its own event channel, so an earlier
-    /// run's events never reach the model.
-    fn connect(&mut self, url: String, key: DeviceKey) {
-        self.link.stop();
-        // A question about an earlier key's state no longer applies.
+    /// The requests the pairing that ends had on their way (S1): nothing waits for their answers,
+    /// and the conversation asks again at the next `hello`.
+    fn drop_requests(&mut self) {
+        self.identity = None;
         self.key_ask = None;
+        self.folder_req = None;
+        self.profiles_req = None;
+        self.drop_personality_sets();
+        self.conversation.dropped();
+    }
+
+    /// Starts the link for a stored pairing and its key; each start gets its own event channel, so
+    /// an earlier run's events never reach the model.
+    fn connect(&mut self, paired: &Paired, key: &TlsKey) {
+        self.link.stop();
+        // A question about an earlier pairing's state no longer applies.
+        self.key_ask = None;
+        self.identity = None;
         let (tx, rx) = mpsc::unbounded_channel();
         self.link_events = rx;
+        let tls = match Tls::paired(&paired.credentials, key, self.config.lmgw.timeout()) {
+            Ok(t) => t,
+            Err(why) => {
+                tracing::warn!("the stored pairing does not connect: {why}");
+                return self.set_pairing(Pairing::PairAgain {
+                    why: format!("{why}: pair again"),
+                });
+            }
+        };
+        let creds = Credentials {
+            reach: Reach::new(paired.credentials.urls.clone()),
+            tls,
+        };
+        self.link_creds = Some(creds.clone());
+        self.dashboard = Dashboard::NotConnected;
+        self.identity = Some(*creds.tls.identity());
+        self.model.certificate = certificate_note(paired);
         self.set_pairing(Pairing::Paired {
-            url: url.clone(),
+            url: paired.first_url().to_owned(),
             link: Link::Down {
                 note: "connecting".into(),
             },
         });
-        let creds = Credentials { url, key };
         self.voice.link_mut().set_credentials(Some(creds.clone()));
         self.link.start(creds.clone(), tx);
         self.host_start(creds);
@@ -1049,6 +1541,7 @@ impl<S: SecretStore, L: LmgwLink, A: AudioPort, V: VoiceLink> Core<S, L, A, V> {
                 return self.apply(acts).await;
             }
             LinkEvent::Fact(fact) => return self.voice.fact(fact),
+            LinkEvent::Device(facts) => return self.device_facts(facts),
             LinkEvent::Folder(e) => return self.on_folder_event(e).await,
             LinkEvent::Profile(e) => return self.personality.event(e),
             _ => {}
@@ -1063,6 +1556,7 @@ impl<S: SecretStore, L: LmgwLink, A: AudioPort, V: VoiceLink> Core<S, L, A, V> {
                 hosts_label,
                 admin,
             } => {
+                self.model.certificate = self.paired.as_ref().and_then(certificate_note);
                 if let Some(host) = self.hosting.host_mut() {
                     host.feed_up(&device, hosts_label.as_deref());
                 }
@@ -1085,6 +1579,23 @@ impl<S: SecretStore, L: LmgwLink, A: AudioPort, V: VoiceLink> Core<S, L, A, V> {
                 let acts = self.conversation.connected();
                 self.apply(acts).await;
                 self.ask_profiles();
+            }
+            LinkEvent::Unconfirmed { note } => {
+                let code = self
+                    .paired
+                    .as_ref()
+                    .map(|p| p.credentials.confirm_code.clone())
+                    .unwrap_or_default();
+                *link = Link::Unconfirmed {
+                    code: code.clone(),
+                    note,
+                };
+                self.voice.feed(
+                    false,
+                    Some(format!(
+                        "waiting for you to confirm {code} on lmgw's Devices card"
+                    )),
+                );
             }
             LinkEvent::Down { note, dead } => {
                 *link = Link::Down { note: note.clone() };
@@ -1110,6 +1621,7 @@ impl<S: SecretStore, L: LmgwLink, A: AudioPort, V: VoiceLink> Core<S, L, A, V> {
             }
             LinkEvent::Revoked { .. }
             | LinkEvent::DeviceRevoked { .. }
+            | LinkEvent::Device(_)
             | LinkEvent::Fact(_)
             | LinkEvent::Folder(_)
             | LinkEvent::Profile(_) => {
@@ -1117,6 +1629,75 @@ impl<S: SecretStore, L: LmgwLink, A: AudioPort, V: VoiceLink> Core<S, L, A, V> {
             }
         }
         self.show_tools();
+        self.publish();
+    }
+
+    /// What the feed's `hello` says about this device (lmgw's device link §7.2): its URLs replace
+    /// the pairing's list and the link's reach, its certificate's dates the stored ones (the
+    /// notice and the lapse go by them), both kept in `device-link.json` (a pairing Kai runs from
+    /// memory stores them with the rest); its dashboard address is what Open in lmgw opens.
+    fn device_facts(&mut self, facts: DeviceFacts) {
+        self.dashboard = match facts.dashboard {
+            Some(url) => Dashboard::At(url),
+            None => Dashboard::NotOffered,
+        };
+        let Some(mut p) = self.paired.clone() else {
+            return;
+        };
+        let mut changed = false;
+        if let Some(urls) = facts.urls
+            && urls != p.credentials.urls
+        {
+            tracing::info!(was = ?p.credentials.urls.as_slice(), now = ?urls.as_slice(), "lmgw's hello: this device's URLs changed");
+            if let Some(c) = &self.link_creds {
+                c.reach.set_urls(urls.clone());
+            }
+            p.credentials.urls = urls;
+            changed = true;
+        }
+        if let Some(d) = facts.cert
+            && d != p.credentials.dates()
+        {
+            tracing::info!(
+                not_after = %pairing::date(d.not_after_ms),
+                notice_after = %pairing::date(d.notice_after_ms),
+                "lmgw's hello: this device's certificate dates changed"
+            );
+            if let Some(c) = &self.link_creds {
+                c.tls.set_not_after_ms(d.not_after_ms);
+            }
+            p.credentials.not_after_ms = d.not_after_ms;
+            p.credentials.notice_after_ms = d.notice_after_ms;
+            changed = true;
+        }
+        if !changed {
+            return;
+        }
+        self.model.certificate = certificate_note(&p);
+        if let Pairing::Paired { url, .. } = &mut self.model.pairing {
+            *url = p.first_url().to_owned();
+        }
+        // A pairing Kai runs from memory stores the new facts with the rest; its file, once
+        // written, is written again.
+        let write = match &mut self.unstored {
+            Some(u) => {
+                u.enrolled.paired = p.clone();
+                u.done.file
+            }
+            None => true,
+        };
+        if write && let Err(why) = p.save(&self.paths.device_link_file) {
+            tracing::warn!("lmgw's hello: cannot keep this device's URLs and dates: {why}");
+            self.notify(
+                "Kai: cannot keep lmgw's new facts",
+                format!(
+                    "lmgw sent new addresses or certificate dates for this device, which Kai uses \
+                     now but could not write ({why}); the next start uses the old ones until \
+                     lmgw sends them again"
+                ),
+            );
+        }
+        self.paired = Some(p);
         self.publish();
     }
 
@@ -1128,14 +1709,16 @@ impl<S: SecretStore, L: LmgwLink, A: AudioPort, V: VoiceLink> Core<S, L, A, V> {
         // The feed and a voice session may both say it (the `revoked` event, a 4003 close).
         if matches!(
             self.model.pairing,
-            Pairing::Revoked { .. } | Pairing::Disabled { .. } | Pairing::Expired { .. }
+            Pairing::Revoked { .. }
+                | Pairing::Disabled { .. }
+                | Pairing::Expired { .. }
+                | Pairing::PairAgain { .. }
         ) {
             tracing::info!(%reason, "the device key's revocation was said already");
             return;
         }
         tracing::warn!(%reason, ?loss, "the device key opens nothing now");
-        self.folder_req = None;
-        self.key_ask = None;
+        self.drop_requests();
         self.unknown_said = None;
         self.voice.feed(false, Some(format!("revoked: {reason}")));
         self.voice.leave_gateway().await;
@@ -1154,6 +1737,12 @@ impl<S: SecretStore, L: LmgwLink, A: AudioPort, V: VoiceLink> Core<S, L, A, V> {
                     format!("this device's key was revoked ({reason}); pair again"),
                 );
                 self.set_pairing(Pairing::Revoked { reason });
+            }
+            KeyLoss::Lapsed => {
+                // Kai's own date where it has one; lmgw's words otherwise.
+                let why = self.paired.as_ref().map_or(reason, lapsed);
+                self.notify("Kai: pair again", why.clone());
+                self.set_pairing(Pairing::PairAgain { why });
             }
             KeyLoss::Disabled => {
                 self.notify(
@@ -1195,7 +1784,7 @@ impl<S: SecretStore, L: LmgwLink, A: AudioPort, V: VoiceLink> Core<S, L, A, V> {
         self.say_unknown(&reason);
         let folder = self.conversation.folder().map(|f| f.id);
         let link = self.voice.link_mut();
-        self.key_ask = Some(match folder {
+        let call: Pending<Result<(), Refusal>> = match folder {
             Some(id) => {
                 let ask = link.current(id, false);
                 Box::pin(async move { ask.await.map(|_| ()) })
@@ -1204,6 +1793,10 @@ impl<S: SecretStore, L: LmgwLink, A: AudioPort, V: VoiceLink> Core<S, L, A, V> {
                 let ask = link.folders();
                 Box::pin(async move { ask.await.map(|_| ()) })
             }
+        };
+        self.key_ask = Some(Asked {
+            by: self.identity,
+            call,
         });
         self.publish();
     }
@@ -1227,12 +1820,12 @@ impl<S: SecretStore, L: LmgwLink, A: AudioPort, V: VoiceLink> Core<S, L, A, V> {
     /// its code (§3.3), and stops the link. Any other answer means lmgw still takes the key, and
     /// no answer leaves it undecided: either way the feed's own try after its backoff goes on, and
     /// its answer (`hello`, a 401, or the same `revoked` met later still) says the rest.
-    async fn on_key_answer(&mut self, answer: Result<(), Refusal>) {
+    async fn on_key_answer(&mut self, by: Option<Identity>, answer: Result<(), Refusal>) {
         match answer {
             Err(e) if e.key_refused() => {
                 tracing::warn!("the key's question answered 401: {e}");
                 let loss = KeyLoss::of_code(e.code());
-                self.revoke(e.message, loss).await
+                self.key_refused(by, e.message, loss).await
             }
             Ok(()) => tracing::info!("the key still opens lmgw: the feed tries again"),
             Err(e) => tracing::info!(
@@ -1272,7 +1865,21 @@ impl<S: SecretStore, L: LmgwLink, A: AudioPort, V: VoiceLink> Core<S, L, A, V> {
         self.apply(acts).await;
     }
 
-    async fn on_folder_answer(&mut self, answer: FolderAnswer) {
+    /// A request's key refusal revokes the pairing it went under, and only while that pairing is
+    /// the one the link runs (S1): one of an earlier pairing's is logged and dropped.
+    async fn key_refused(&mut self, by: Option<Identity>, reason: String, loss: KeyLoss) {
+        if by.is_none() || by != self.identity {
+            tracing::info!(
+                %reason,
+                ?loss,
+                "a key refusal of a request an earlier pairing sent; the pairing Kai runs now stays"
+            );
+            return;
+        }
+        self.revoke(reason, loss).await
+    }
+
+    async fn on_folder_answer(&mut self, by: Option<Identity>, answer: FolderAnswer) {
         let refused = match &answer {
             FolderAnswer::Listed(Err(e)) | FolderAnswer::Created(Err(e)) => e
                 .key_refused()
@@ -1280,7 +1887,7 @@ impl<S: SecretStore, L: LmgwLink, A: AudioPort, V: VoiceLink> Core<S, L, A, V> {
             _ => None,
         };
         if let Some((reason, loss)) = refused {
-            return self.revoke(reason, loss).await;
+            return self.key_refused(by, reason, loss).await;
         }
         let acts = match answer {
             FolderAnswer::Listed(r) => self.conversation.listed(r),
@@ -1296,19 +1903,28 @@ impl<S: SecretStore, L: LmgwLink, A: AudioPort, V: VoiceLink> Core<S, L, A, V> {
             match a {
                 Action::Lookup => {
                     let f = self.voice.link_mut().folders();
-                    self.folder_req = Some(Box::pin(async move { FolderAnswer::Listed(f.await) }));
+                    self.folder_req = Some(Asked {
+                        by: self.identity,
+                        call: Box::pin(async move { FolderAnswer::Listed(f.await) }),
+                    });
                 }
                 Action::LookupAfter(wait) => {
                     // The request goes once the wait is over (the future starts when polled).
                     let f = self.voice.link_mut().folders();
-                    self.folder_req = Some(Box::pin(async move {
-                        tokio::time::sleep(wait).await;
-                        FolderAnswer::Listed(f.await)
-                    }));
+                    self.folder_req = Some(Asked {
+                        by: self.identity,
+                        call: Box::pin(async move {
+                            tokio::time::sleep(wait).await;
+                            FolderAnswer::Listed(f.await)
+                        }),
+                    });
                 }
                 Action::Create(name) => {
                     let f = self.voice.link_mut().create_folder(&name);
-                    self.folder_req = Some(Box::pin(async move { FolderAnswer::Created(f.await) }));
+                    self.folder_req = Some(Asked {
+                        by: self.identity,
+                        call: Box::pin(async move { FolderAnswer::Created(f.await) }),
+                    });
                 }
                 Action::Remember(id) => self.remember_folder(id),
                 Action::Use(using) => {
@@ -1357,10 +1973,43 @@ impl<S: SecretStore, L: LmgwLink, A: AudioPort, V: VoiceLink> Core<S, L, A, V> {
 
     /// Open in lmgw (§4, §7 item 5): with `xdg-open`, the folder's settings form while the folder
     /// waits for the owner's steps, else the thread's dashboard page, or the Chat page while no
-    /// thread is known.
+    /// thread is known, on the dashboard address lmgw sent in the feed's `hello` (lmgw's device
+    /// link §7.2): the device link's URLs are lmgw's device listener, which serves no dashboard.
     fn open_in_lmgw(&mut self) {
-        let Some(base) = self.config.lmgw.url.clone().filter(|_| self.paired()) else {
+        if !self.paired() {
             return self.not_paired();
+        }
+        let base = match &self.dashboard {
+            Dashboard::At(url) => match dashboard_base(url) {
+                Ok(base) => base,
+                Err(rule) => {
+                    tracing::warn!(%url, %rule, "Open in lmgw: lmgw's dashboard address does not read");
+                    return self.notify(
+                        "Kai: Open in lmgw",
+                        format!(
+                            "lmgw's dashboard address {url:?} does not read as a web address \
+                             ({rule}): Kai opens nothing"
+                        ),
+                    );
+                }
+            },
+            Dashboard::NotOffered => {
+                tracing::info!("Open in lmgw: lmgw sent no dashboard address for this device");
+                return self.notify(
+                    "Kai: lmgw's dashboard is not reachable from here",
+                    "lmgw's dashboard is only reachable on lmgw's own machine: open it there"
+                        .to_owned(),
+                );
+            }
+            Dashboard::NotConnected => {
+                tracing::info!("Open in lmgw: no hello on this pairing yet");
+                return self.notify(
+                    "Kai: Open in lmgw waits for lmgw",
+                    "Kai has not connected to lmgw yet: lmgw says where its dashboard is when Kai \
+                     connects"
+                        .to_owned(),
+                );
+            }
         };
         let page = match (self.conversation.folder(), self.voice.thread_id()) {
             (Some(f), _) if !self.conversation.ready() || self.host_step().is_some() => {
@@ -1435,7 +2084,7 @@ impl<S: SecretStore, L: LmgwLink, A: AudioPort, V: VoiceLink> Core<S, L, A, V> {
     }
 
     /// `lmgw.response.timing` for the ring's `setTiming`.
-    pub fn set_ring_timing(&mut self, timing: Option<serde_json::Value>) {
+    pub fn set_ring_timing(&mut self, timing: Option<Box<lmgw_client::realtime::VoiceTiming>>) {
         self.overlay(OverlayCmd::Timing(timing));
     }
 
@@ -1562,6 +2211,23 @@ impl<S: SecretStore, L: LmgwLink, A: AudioPort, V: VoiceLink> Core<S, L, A, V> {
     /// sender, which removes the tray item. Notifications still on their way are waited for.
     async fn quit(mut self) {
         tracing::info!("quitting");
+        // A pairing Kai ran from memory: one last try to store it, else the owner hears it is
+        // lost (decision 5 as settled 2026-10-15).
+        if self.unstored.is_some() {
+            self.store_unstored().await;
+        }
+        if let Some(u) = &self.unstored {
+            let url = u.enrolled.paired.first_url();
+            tracing::warn!(%url, "Kai quits with its pairing not stored ({}): it is lost", u.why);
+            self.notify(
+                "Kai: the pairing is lost",
+                format!(
+                    "Kai quit before it could store its pairing with lmgw at {url} ({}): pair it \
+                     again with a new link from lmgw's Devices card",
+                    u.why
+                ),
+            );
+        }
         // Running jobs end with Kai, and lmgw is told before the link closes (WP18; all within
         // lmgw.timeout_s, and none while the screen is locked).
         self.jobs.quit();
@@ -1592,8 +2258,10 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::pairing::tests::{KEY, good};
+    use crate::lmgw_link::test_pki::{FOREIGN, PKI, fp};
+    use crate::pairing::tests::{enroller, good_at, link_for, other_at, store_pairing};
     use crate::secret::MemoryStore;
+    use crate::voice::link as voice_link;
 
     #[derive(Clone, Default)]
     struct FakeAudio {
@@ -1632,12 +2300,15 @@ mod tests {
         starts: Arc<Mutex<Vec<String>>>,
         stops: Arc<Mutex<usize>>,
         events: Arc<Mutex<Option<mpsc::UnboundedSender<LinkEvent>>>>,
+        /// The last start's credentials (their reach and TLS are shared with the core's).
+        creds: Arc<Mutex<Option<Credentials>>>,
     }
 
     impl LmgwLink for FakeLink {
         fn start(&mut self, creds: Credentials, events: mpsc::UnboundedSender<LinkEvent>) {
-            assert_eq!(creds.key.expose(), KEY);
-            self.starts.lock().unwrap().push(creds.url);
+            assert_ne!(creds.tls.identity(), &[0; 32], "a paired device's TLS");
+            self.starts.lock().unwrap().push(creds.url());
+            *self.creds.lock().unwrap() = Some(creds.clone());
             *self.events.lock().unwrap() = Some(events);
         }
         fn stop(&mut self) {
@@ -1680,7 +2351,7 @@ mod tests {
             creds: Credentials,
             events: mpsc::UnboundedSender<crate::host::HostEvent>,
         ) {
-            self.starts.lock().unwrap().push(creds.url);
+            self.starts.lock().unwrap().push(creds.url());
             *self.events.lock().unwrap() = Some(events);
         }
         fn stop(&mut self) {
@@ -1729,14 +2400,33 @@ mod tests {
         task: tokio::task::JoinHandle<Ended>,
     }
 
-    fn rig(config_text: &str, prepare: impl FnOnce(&MemoryStore)) -> Rig {
+    fn rig(config_text: &str, prepare: impl FnOnce(&MemoryStore, &Paths)) -> Rig {
+        rig_enrolling(config_text, prepare, enroller())
+    }
+
+    /// [`rig`] whose enrolment is `enrol`.
+    fn rig_enrolling(
+        config_text: &str,
+        prepare: impl FnOnce(&MemoryStore, &Paths),
+        enrol: Enroller,
+    ) -> Rig {
+        rig_with(config_text, prepare, enrol, crate::voice::NoVoice)
+    }
+
+    /// [`rig_enrolling`] whose voice link is `voice`.
+    fn rig_with<V: VoiceLink>(
+        config_text: &str,
+        prepare: impl FnOnce(&MemoryStore, &Paths),
+        enrol: Enroller,
+        voice: V,
+    ) -> Rig {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::under_config_home(dir.path());
         std::fs::create_dir_all(paths.config_file.parent().unwrap()).unwrap();
         std::fs::write(&paths.config_file, config_text).unwrap();
         let config = Config::load(&paths.config_file).unwrap();
         let store = Arc::new(MemoryStore::default());
-        prepare(&store);
+        prepare(&store, &paths);
         let link = FakeLink::default();
         let host = FakeHost::default();
         let audio = FakeAudio::default();
@@ -1751,12 +2441,13 @@ mod tests {
             "/usr/bin/kai".into(),
             store.clone(),
             link.clone(),
-            crate::voice::NoVoice,
+            voice,
             (audio.clone(), audio_rx),
             model_tx,
             ui_tx,
             None,
         );
+        core.set_enroller(enrol);
         core.notify_into(ntx);
         core.set_host(Box::new(host.clone()), vec!["policy.tools.nothing".into()]);
         let (updates_tx, updates) = mpsc::unbounded_channel();
@@ -1802,7 +2493,7 @@ mod tests {
         }
         /// The paste dialog's Pair, the dialog opened just now (it shows Kai's pairing as it is).
         async fn paste(&self, text: &str) -> Result<(), String> {
-            self.paste_shown(text, self.config_url())
+            self.paste_shown(text, self.paired_url())
                 .await
                 .map_err(|e| e.to_string())
         }
@@ -1849,23 +2540,30 @@ mod tests {
                 );
             }
         }
-        /// Waits until the wallet holds exactly `urls` (the old item goes after the switch).
-        async fn until_stored(&self, urls: &[&str]) {
+        /// Waits until the wallet holds the keys of exactly `gateways` (by fingerprint; the old
+        /// item goes after the switch).
+        async fn until_stored(&self, gateways: &[&str]) {
+            let mut want: Vec<String> = gateways.iter().map(|g| (*g).to_owned()).collect();
+            want.sort();
             for _ in 0..100 {
-                if self.stored_urls() == urls {
+                if self.stored() == want {
                     return;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            assert_eq!(self.stored_urls(), urls);
+            assert_eq!(self.stored(), want);
         }
-        fn stored_urls(&self) -> Vec<String> {
+        /// The gateways whose keys the wallet holds, by fingerprint, sorted.
+        fn stored(&self) -> Vec<String> {
             let mut v: Vec<String> = self.store.items.lock().unwrap().keys().cloned().collect();
             v.sort();
             v
         }
-        fn config_url(&self) -> Option<String> {
-            Config::load(&self.paths.config_file).unwrap().lmgw.url
+        /// The stored pairing's first URL.
+        fn paired_url(&self) -> Option<String> {
+            Paired::load(&self.paths.device_link_file)
+                .unwrap()
+                .map(|p| p.first_url().to_owned())
         }
         async fn quit(self) {
             self.cmds.send(Command::Quit).unwrap();
@@ -1879,7 +2577,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn no_url_is_not_paired() {
-        let mut r = rig("", |_| {});
+        let mut r = rig("", |_, _| {});
         let m = r.until(|m| m.pairing != Pairing::Checking).await;
         assert_eq!(m.pairing, Pairing::NotPaired);
         r.cmds.send(Command::OpenPairDialog).unwrap();
@@ -1892,17 +2590,9 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_stored_key_starts_the_link_and_its_events_reach_the_model() {
-        let mut r = rig("[lmgw]\nurl = \"http://127.0.0.1:1\"\n", |s| {
-            s.items.lock().unwrap().insert(
-                "http://127.0.0.1:1".into(),
-                ("d".into(), DeviceKey::parse(KEY).unwrap()),
-            );
-        });
+        let mut r = rig("", paired_at(OLD));
         r.until(paired).await;
-        assert_eq!(
-            *r.link.starts.lock().unwrap(),
-            vec!["http://127.0.0.1:1".to_owned()]
-        );
+        assert_eq!(*r.link.starts.lock().unwrap(), vec![OLD.to_owned()]);
         r.link.raise(LinkEvent::Down {
             note: "lmgw not reachable; retry in 2 s".into(),
             dead: false,
@@ -1959,16 +2649,10 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_locked_wallet_shows_locked_and_recovers_when_it_opens() {
-        let mut r = rig(
-            "[lmgw]\nurl = \"http://127.0.0.1:1\"\n[wallet]\nretry_s = 3\n",
-            |s| {
-                s.items.lock().unwrap().insert(
-                    "http://127.0.0.1:1".into(),
-                    ("d".into(), DeviceKey::parse(KEY).unwrap()),
-                );
-                s.set_locked(true);
-            },
-        );
+        let mut r = rig("[wallet]\nretry_s = 3\n", |s, p| {
+            paired_at(OLD)(s, p);
+            s.set_locked(true);
+        });
         let m = r.until(|m| m.pairing != Pairing::Checking).await;
         assert_eq!(m.pairing, Pairing::WalletLocked { retry_s: 3 });
         // still locked after a retry
@@ -1982,17 +2666,35 @@ mod tests {
         r.quit().await;
     }
 
-    const OLD: &str = "http://127.0.0.1:1";
-    const NEW: &str = "http://127.0.0.1:8001";
+    /// The gateway Kai is paired with ([`PKI`]'s) and another one ([`FOREIGN`]'s).
+    const OLD: &str = "https://127.0.0.1:1";
+    const NEW: &str = "https://127.0.0.1:8002";
+    /// Where lmgw's `hello.urls` moves a pairing.
+    const MOVED: &str = "https://127.0.0.1:8003";
+
+    fn old_fp() -> String {
+        fp(&PKI.ca).to_string()
+    }
+
+    fn new_fp() -> String {
+        fp(&FOREIGN.ca).to_string()
+    }
+
+    /// A pairing link for NEW.
+    fn good() -> String {
+        other_at(NEW)
+    }
+
+    /// A Kai paired with OLD at its start.
+    fn paired_at(url: &'static str) -> impl FnOnce(&MemoryStore, &Paths) {
+        move |s, p| {
+            store_pairing(&PKI, p, s, url);
+        }
+    }
 
     /// Kai paired with OLD, its feed up.
     async fn paired_rig() -> Rig {
-        let mut r = rig(&format!("[lmgw]\nurl = \"{OLD}\"\n"), |s| {
-            s.items
-                .lock()
-                .unwrap()
-                .insert(OLD.into(), ("d".into(), DeviceKey::parse(KEY).unwrap()));
-        });
+        let mut r = rig("", paired_at(OLD));
         r.until(paired).await;
         r.link.raise(LinkEvent::Connected {
             device: "desktop".into(),
@@ -2020,15 +2722,15 @@ mod tests {
         r.arrive(&good());
         let req = r.confirm_request().await;
         // The dialog shows the new gateway, the device, and the pairing it replaces.
-        assert_eq!(req.facts.url, NEW);
+        assert_eq!(req.facts.urls, [NEW]);
         assert_eq!(req.facts.name, "desktop");
         assert_eq!(req.facts.replaces.as_deref(), Some(OLD));
         let m = r.until(|m| m.link_wait.is_some()).await;
         assert_eq!(m.link_wait, Some(LinkWait::Owner { url: NEW.into() }));
         // Nothing is stored, stopped or switched before the answer.
         tokio::time::sleep(Duration::from_secs(60)).await;
-        assert_eq!(r.stored_urls(), [OLD]);
-        assert_eq!(r.config_url().as_deref(), Some(OLD));
+        assert_eq!(r.stored(), [old_fp()]);
+        assert_eq!(r.paired_url().as_deref(), Some(OLD));
         assert_eq!(
             *r.link.stops.lock().unwrap(),
             stops,
@@ -2043,8 +2745,8 @@ mod tests {
             .await;
         assert_eq!(m.link_wait, None);
         // The owner's decision (2026-10-07): the old gateway's item goes, Kai's own only.
-        r.until_stored(&[NEW]).await;
-        assert_eq!(r.config_url().as_deref(), Some(NEW));
+        r.until_stored(&[&new_fp()]).await;
+        assert_eq!(r.paired_url().as_deref(), Some(NEW));
         assert_eq!(*r.link.starts.lock().unwrap(), [OLD, NEW]);
         assert!(
             !m.autostart,
@@ -2056,23 +2758,26 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_re_pair_deletes_kais_item_for_the_old_gateway_and_nothing_else() {
         let r = paired_rig().await;
-        let other = "http://127.0.0.1:2";
+        let other = "sha256:other";
         r.store
             .items
             .lock()
             .unwrap()
-            .insert(other.into(), ("x".into(), DeviceKey::parse(KEY).unwrap()));
+            .insert(other.into(), ("x".into(), PKI.device_key.clone()));
         // The same gateway again: its item is replaced, nothing is deleted.
-        let same = crate::pairing::tests::link(&format!(
-            "v=1&url=http%3A%2F%2F127.0.0.1%3A1&name=again&key={KEY}"
-        ));
+        let same = link_for(&fp(&PKI.ca), OLD, "again");
         assert_eq!(r.paste(&same).await, Ok(()));
-        r.until_stored(&[OLD, other]).await;
-        assert_eq!(r.store.items.lock().unwrap()[OLD].0, "again");
+        r.until_stored(&[&old_fp(), other]).await;
+        assert!(
+            r.store.items.lock().unwrap()[&old_fp()]
+                .0
+                .contains("'again'"),
+            "the new key's item"
+        );
         // Another gateway: the old one's item goes, the unrelated one stays.
         assert_eq!(r.paste(&good()).await, Ok(()));
-        r.until_stored(&[other, NEW]).await;
-        assert_eq!(r.config_url().as_deref(), Some(NEW));
+        r.until_stored(&[other, &new_fp()]).await;
+        assert_eq!(r.paired_url().as_deref(), Some(NEW));
         r.quit().await;
     }
 
@@ -2085,14 +2790,14 @@ mod tests {
         r.answer(req.id, false);
         r.until(|m| m.link_wait.is_none()).await;
         tokio::time::sleep(Duration::from_secs(10)).await;
-        assert_eq!(r.stored_urls(), [OLD]);
-        assert_eq!(r.config_url().as_deref(), Some(OLD));
+        assert_eq!(r.stored(), [old_fp()]);
+        assert_eq!(r.paired_url().as_deref(), Some(OLD));
         assert_eq!(*r.link.stops.lock().unwrap(), stops);
         assert_eq!(*r.link.starts.lock().unwrap(), [OLD]);
         // A late second answer for it does nothing either.
         r.answer(req.id, true);
         tokio::time::sleep(Duration::from_secs(1)).await;
-        assert_eq!(r.stored_urls(), [OLD]);
+        assert_eq!(r.stored(), [old_fp()]);
         r.quit().await;
     }
 
@@ -2100,7 +2805,7 @@ mod tests {
     /// the open dialog stays as it is (no withdrawal, no new dialog), and its answer still counts.
     #[tokio::test(start_paused = true)]
     async fn a_link_while_another_waits_is_refused_and_nothing_swaps() {
-        let mut r = rig("", |_| {});
+        let mut r = rig("", |_, _| {});
         r.until(|m| m.pairing == Pairing::NotPaired).await;
         r.arrive(&good());
         let first = r.confirm_request().await;
@@ -2108,9 +2813,7 @@ mod tests {
             first.facts.replaces, None,
             "a first pairing replaces nothing"
         );
-        let other = crate::pairing::tests::link(&format!(
-            "v=1&url=http%3A%2F%2F192.0.2.20%3A8001&name=other&key={KEY}"
-        ));
+        let other = link_for(&fp(&PKI.ca), "https://192.0.2.20:8002", "other");
         r.arrive(&other);
         let n = r.notices.recv().await.unwrap();
         assert_eq!(n.summary, "Kai could not pair");
@@ -2125,7 +2828,7 @@ mod tests {
         );
         r.answer(first.id, true);
         let m = r.until(paired).await;
-        assert_eq!(r.stored_urls(), [NEW]);
+        assert_eq!(r.stored(), [new_fp()]);
         assert!(
             m.autostart,
             "a confirmed first pairing switches Start with Plasma on"
@@ -2134,7 +2837,6 @@ mod tests {
         // Answered: the next link is asked about again.
         r.arrive(&other);
         let second = r.confirm_request().await;
-        assert!(second.facts.plain_http_remote);
         assert_eq!(second.facts.replaces.as_deref(), Some(NEW));
         r.quit().await;
     }
@@ -2144,40 +2846,30 @@ mod tests {
     /// dialog then shows the pairing Kai has, and a Pair with it goes through.
     #[tokio::test(start_paused = true)]
     async fn a_paste_against_a_pairing_that_changed_is_refused() {
-        let mut r = rig("", |_| {});
+        let mut r = rig("", |_, _| {});
         r.until(|m| m.pairing == Pairing::NotPaired).await;
         // The paste dialog opens: nothing to replace.
-        let shown = r.config_url();
+        let shown = r.paired_url();
         assert_eq!(shown, None);
         // Meanwhile a link is confirmed.
-        let other = crate::pairing::tests::link(&format!(
-            "v=1&url=http%3A%2F%2F192.0.2.20%3A8001&name=other&key={KEY}"
-        ));
-        r.arrive(&other);
+        let elsewhere = "https://192.0.2.20:8002";
+        r.arrive(&good_at(elsewhere));
         let req = r.confirm_request().await;
         r.answer(req.id, true);
-        r.until_stored(&["http://192.0.2.20:8001"]).await;
+        r.until_stored(&[&old_fp()]).await;
         let e = r.paste_shown(&good(), shown).await.unwrap_err();
         assert_eq!(
             e,
             PasteError::Changed {
-                current: Some("http://192.0.2.20:8001".into())
+                current: Some(elsewhere.into())
             }
         );
         assert!(e.to_string().contains("nothing was stored"), "{e}");
-        assert_eq!(
-            r.stored_urls(),
-            ["http://192.0.2.20:8001"],
-            "nothing deleted"
-        );
-        assert_eq!(r.config_url().as_deref(), Some("http://192.0.2.20:8001"));
+        assert_eq!(r.stored(), [old_fp()], "nothing deleted");
+        assert_eq!(r.paired_url().as_deref(), Some(elsewhere));
         // The dialog shows the facts again against what Kai has; Pair now replaces it, named.
-        assert_eq!(
-            r.paste_shown(&good(), Some("http://192.0.2.20:8001".into()))
-                .await,
-            Ok(())
-        );
-        r.until_stored(&[NEW]).await;
+        assert_eq!(r.paste_shown(&good(), Some(elsewhere.into())).await, Ok(()));
+        r.until_stored(&[&new_fp()]).await;
         r.quit().await;
     }
 
@@ -2208,12 +2900,12 @@ mod tests {
             "the wallet notice is said once"
         );
         assert_eq!(*r.link.stops.lock().unwrap(), stops);
-        assert_eq!(r.stored_urls(), [OLD]);
+        assert_eq!(r.stored(), [old_fp()]);
         // The wallet opens: now the owner is asked, and only the answer stores.
         r.store.set_locked(false);
         let req = r.confirm_request().await;
         assert_eq!(req.facts.replaces.as_deref(), Some(OLD));
-        assert_eq!(r.stored_urls(), [OLD]);
+        assert_eq!(r.stored(), [old_fp()]);
         r.answer(req.id, true);
         r.until(|m| matches!(&m.pairing, Pairing::Paired { url, .. } if url == NEW))
             .await;
@@ -2223,7 +2915,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_link_for_a_kai_whose_wallet_is_locked_at_start_is_asked_once_it_opens() {
         // The handler started Kai with the link; the wallet is locked at login.
-        let mut r = rig("", |s| s.set_locked(true));
+        let mut r = rig("", |s, _| s.set_locked(true));
         r.until(|m| m.pairing == Pairing::NotPaired).await;
         r.arrive(&good());
         r.until(|m| matches!(m.link_wait, Some(LinkWait::Wallet { .. })))
@@ -2231,33 +2923,35 @@ mod tests {
         assert!(!r.model.borrow().autostart);
         r.store.set_locked(false);
         let req = r.confirm_request().await;
-        assert!(r.stored_urls().is_empty());
+        assert!(r.stored().is_empty());
         r.answer(req.id, true);
         let m = r.until(paired).await;
         assert!(
             m.autostart,
             "the first pairing switches Start with Plasma on"
         );
-        assert_eq!(r.config_url().as_deref(), Some(NEW));
+        assert_eq!(r.paired_url().as_deref(), Some(NEW));
         r.quit().await;
     }
 
     #[tokio::test(start_paused = true)]
     async fn a_paste_is_confirmed_in_its_dialog_and_a_locked_wallet_is_said_there() {
-        let mut r = rig("[lmgw]\nurl = \"http://127.0.0.1:1\"\n", |s| {
+        // A pairing whose key is not in the wallet (yet): the wallet is locked.
+        let mut r = rig("", |s, p| {
+            PKI.paired(&[OLD]).save(&p.device_link_file).unwrap();
             s.set_locked(true)
         });
         r.until(|m| matches!(m.pairing, Pairing::WalletLocked { .. }))
             .await;
         r.cmds.send(Command::OpenPairDialog).unwrap();
         assert!(matches!(r.dialog().await,
-            UiCmd::ShowPairDialog { current: Some(c) } if c == "http://127.0.0.1:1"));
+            UiCmd::ShowPairDialog { current: Some(c) } if c == OLD));
         let e = r.paste(&good()).await.unwrap_err();
         assert!(
-            e.contains("KWallet is locked") && e.contains("nothing was stored"),
+            e.contains("KWallet is locked") && e.contains("nothing was sent to lmgw"),
             "{e}"
         );
-        assert!(r.stored_urls().is_empty());
+        assert!(r.stored().is_empty());
         assert_eq!(
             r.model.borrow().link_wait,
             None,
@@ -2272,7 +2966,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_failing_wallet_is_shown_and_retried() {
-        let mut r = rig("[lmgw]\nurl = \"http://127.0.0.1:1\"\n", |s| {
+        let mut r = rig("", |s, p| {
+            PKI.paired(&[OLD]).save(&p.device_link_file).unwrap();
             *s.fail.lock().unwrap() = Some(
                 "the Secret Service did not answer a lookup within 10 s (wallet.timeout_s)".into(),
             );
@@ -2288,13 +2983,13 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn revocation_through_the_seam_says_pair_again_and_a_new_pairing_recovers() {
-        let mut r = rig("", |_| {});
+        let mut r = rig("", |_, _| {});
         r.until(|m| m.pairing == Pairing::NotPaired).await;
         assert_eq!(r.paste(&good()).await, Ok(()));
         r.until(paired).await;
         let stops = *r.link.stops.lock().unwrap();
         r.link.raise(LinkEvent::Revoked {
-            reason: "device 'desktop' was rotated — pair it again".into(),
+            reason: "the key of device 'desktop' was replaced — pair it again".into(),
             loss: Some(KeyLoss::PairAgain),
         });
         let m = r
@@ -2303,7 +2998,7 @@ mod tests {
         assert_eq!(
             m.pairing,
             Pairing::Revoked {
-                reason: "device 'desktop' was rotated — pair it again".into()
+                reason: "the key of device 'desktop' was replaced — pair it again".into()
             }
         );
         assert_eq!(
@@ -2329,12 +3024,7 @@ mod tests {
     /// stops retrying; the tray's Try again opens the link with the stored key once more.
     #[tokio::test(start_paused = true)]
     async fn a_disabled_device_keeps_its_key_and_try_again_reconnects_with_it() {
-        let mut r = rig("[lmgw]\nurl = \"http://127.0.0.1:1\"\n", |s| {
-            s.items.lock().unwrap().insert(
-                "http://127.0.0.1:1".into(),
-                ("d".into(), DeviceKey::parse(KEY).unwrap()),
-            );
-        });
+        let mut r = rig("", paired_at(OLD));
         r.until(paired).await;
         let stops = *r.link.stops.lock().unwrap();
         let words = "device 'desktop' is disabled — enable it on Usage → Keys";
@@ -2359,11 +3049,7 @@ mod tests {
         );
         assert_eq!(*r.link.stops.lock().unwrap(), stops + 1, "the link stops");
         assert!(
-            r.store
-                .items
-                .lock()
-                .unwrap()
-                .contains_key("http://127.0.0.1:1"),
+            r.store.items.lock().unwrap().contains_key(&old_fp()),
             "the key stays in the wallet"
         );
         let view = crate::tray::model::render(&m);
@@ -2385,10 +3071,7 @@ mod tests {
         // The owner enabled it: Try again starts the link with the stored key.
         r.cmds.send(Command::TryAgain).unwrap();
         r.until(paired).await;
-        assert_eq!(
-            *r.link.starts.lock().unwrap(),
-            ["http://127.0.0.1:1", "http://127.0.0.1:1"]
-        );
+        assert_eq!(*r.link.starts.lock().unwrap(), [OLD, OLD]);
         r.link.raise(LinkEvent::Connected {
             device: "desktop".into(),
             held: false,
@@ -2422,32 +3105,783 @@ mod tests {
         r.quit().await;
     }
 
+    /// lmgw's device link §3.5: the new pairing's code is said at once, and the tray shows it
+    /// while lmgw waits for the owner's Confirm; once confirmed, the feed comes up.
     #[tokio::test(start_paused = true)]
-    async fn a_link_with_fp_is_refused_and_the_pairing_is_unchanged() {
-        let mut r = rig("", |_| {});
+    async fn the_code_is_said_and_shown_until_the_owner_confirms() {
+        let mut r = rig("", |_, _| {});
         r.until(|m| m.pairing == Pairing::NotPaired).await;
-        let fp = format!("{}&fp=sha256:{}", good(), "0".repeat(64));
-        r.arrive(&fp);
-        let m = r.until(|m| m.pair_error.is_some()).await;
-        assert!(m.pair_error.unwrap().contains("refusing"));
-        assert_eq!(m.pairing, Pairing::NotPaired);
-        assert_eq!(m.link_wait, None);
-        r.no_dialog();
-        assert!(r.store.items.lock().unwrap().is_empty());
+        assert_eq!(r.paste(&good()).await, Ok(()));
+        let code = crate::pairing::tests::enrolled_for(&PairingLink::parse(&good()).unwrap())
+            .paired
+            .credentials
+            .confirm_code;
+        let n = r.notice("Kai is paired with lmgw").await;
         assert!(
-            !r.paths.config_file.exists()
-                || Config::load(&r.paths.config_file)
-                    .unwrap()
-                    .lmgw
-                    .url
-                    .is_none()
+            n.body
+                .contains(&format!("confirm the code {code} on lmgw's Devices card")),
+            "{}",
+            n.body
+        );
+        r.until(paired).await;
+        r.link.raise(LinkEvent::Unconfirmed {
+            note: "Kai asks again in 1 s".into(),
+        });
+        let m = r
+            .until(|m| {
+                matches!(
+                    &m.pairing,
+                    Pairing::Paired {
+                        link: Link::Unconfirmed { .. },
+                        ..
+                    }
+                )
+            })
+            .await;
+        assert_eq!(
+            m.pairing,
+            Pairing::Paired {
+                url: NEW.into(),
+                link: Link::Unconfirmed {
+                    code: code.clone(),
+                    note: "Kai asks again in 1 s".into(),
+                },
+            }
+        );
+        r.link.raise(LinkEvent::Connected {
+            device: "desktop".into(),
+            held: false,
+            hosts_label: None,
+            admin: Default::default(),
+        });
+        r.until(|m| {
+            matches!(
+                &m.pairing,
+                Pairing::Paired {
+                    link: Link::Up { .. },
+                    ..
+                }
+            )
+        })
+        .await;
+        r.quit().await;
+    }
+
+    /// While lmgw waits for the owner's Confirm, a talk press says so (not "lmgw is not running").
+    #[tokio::test(start_paused = true)]
+    async fn a_press_while_unconfirmed_says_to_confirm() {
+        let mut r = rig("", paired_at(OLD));
+        r.until(paired).await;
+        r.link.raise(LinkEvent::Unconfirmed {
+            note: "Kai asks again in 1 s".into(),
+        });
+        r.until(|m| {
+            matches!(
+                &m.pairing,
+                Pairing::Paired {
+                    link: Link::Unconfirmed { .. },
+                    ..
+                }
+            )
+        })
+        .await;
+        r.cmds.send(Command::Talk(true)).unwrap();
+        r.cmds.send(Command::Talk(false)).unwrap();
+        let n = r.notice("Kai waits for your confirmation").await;
+        let code = PKI.paired(&[OLD]).credentials.confirm_code;
+        assert!(n.body.contains(&code), "{}", n.body);
+        // The tray's Start listening says the same.
+        r.cmds.send(Command::SetListening(true)).unwrap();
+        let n = r.notice("Kai waits for your confirmation").await;
+        assert!(n.body.contains(&code), "{}", n.body);
+        r.quit().await;
+    }
+
+    /// A voice command while the pairing must be made again says why, not "not paired".
+    #[tokio::test(start_paused = true)]
+    async fn a_press_while_kai_must_pair_again_says_why() {
+        let lapsed = |s: &MemoryStore, p: &Paths| {
+            let mut paired = store_pairing(&PKI, p, s, OLD);
+            paired.credentials.not_after_ms = 86_400_000;
+            paired.save(&p.device_link_file).unwrap();
+        };
+        let mut r = rig("", lapsed);
+        r.until(|m| matches!(m.pairing, Pairing::PairAgain { .. }))
+            .await;
+        r.cmds.send(Command::Talk(true)).unwrap();
+        let n = r.notice("Kai: pair again").await;
+        assert!(
+            n.body.contains("lapsed on 1970-01-02") && n.body.contains("Pair with lmgw"),
+            "{}",
+            n.body
+        );
+        r.quit().await;
+    }
+
+    /// The pairing Kai has drops its connections before the enrolment (kai §3.1's order), and comes
+    /// back when the enrolment fails, which is said.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_enrolment_is_said_and_the_pairing_comes_back() {
+        let refused = "lmgw refused the enrolment: the token expired (pairing_token_expired)";
+        let fails: Enroller = std::sync::Arc::new(move |_, _| {
+            Box::pin(async move { Err(PairError::Enrol(refused.into())) })
+        });
+        let mut r = rig_enrolling("", paired_at(OLD), fails);
+        r.until(paired).await;
+        let stops = *r.link.stops.lock().unwrap();
+        r.arrive(&good());
+        let req = r.confirm_request().await;
+        r.answer(req.id, true);
+        let n = r.notice("Kai could not pair").await;
+        assert_eq!(n.body, refused);
+        let m = r
+            .until(|m| matches!(&m.pairing, Pairing::Paired { url, .. } if url == OLD))
+            .await;
+        assert_eq!(m.pair_error.as_deref(), Some(refused));
+        assert!(
+            *r.link.stops.lock().unwrap() > stops,
+            "the old pairing's link stopped for the enrolment"
+        );
+        assert_eq!(*r.link.starts.lock().unwrap(), [OLD, OLD], "and came back");
+        assert_eq!(r.stored(), [old_fp()]);
+        assert_eq!(r.paired_url().as_deref(), Some(OLD));
+        r.quit().await;
+    }
+
+    /// A voice link whose folder lookups wait for the test's answer: each lookup's sender, in the
+    /// order they were asked. Everything else as [`crate::voice::NoVoice`].
+    type FolderReply = oneshot::Sender<Result<Vec<FolderInfo>, Refusal>>;
+
+    #[derive(Clone, Default)]
+    struct HeldFolders {
+        asked: Arc<Mutex<Vec<FolderReply>>>,
+    }
+
+    impl VoiceLink for HeldFolders {
+        fn set_credentials(&mut self, _creds: Option<Credentials>) {}
+        fn current(
+            &mut self,
+            folder: i64,
+            new: bool,
+        ) -> Pending<Result<voice_link::Current, Refusal>> {
+            crate::voice::NoVoice.current(folder, new)
+        }
+        fn folders(&mut self) -> Pending<Result<Vec<FolderInfo>, Refusal>> {
+            let (tx, rx) = oneshot::channel();
+            self.asked.lock().unwrap().push(tx);
+            Box::pin(async move {
+                rx.await
+                    .unwrap_or_else(|_| Err(Refusal::no_answer("the test dropped it")))
+            })
+        }
+        fn create_folder(&mut self, name: &str) -> Pending<Result<FolderInfo, Refusal>> {
+            crate::voice::NoVoice.create_folder(name)
+        }
+        fn open(
+            &mut self,
+            thread: i64,
+            take_over: bool,
+            events: mpsc::UnboundedSender<voice_link::SessionEvent>,
+        ) -> Box<dyn voice_link::VoiceSocket> {
+            crate::voice::NoVoice.open(thread, take_over, events)
+        }
+    }
+
+    impl HeldFolders {
+        /// How many lookups were asked so far.
+        fn count(&self) -> usize {
+            self.asked.lock().unwrap().len()
+        }
+        /// Answers lookup `n`; `false` when nothing waits for it any more.
+        fn answer(&self, n: usize, r: Result<Vec<FolderInfo>, Refusal>) -> bool {
+            let tx = std::mem::replace(&mut self.asked.lock().unwrap()[n], oneshot::channel().0);
+            tx.send(r).is_ok()
+        }
+    }
+
+    /// lmgw's 401 for a key it does not know (a re-paired device's old key).
+    fn key_unknown() -> Refusal {
+        Refusal {
+            status: 401,
+            code: Some("device_key_unknown".into()),
+            message: "this device's key is unknown".into(),
+        }
+    }
+
+    /// An enrolment as a real re-pair makes it: a new key, so a new certificate (another
+    /// identity), for the link's gateway.
+    fn fresh_enroller() -> Enroller {
+        Arc::new(|link: PairingLink, key: TlsKey| {
+            Box::pin(async move {
+                let mut e = crate::pairing::tests::enrolled_for(&link);
+                let spki = key.public_key().unwrap();
+                e.paired.credentials.certificate =
+                    crate::lmgw_link::test_pki::device_cert(&PKI.ca, &spki, (2020, 2100));
+                e.paired.credentials.confirm_code = lmgw_client::requests::confirm_code(&spki);
+                e.key = key;
+                Ok(e)
+            })
+        })
+    }
+
+    /// An enrolment that waits for the test's go.
+    fn held_enroller() -> (Enroller, Arc<tokio::sync::Notify>) {
+        let go = Arc::new(tokio::sync::Notify::new());
+        let g = go.clone();
+        let e: Enroller = Arc::new(move |link: PairingLink, _key: TlsKey| {
+            let g = g.clone();
+            Box::pin(async move {
+                g.notified().await;
+                Ok(crate::pairing::tests::enrolled_for(&link))
+            })
+        });
+        (e, go)
+    }
+
+    /// An enrolment that notes the public half of each key it is given, its first answer lost.
+    fn noting_enroller() -> (Enroller, Arc<std::sync::Mutex<Vec<Vec<u8>>>>) {
+        let keys = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let k = keys.clone();
+        let e: Enroller = Arc::new(move |link: PairingLink, key: TlsKey| {
+            let k = k.clone();
+            Box::pin(async move {
+                let first = {
+                    let mut k = k.lock().unwrap();
+                    k.push(key.public_key().unwrap());
+                    k.len() == 1
+                };
+                if first {
+                    return Err(PairError::Enrol(
+                        "lmgw's answer to the enrolment broke off".into(),
+                    ));
+                }
+                Ok(crate::pairing::tests::enrolled_for(&link))
+            })
+        });
+        (e, keys)
+    }
+
+    /// D8's lost answer (lmgw's device link §3.3): the first enrolment's answer did not arrive,
+    /// and the owner presses Pair again: Kai sends the key it sent with that token, which lmgw
+    /// answers with the same certificate; a link with another token gets a new key.
+    #[tokio::test(start_paused = true)]
+    async fn trying_a_link_again_sends_the_key_sent_with_its_token() {
+        let (enrol, keys) = noting_enroller();
+        let mut r = rig_enrolling("", |_, _| {}, enrol);
+        r.until(|m| m.pairing == Pairing::NotPaired).await;
+        let e = r.paste(&good()).await.unwrap_err();
+        assert!(e.contains("broke off"), "{e}");
+        assert_eq!(r.paste(&good()).await, Ok(()));
+        let other = crate::pairing::tests::link_with_token(
+            &fp(&PKI.ca),
+            NEW,
+            "desktop",
+            "lmgw-enrol-fedcba9876543210fedcba9876543210",
+        );
+        r.until(paired).await;
+        assert_eq!(r.paste(&other).await, Ok(()));
+        let keys = keys.lock().unwrap().clone();
+        assert_eq!(keys.len(), 3);
+        assert_eq!(keys[0], keys[1], "the same token, the same key");
+        assert_ne!(keys[1], keys[2], "another token, a new key");
+        r.quit().await;
+    }
+
+    /// lmgw's device link §7.2: the feed's `hello` says what lmgw holds about the device. Its URLs
+    /// replace the pairing's list (`device-link.json`, the tooltip's URL, the link's reach) and its
+    /// certificate's dates the stored ones (the notice, the lapse by Kai's date); a `hello`
+    /// without them keeps what Kai has.
+    #[tokio::test(start_paused = true)]
+    async fn hellos_urls_and_dates_replace_the_stored_ones() {
+        let mut r = rig("", paired_at(OLD));
+        r.until(paired).await;
+        let before = std::fs::read_to_string(&r.paths.device_link_file).unwrap();
+        r.link.raise(LinkEvent::Device(DeviceFacts {
+            urls: None,
+            cert: None,
+            dashboard: None,
+        }));
+        r.link.raise(connected());
+        r.until(|m| {
+            matches!(
+                &m.pairing,
+                Pairing::Paired {
+                    link: Link::Up { .. },
+                    ..
+                }
+            )
+        })
+        .await;
+        assert_eq!(
+            std::fs::read_to_string(&r.paths.device_link_file).unwrap(),
+            before,
+            "nothing new, nothing written"
+        );
+        let urls: lmgw_client::pairing::Urls =
+            vec![MOVED.to_owned(), OLD.to_owned()].try_into().unwrap();
+        let dates = lmgw_client::requests::CertDates {
+            not_after_ms: 1_900_000_000_000,
+            notice_after_ms: 1_000,
+        };
+        r.link.raise(LinkEvent::Device(DeviceFacts {
+            urls: Some(urls.clone()),
+            cert: Some(dates),
+            dashboard: None,
+        }));
+        let m = r
+            .until(|m| matches!(&m.pairing, Pairing::Paired { url, .. } if url == MOVED))
+            .await;
+        assert_eq!(
+            m.certificate.as_deref(),
+            Some("this device's certificate lapses on 2030-03-17; pair it again before then"),
+            "the notice from lmgw's dates"
+        );
+        let stored = Paired::load(&r.paths.device_link_file).unwrap().unwrap();
+        assert_eq!(stored.credentials.urls, urls);
+        assert_eq!(stored.credentials.dates(), dates);
+        let creds = r.link.creds.lock().unwrap().clone().unwrap();
+        assert_eq!(creds.reach.urls(), [MOVED, OLD], "the link's reach");
+        assert_eq!(creds.url(), MOVED);
+        assert_eq!(creds.tls.not_after_ms(), Some(1_900_000_000_000));
+        assert!(
+            creds.tls.lapsed(1_900_000_000_000),
+            "the lapse by lmgw's date"
+        );
+        r.quit().await;
+    }
+
+    /// Open in lmgw before the feed's first `hello` on a pairing: lmgw has not said where its
+    /// dashboard is yet, and Kai says so (lmgw's device link §7.2).
+    #[tokio::test(start_paused = true)]
+    async fn open_in_lmgw_before_the_first_hello_says_kai_waits_for_lmgw() {
+        let mut r = rig("", paired_at(OLD));
+        r.until(paired).await;
+        r.cmds.send(Command::OpenInLmgw).unwrap();
+        let n = r.notice("Kai: Open in lmgw waits for lmgw").await;
+        assert!(
+            n.body.contains("has not connected to lmgw yet"),
+            "{}",
+            n.body
+        );
+        r.quit().await;
+    }
+
+    fn connected() -> LinkEvent {
+        LinkEvent::Connected {
+            device: "desktop".into(),
+            held: false,
+            hosts_label: None,
+            admin: Default::default(),
+        }
+    }
+
+    /// The security review's S1: a folder lookup the old pairing sent, answered 401 after a
+    /// re-pair to the same lmgw, never revokes the new pairing; the new pairing looks its folder up
+    /// again at its `hello`, and its own 401 does revoke.
+    #[tokio::test(start_paused = true)]
+    async fn a_same_lmgw_re_pair_with_a_request_in_flight_keeps_the_new_pairing() {
+        let voice = HeldFolders::default();
+        let mut r = rig_with("", paired_at(OLD), fresh_enroller(), voice.clone());
+        r.until(paired).await;
+        r.link.raise(connected());
+        for _ in 0..100 {
+            if voice.count() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(voice.count(), 1, "the old pairing's lookup is on its way");
+        // The same lmgw again, with a new key.
+        let same = link_for(&fp(&PKI.ca), OLD, "again");
+        assert_eq!(r.paste(&same).await, Ok(()));
+        r.until(|m| {
+            matches!(
+                &m.pairing,
+                Pairing::Paired {
+                    link: Link::Down { .. },
+                    ..
+                }
+            )
+        })
+        .await;
+        assert_eq!(*r.link.starts.lock().unwrap(), [OLD, OLD]);
+        // lmgw ended the old key: its lookup's 401 reaches no one.
+        assert!(
+            !voice.answer(0, Err(key_unknown())),
+            "the old pairing's lookup was dropped with it"
+        );
+        r.link.raise(connected());
+        for _ in 0..100 {
+            if voice.count() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(voice.count(), 2, "the new pairing looks its folder up");
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert!(
+            matches!(r.model.borrow().pairing, Pairing::Paired { .. }),
+            "{:?}",
+            r.model.borrow().pairing
+        );
+        // The new pairing's own refusal decides.
+        assert!(voice.answer(1, Err(key_unknown())));
+        r.until(|m| matches!(m.pairing, Pairing::Revoked { .. }))
+            .await;
+        r.quit().await;
+    }
+
+    /// S1's second line: a key refusal counts only for the pairing it went under.
+    #[tokio::test(start_paused = true)]
+    async fn a_key_refusal_answers_for_the_pairing_it_went_under() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under_config_home(dir.path());
+        let store = Arc::new(MemoryStore::default());
+        store_pairing(&PKI, &paths, &store, OLD);
+        let (_audio_tx, audio_rx) = mpsc::unbounded_channel();
+        let (model_tx, _model) = watch::channel(TrayModel::starting(false));
+        let (ui_tx, _ui) = async_channel::unbounded();
+        let (ntx, _notices) = mpsc::unbounded_channel();
+        let mut core = Core::new(
+            Config::default(),
+            paths,
+            "/usr/bin/kai".into(),
+            store,
+            FakeLink::default(),
+            crate::voice::NoVoice,
+            (FakeAudio::default(), audio_rx),
+            model_tx,
+            ui_tx,
+            None,
+        );
+        core.notify_into(ntx);
+        core.load().await;
+        let now = core.identity;
+        assert!(now.is_some(), "connected");
+        core.key_refused(Some([7; 32]), "an old key".into(), KeyLoss::PairAgain)
+            .await;
+        core.key_refused(None, "no pairing".into(), KeyLoss::PairAgain)
+            .await;
+        assert!(matches!(core.model.pairing, Pairing::Paired { .. }));
+        core.key_refused(now, "this key".into(), KeyLoss::PairAgain)
+            .await;
+        assert!(matches!(core.model.pairing, Pairing::Revoked { .. }));
+    }
+
+    /// The security review's S2: while an enrolment is on its way, the wallet's retry does not
+    /// load the stored pairing beside it.
+    #[tokio::test(start_paused = true)]
+    async fn the_wallets_retry_loads_nothing_while_kai_enrols() {
+        let (enrol, go) = held_enroller();
+        let mut r = rig_enrolling(
+            "[wallet]\nretry_s = 3\n",
+            |s, p| {
+                paired_at(OLD)(s, p);
+                s.set_locked(true);
+            },
+            enrol,
+        );
+        r.until(|m| matches!(m.pairing, Pairing::WalletLocked { .. }))
+            .await;
+        // The owner unlocks and pastes before the next check.
+        r.store.set_locked(false);
+        let cmds = r.cmds.clone();
+        let link = PairingLink::parse(&good()).unwrap();
+        let (reply, answer) = oneshot::channel();
+        cmds.send(Command::PairPasted {
+            link,
+            shown: Some(OLD.into()),
+            reply,
+        })
+        .unwrap();
+        r.until(|m| matches!(m.link_wait, Some(LinkWait::Enrolling { .. })))
+            .await;
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert!(
+            r.link.starts.lock().unwrap().is_empty(),
+            "the stored pairing connected during the enrolment"
+        );
+        go.notify_one();
+        assert_eq!(answer.await.unwrap(), Ok(()));
+        r.until(|m| matches!(&m.pairing, Pairing::Paired { url, .. } if url == NEW))
+            .await;
+        assert_eq!(*r.link.starts.lock().unwrap(), [NEW]);
+        r.quit().await;
+    }
+
+    /// S2: Try again on a disabled device does nothing while an enrolment is on its way.
+    #[tokio::test(start_paused = true)]
+    async fn try_again_loads_nothing_while_kai_enrols() {
+        let (enrol, go) = held_enroller();
+        let mut r = rig_enrolling("", paired_at(OLD), enrol);
+        r.until(paired).await;
+        r.link.raise(LinkEvent::Revoked {
+            reason: "disabled".into(),
+            loss: Some(KeyLoss::Disabled),
+        });
+        r.until(|m| matches!(m.pairing, Pairing::Disabled { .. }))
+            .await;
+        let (reply, answer) = oneshot::channel();
+        r.cmds
+            .send(Command::PairPasted {
+                link: PairingLink::parse(&good()).unwrap(),
+                shown: Some(OLD.into()),
+                reply,
+            })
+            .unwrap();
+        r.until(|m| matches!(m.link_wait, Some(LinkWait::Enrolling { .. })))
+            .await;
+        r.cmds.send(Command::TryAgain).unwrap();
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert_eq!(*r.link.starts.lock().unwrap(), [OLD], "no second start");
+        go.notify_one();
+        assert_eq!(answer.await.unwrap(), Ok(()));
+        r.until(|m| matches!(&m.pairing, Pairing::Paired { url, .. } if url == NEW))
+            .await;
+        assert_eq!(*r.link.starts.lock().unwrap(), [OLD, NEW]);
+        r.quit().await;
+    }
+
+    /// Decision 5 as the owner settled it (2026-10-15): an enrolment the wallet did not take (it
+    /// locked between the dialog and the store) connects at once from memory, is said in a
+    /// notification and the tooltip, and is stored once the wallet opens; the old gateway's key
+    /// goes only then. Try again on it uses the key in memory.
+    #[tokio::test(start_paused = true)]
+    async fn an_enrolment_the_wallet_did_not_take_runs_at_once_and_is_stored_when_it_opens() {
+        let (enrol, go) = held_enroller();
+        let mut r = rig_enrolling("", paired_at(OLD), enrol);
+        r.until(paired).await;
+        let (reply, answer) = oneshot::channel();
+        r.cmds
+            .send(Command::PairPasted {
+                link: PairingLink::parse(&good()).unwrap(),
+                shown: Some(OLD.into()),
+                reply,
+            })
+            .unwrap();
+        r.until(|m| matches!(m.link_wait, Some(LinkWait::Enrolling { .. })))
+            .await;
+        r.store.set_locked(true);
+        go.notify_one();
+        assert_eq!(answer.await.unwrap(), Ok(()), "the pairing works");
+        let m = r
+            .until(|m| matches!(&m.pairing, Pairing::Paired { url, .. } if url == NEW))
+            .await;
+        assert_eq!(
+            *r.link.starts.lock().unwrap(),
+            [OLD, NEW],
+            "connected at once"
+        );
+        let n = r.notice("Kai: the pairing is not stored yet").await;
+        assert!(
+            n.body.contains("KWallet is locked") && n.body.contains("loses the pairing"),
+            "{}",
+            n.body
+        );
+        let line = m.unstored.clone().unwrap_or_default();
+        assert!(line.contains("KWallet is locked"), "{line}");
+        assert_eq!(r.stored(), [old_fp()], "nothing stored, the old key kept");
+        assert_eq!(r.paired_url().as_deref(), Some(OLD));
+        // Disabled meanwhile: Try again uses the key in memory.
+        r.link.raise(LinkEvent::Revoked {
+            reason: "disabled".into(),
+            loss: Some(KeyLoss::Disabled),
+        });
+        r.until(|m| matches!(m.pairing, Pairing::Disabled { .. }))
+            .await;
+        r.cmds.send(Command::TryAgain).unwrap();
+        r.until(|m| matches!(&m.pairing, Pairing::Paired { url, .. } if url == NEW))
+            .await;
+        assert_eq!(*r.link.starts.lock().unwrap(), [OLD, NEW, NEW]);
+        // lmgw's hello names other URLs meanwhile (device link §7.2): kept with the pairing in
+        // memory, and stored with it.
+        r.link.raise(LinkEvent::Device(DeviceFacts {
+            urls: Some(vec![MOVED.to_owned(), NEW.to_owned()].try_into().unwrap()),
+            cert: None,
+            dashboard: None,
+        }));
+        r.until(|m| matches!(&m.pairing, Pairing::Paired { url, .. } if url == MOVED))
+            .await;
+        assert_eq!(
+            r.paired_url().as_deref(),
+            Some(OLD),
+            "the old pairing's file stays until the new one is stored"
+        );
+        // The wallet opens: stored, the old gateway's key goes, the line goes.
+        r.store.set_locked(false);
+        r.notice("Kai stored its pairing").await;
+        r.until_stored(&[&new_fp()]).await;
+        assert_eq!(r.paired_url().as_deref(), Some(MOVED));
+        r.until(|m| m.unstored.is_none()).await;
+        r.cmds.send(Command::Quit).unwrap();
+        let (task, mut notices) = (r.task, r.notices);
+        assert_eq!(task.await.unwrap(), Ended::Quit);
+        while let Ok(n) = notices.try_recv() {
+            assert_ne!(n.summary, "Kai: the pairing is lost", "{}", n.body);
+        }
+    }
+
+    /// A quit while the pairing is still not stored says it is lost.
+    #[tokio::test(start_paused = true)]
+    async fn a_quit_with_the_pairing_unstored_says_it_is_lost() {
+        let (enrol, go) = held_enroller();
+        let mut r = rig_enrolling("", |_, _| {}, enrol);
+        r.until(|m| m.pairing == Pairing::NotPaired).await;
+        let (reply, answer) = oneshot::channel();
+        r.cmds
+            .send(Command::PairPasted {
+                link: PairingLink::parse(&good()).unwrap(),
+                shown: None,
+                reply,
+            })
+            .unwrap();
+        r.until(|m| matches!(m.link_wait, Some(LinkWait::Enrolling { .. })))
+            .await;
+        r.store.set_locked(true);
+        go.notify_one();
+        assert_eq!(answer.await.unwrap(), Ok(()));
+        r.until(paired).await;
+        r.notice("Kai: the pairing is not stored yet").await;
+        r.cmds.send(Command::Quit).unwrap();
+        let n = r.notice("Kai: the pairing is lost").await;
+        assert!(
+            n.body.contains(NEW) && n.body.contains("KWallet is locked"),
+            "{}",
+            n.body
+        );
+        assert_eq!(r.task.await.unwrap(), Ended::Quit);
+    }
+
+    /// The security review's S4: `device-link.json` cannot be written after the wallet took the
+    /// key. The pairing is kept and runs from memory, the owner hears that a restart would lose it,
+    /// and the write is tried again until it works.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_write_after_the_wallet_took_the_key_keeps_the_pairing() {
+        let mut r = rig("", |_, _| {});
+        r.until(|m| m.pairing == Pairing::NotPaired).await;
+        std::fs::create_dir_all(r.paths.device_link_file.join("in-the-way")).unwrap();
+        assert_eq!(r.paste_shown(&good(), None).await, Ok(()));
+        let m = r
+            .until(|m| matches!(&m.pairing, Pairing::Paired { url, .. } if url == NEW))
+            .await;
+        assert_eq!(*r.link.starts.lock().unwrap(), [NEW]);
+        assert_eq!(r.stored(), [new_fp()], "the wallet took the key");
+        let n = r.notice("Kai: the pairing is not stored yet").await;
+        assert!(
+            n.body.contains("cannot write") && n.body.contains("loses the pairing"),
+            "{}",
+            n.body
+        );
+        assert!(m.unstored.is_some());
+        // A further pairing waits for this one to be stored (the dialog shows the pairing Kai
+        // runs).
+        let e = r
+            .paste_shown(&good(), Some(NEW.into()))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("not stored yet") && e.contains("cannot write"),
+            "{e}"
+        );
+        tokio::time::sleep(Duration::from_secs(12)).await;
+        assert!(r.model.borrow().unstored.is_some(), "still not written");
+        std::fs::remove_dir_all(&r.paths.device_link_file).unwrap();
+        r.notice("Kai stored its pairing").await;
+        assert_eq!(r.paired_url().as_deref(), Some(NEW));
+        r.until(|m| m.unstored.is_none()).await;
+        r.quit().await;
+    }
+
+    /// lmgw's device link §12: a pairing from before TLS (`lmgw.url`, a bearer key in the wallet)
+    /// says "pair again"; the next pairing removes both.
+    #[tokio::test(start_paused = true)]
+    async fn a_pairing_from_before_tls_says_pair_again_and_the_next_pairing_clears_it() {
+        let v1 = "http://127.0.0.1:8001";
+        let mut r = rig(&format!("[lmgw]\nurl = \"{v1}\"\n"), |s, _| {
+            s.v1.lock().unwrap().insert(v1.into());
+        });
+        let m = r
+            .until(|m| matches!(m.pairing, Pairing::PairAgain { .. }))
+            .await;
+        let Pairing::PairAgain { why } = &m.pairing else {
+            unreachable!()
+        };
+        assert!(why.contains("before TLS") && why.contains(v1), "{why}");
+        assert_eq!(
+            crate::tray::model::render(&m).menu[0],
+            crate::tray::model::MenuEntry::PairWithLmgw
+        );
+        assert_eq!(r.paste(&good()).await, Ok(()));
+        r.until(paired).await;
+        for _ in 0..100 {
+            if r.store.v1.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(r.store.v1.lock().unwrap().is_empty(), "the bearer key went");
+        assert_eq!(Config::load(&r.paths.config_file).unwrap().lmgw.url, None);
+        r.quit().await;
+    }
+
+    /// lmgw's device link §5.3: a certificate past its date is not tried, and Kai says the date it
+    /// knows; from `notice_after` on the tooltip says when it lapses.
+    #[tokio::test(start_paused = true)]
+    async fn the_certificates_dates_are_said() {
+        let lapsed = |s: &MemoryStore, p: &Paths| {
+            let mut paired = store_pairing(&PKI, p, s, OLD);
+            paired.credentials.notice_after_ms = 1_000;
+            paired.credentials.not_after_ms = 1_823_097_791_000 - 1_200_000_000_000;
+            paired.save(&p.device_link_file).unwrap();
+        };
+        let mut r = rig("", lapsed);
+        let m = r
+            .until(|m| matches!(m.pairing, Pairing::PairAgain { .. }))
+            .await;
+        assert_eq!(
+            m.pairing,
+            Pairing::PairAgain {
+                why: format!(
+                    "this device's certificate lapsed on {}; pair it again",
+                    crate::pairing::date(1_823_097_791_000 - 1_200_000_000_000)
+                )
+            }
+        );
+        assert!(r.link.starts.lock().unwrap().is_empty(), "not tried");
+        r.quit().await;
+
+        let notice = |s: &MemoryStore, p: &Paths| {
+            let mut paired = store_pairing(&PKI, p, s, OLD);
+            paired.credentials.notice_after_ms = 1_000;
+            paired.save(&p.device_link_file).unwrap();
+        };
+        let mut r = rig("", notice);
+        let m = r.until(paired).await;
+        assert_eq!(
+            m.certificate.as_deref(),
+            Some("this device's certificate lapses on 2100-01-01; pair it again before then")
+        );
+        // The certificate lapses while Kai runs: lmgw says so, and Kai says its date.
+        r.link.raise(LinkEvent::Revoked {
+            reason: "the device's certificate expired".into(),
+            loss: Some(KeyLoss::Lapsed),
+        });
+        let m = r
+            .until(|m| matches!(m.pairing, Pairing::PairAgain { .. }))
+            .await;
+        assert_eq!(
+            m.pairing,
+            Pairing::PairAgain {
+                why: "this device's certificate lapsed on 2100-01-01; pair it again".into()
+            }
         );
         r.quit().await;
     }
 
     #[tokio::test(start_paused = true)]
     async fn check_for_updates_goes_to_the_updater() {
-        let mut r = rig("", |_| {});
+        let mut r = rig("", |_, _| {});
         r.until(|m| m.pairing == Pairing::NotPaired).await;
         r.cmds.send(Command::CheckForUpdates).unwrap();
         assert_eq!(
@@ -2461,7 +3895,7 @@ mod tests {
     /// app AEC's default devices back, the link stopped) and ends with `Ended::Restart` for `main`.
     #[tokio::test(start_paused = true)]
     async fn restart_runs_the_quit_sequence_and_ends_as_a_restart() {
-        let r = rig("", |_| {});
+        let r = rig("", |_, _| {});
         r.cmds.send(Command::Restart).unwrap();
         assert_eq!(r.task.await.unwrap(), Ended::Restart);
         assert_eq!(
@@ -2475,7 +3909,7 @@ mod tests {
     /// A Quit during a Restart's quit sequence wins: Kai ends without the restart.
     #[tokio::test(start_paused = true)]
     async fn a_quit_after_restart_is_a_quit() {
-        let r = rig("", |_| {});
+        let r = rig("", |_, _| {});
         r.cmds.send(Command::Restart).unwrap();
         r.cmds.send(Command::Quit).unwrap();
         assert_eq!(r.task.await.unwrap(), Ended::Quit);
@@ -2484,7 +3918,7 @@ mod tests {
     /// A Restart after the quit began is not one: Kai ends as a quit.
     #[tokio::test(start_paused = true)]
     async fn a_restart_after_quit_is_a_quit() {
-        let r = rig("", |_| {});
+        let r = rig("", |_, _| {});
         r.cmds.send(Command::Quit).unwrap();
         r.cmds.send(Command::Restart).unwrap();
         assert_eq!(r.task.await.unwrap(), Ended::Quit);
@@ -2492,7 +3926,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn start_with_plasma_toggles_the_autostart_file() {
-        let mut r = rig("", |_| {});
+        let mut r = rig("", |_, _| {});
         r.until(|m| m.pairing == Pairing::NotPaired).await;
         r.cmds.send(Command::SetAutostart(true)).unwrap();
         r.until(|m| m.autostart).await;
@@ -2506,8 +3940,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn tray_audio_choices_are_saved_forwarded_and_shown() {
         let mut r = rig(
-            "[lmgw]\nurl = \"http://127.0.0.1:1\"\n[audio]\noutput = \"hdmi\"\n",
-            |_| {},
+            "[lmgw]\nretry_max_s = 7\n[audio]\noutput = \"hdmi\"\n",
+            |_, _| {},
         );
         let m = r.until(|m| m.pairing != Pairing::Checking).await;
         assert_eq!(
@@ -2527,11 +3961,7 @@ mod tests {
         assert_eq!(c.audio.echo_mode, EchoMode::App);
         assert_eq!(c.audio.input.as_deref(), Some("usb mic"));
         assert_eq!(c.audio.output, None);
-        assert_eq!(
-            c.lmgw.url.as_deref(),
-            Some("http://127.0.0.1:1"),
-            "the rest is kept"
-        );
+        assert_eq!(c.lmgw.retry_max_s, 7, "the rest is kept");
         // The audio thread's reports reach the tray.
         let status = crate::audio::EchoStatus {
             chosen: EchoMode::App,
@@ -2561,7 +3991,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn an_audio_notice_is_notified_once_per_pipewire_outage() {
-        let mut r = rig("", |_| {});
+        let mut r = rig("", |_, _| {});
         r.until(|m| m.pairing == Pairing::NotPaired).await;
         let line = "cannot open the playback stream: not connected to PipeWire";
         r.audio_tx
@@ -2591,7 +4021,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn ring_over_fullscreen_is_saved_shown_and_sent_to_the_overlay() {
-        let mut r = rig("[lmgw]\nurl = \"http://127.0.0.1:1\"\n", |_| {});
+        let mut r = rig("[lmgw]\nretry_max_s = 7\n", |_, _| {});
         let m = r.until(|m| m.pairing != Pairing::Checking).await;
         assert!(m.overlay.ring_over_fullscreen, "the default (§16 answer 5)");
         r.cmds.send(Command::SetRingOverFullscreen(false)).unwrap();
@@ -2611,7 +4041,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn the_overlays_ring_note_shows_in_the_tooltip_until_it_is_cleared() {
-        let mut r = rig("[lmgw]\nurl = \"http://127.0.0.1:1\"\n", |_| {});
+        let mut r = rig("[lmgw]\nretry_max_s = 7\n", |_, _| {});
         r.until(|m| m.pairing != Pairing::Checking).await;
         let line = "its web process ended twice, so the ring is down";
         r.cmds
@@ -2662,7 +4092,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_choice_that_cannot_be_saved_is_not_applied_and_says_why() {
-        let mut r = rig("", |_| {});
+        let mut r = rig("", |_, _| {});
         r.until(|m| m.pairing == Pairing::NotPaired).await;
         // A directory where the config file should be: the write fails.
         std::fs::remove_file(&r.paths.config_file).unwrap();
@@ -2783,7 +4213,7 @@ mod tests {
         const FILE: &str = "# mine\n[voice]\ngrace_s = 30 # half a minute\n\
             [policy]\nwiden_trust_by_tools = true\n[policy.widen_by_tools]\n\
             conversation_start = true\n";
-        let r = rig(FILE, |_| {});
+        let r = rig(FILE, |_, _| {});
         let entries = calls::provider(r.cmds.clone(), crate::jobs::Jobs::default()).entries();
         let run = |tool: &str, args: serde_json::Value| {
             let entry = entries.iter().find(|e| e.spec.name == tool).unwrap();
@@ -2877,6 +4307,36 @@ mod tests {
         assert_eq!(r.host.policies.lock().unwrap().len(), 2);
     }
 
+    /// The confirmation's "always allow" (`Command::AllowAlways`): the tool's state is written as
+    /// `allow_trusted`, the file's comments stay, and the host gets the new policy; a tool Kai
+    /// does not offer writes nothing and is said.
+    #[tokio::test]
+    async fn always_allow_writes_allow_trusted() {
+        const FILE: &str = "# mine\n[policy.tools]\napp_launch = \"confirm\"\n";
+        let mut r = rig(FILE, |_, _| {});
+        r.cmds
+            .send(Command::AllowAlways {
+                tool: "app_launch".into(),
+            })
+            .unwrap();
+        r.cmds
+            .send(Command::AllowAlways {
+                tool: "no_such_tool".into(),
+            })
+            .unwrap();
+        let notice = r.notice("Kai: \"always allow\" was not saved").await;
+        assert!(notice.body.contains("no_such_tool"), "{notice:?}");
+        assert_eq!(
+            std::fs::read_to_string(&r.paths.config_file).unwrap(),
+            "# mine\n[policy.tools]\napp_launch = \"allow_trusted\"\n"
+        );
+        assert_eq!(
+            r.host.policies.lock().unwrap().len(),
+            1,
+            "the host has the new policy"
+        );
+    }
+
     /// WP21b: the window's operations run in the core like the tools' (the file, the host's policy),
     /// answer with the structured response, and a refusal writes nothing; the tray's Settings
     /// reaches the GTK side.
@@ -2885,7 +4345,7 @@ mod tests {
         use crate::settings::{Request, Response};
 
         const FILE: &str = "# mine\n[voice]\ngrace_s = 30\n";
-        let r = rig(FILE, |_| {});
+        let r = rig(FILE, |_, _| {});
         r.cmds.send(Command::OpenSettings).unwrap();
         assert!(matches!(r.ui.recv().await, Ok(UiCmd::ShowSettings)));
         let ask = |request: Request| {
@@ -2956,7 +4416,7 @@ mod tests {
     /// RemoteDesktop portal's token in its own state directory, where the portal stores it.
     #[tokio::test]
     async fn the_window_forgets_the_remote_control_permission_in_kais_state_directory() {
-        let r = rig("", |_| {});
+        let r = rig("", |_, _| {});
         let file = crate::desktop::fdo::input::token_file(&r.paths.state_dir);
         let ask = |forget: bool| {
             let (reply, rx) = oneshot::channel();
@@ -3005,7 +4465,7 @@ mod tests {
                 .to_owned()
         };
 
-        let mut r = rig("", |_| {});
+        let mut r = rig("", |_, _| {});
         r.until(|m| matches!(m.pairing, Pairing::NotPaired)).await;
         let f = facts(&r).await.unwrap();
         assert!(

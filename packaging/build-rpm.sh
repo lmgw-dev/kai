@@ -40,13 +40,13 @@ crate=$(sed -nE 's|^lmgw-client = \{ path = "([^"]+)".*|\1|p' Cargo.toml)
 lmgw=${LMGW_DIR:-$(realpath -m "$crate/../..")}
 pin=$(scripts/lmgw-pin.sh commit)
 tree=$(scripts/lmgw-pin.sh tree)
-tag=$(scripts/lmgw-pin.sh tag)
 [[ "$(git -C "$lmgw" cat-file -t "$tree" 2>/dev/null)" == tree ]] || {
-  echo "the pinned lmgw tree $tree (LMGW_PIN, $tag) is not in $lmgw: fetch it there, or set LMGW_DIR" >&2
+  echo "the pinned lmgw tree $tree (LMGW_PIN) is not in $lmgw: fetch it there, or set LMGW_DIR" >&2
   exit 1
 }
 # How the package's description names the source: the commit where the checkout has it (lmgw's
-# development history), else the public release whose tree it is.
+# development history, where lmgw_tag may be `unpublished`), else the public release whose tree it
+# is (a clone of the public lmgw at lmgw_tag), else the tree alone.
 if git -C "$lmgw" cat-file -e "$pin^{commit}" 2>/dev/null; then
   [[ "$(git -C "$lmgw" rev-parse "$pin^{tree}")" == "$tree" ]] || {
     echo "LMGW_PIN disagrees with itself: lmgw_commit ${pin:0:12}'s tree is not lmgw_tree ${tree:0:12}" >&2
@@ -54,7 +54,11 @@ if git -C "$lmgw" cat-file -e "$pin^{commit}" 2>/dev/null; then
   }
   lmgw_source="commit $pin"
 else
-  lmgw_source="$tag (tree $tree)"
+  if release=$(scripts/lmgw-pin.sh tag 2>/dev/null); then
+    lmgw_source="$release (tree $tree)"
+  else
+    lmgw_source="tree $tree"
+  fi
 fi
 for d in lmgw-client lmgw-api-types lmgw-update lmgw-ui-kit; do
   git -C "$lmgw" cat-file -e "$tree:crates/$d/Cargo.toml" 2>/dev/null || {

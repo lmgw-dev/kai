@@ -152,9 +152,11 @@ viz-reference engine="../lmgw/crates/lmgw-ui/assets/voice/viz/engine.js":
     node scripts/viz-reference.mjs "{{engine}}" > src/audio/levels_reference.json
 
 # WP2's live check: Kai's live-test build against a dev lmgw on 127.0.0.1:8897 (build its headless
-# example first): pairing, the hold badge, the dev lmgw stopping and starting, disable and expiry
-# waiting with the key kept (Try again), rotate "pair again", each read by its kind, the old item
-# deleted on a re-pair. Verdicts in target/live-link/.
+# example first), over lmgw's device link (its listener on 8898): pairing (the v2 link, Kai's
+# enrolment, the code on lmgw's card confirmed), the hold badge, the dev lmgw stopping and starting
+# (the row's URLs through the next hello), disable and expiry waiting with the key kept (Try again),
+# a key ended at once saying "pair again", each read by its kind, and a re-pair that keeps the key
+# until the new one is confirmed. Verdicts in target/live-link/.
 [doc("Live check of the lmgw link against a dev lmgw on 127.0.0.1:8897")]
 live-check-link lmgw="../lmgw":
     scripts/live-check-link.sh "{{lmgw}}"

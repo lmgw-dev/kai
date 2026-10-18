@@ -13,7 +13,6 @@
 //!   (no `GET` stream), so these are the invalidations there are.
 
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 use std::sync::Mutex;
 
 use serde_json::Value;
@@ -36,16 +35,13 @@ pub enum Seen {
 pub struct Lists(Mutex<Option<Kept>>);
 
 struct Kept {
-    /// Whose list it is (the pairing's URL and key, hashed: the key is not kept twice).
-    whose: u64,
+    /// Whose list it is (the pairing: its device certificate, hashed).
+    whose: [u8; 32],
     tools: HashMap<String, bool>,
 }
 
-fn whose(c: &Credentials) -> u64 {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    c.url.hash(&mut h);
-    c.key.expose().hash(&mut h);
-    h.finish()
+fn whose(c: &Credentials) -> [u8; 32] {
+    *c.tls.identity()
 }
 
 impl Lists {
@@ -91,17 +87,12 @@ mod tests {
 
     use super::*;
 
-    fn creds(url: &str, key: &str) -> Credentials {
-        Credentials {
-            url: url.into(),
-            key: crate::pairing::DeviceKey::from_store(key.into()),
-        }
-    }
+    use crate::lmgw_link::test_pki::{FOREIGN, PKI};
 
     #[test]
     fn the_kept_list_answers_for_its_own_credentials_until_forgotten() {
         let l = Lists::default();
-        let a = creds("http://a", "k1");
+        let a = PKI.creds("https://a");
         assert_eq!(l.seen(&a, "fx__show"), Seen::Unknown);
         l.put(
             &a,
@@ -115,9 +106,12 @@ mod tests {
         assert_eq!(l.seen(&a, "fx__old"), Seen::View);
         assert_eq!(l.seen(&a, "fx__plain"), Seen::NoView);
         assert_eq!(l.seen(&a, "fx__new"), Seen::Unknown, "not in the list");
-        // Another pairing (gateway or key) does not read it.
-        assert_eq!(l.seen(&creds("http://b", "k1"), "fx__plain"), Seen::Unknown);
-        assert_eq!(l.seen(&creds("http://a", "k2"), "fx__plain"), Seen::Unknown);
+        // Another pairing does not read it; the same pairing at another of its URLs does.
+        assert_eq!(
+            l.seen(&FOREIGN.creds("https://a"), "fx__plain"),
+            Seen::Unknown
+        );
+        assert_eq!(l.seen(&PKI.creds("https://b"), "fx__plain"), Seen::NoView);
         // A fetch replaces it.
         l.put(&a, &json!({"tools": [{"name": "fx__plain", "_meta": {"ui": {"resourceUri": "ui://fx__p"}}}]}));
         assert_eq!(l.seen(&a, "fx__plain"), Seen::View);

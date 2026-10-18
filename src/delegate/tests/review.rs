@@ -75,7 +75,7 @@ async fn a_policy_change_applies_to_the_delegates_calls_and_listing() {
 #[tokio::test]
 async fn a_policy_change_during_a_task_applies_to_its_next_step() {
     let r = rig(
-        "http://127.0.0.1:1",
+        "https://127.0.0.1:1",
         Desk::with(LOOK_TOOLS),
         DelegateConfig::default(),
         PolicyConfig::default(),
@@ -104,7 +104,7 @@ async fn the_alias_that_answered_is_named_when_a_fallback_did() {
     let mut turn = text_turn("done: it says hello");
     turn["_fallback"] = json!("cloud-b");
     let lmgw = Lmgw::start(folders(None), vec![turn]).await;
-    lmgw.list_models(json!([{"id": "local-a", "capabilities": {"vision": true}}]));
+    lmgw.list_models(json!([{"id": "local-a", "capabilities": {"task": "chat", "endpoints": [], "source": "config", "vision": true}}]));
     let set = DelegateConfig {
         look: Some("local-a".into()),
         ..DelegateConfig::default()
@@ -140,8 +140,8 @@ async fn the_alias_that_answered_is_named_when_a_fallback_did() {
 async fn look_fails_up_front_on_an_alias_lmgw_lists_without_vision() {
     let lmgw = Lmgw::start(folders(None), vec![text_turn("done: x")]).await;
     lmgw.list_models(json!([
-        {"id": "blind", "capabilities": {"vision": false}},
-        {"id": "sighted", "capabilities": {"vision": true}},
+        {"id": "blind", "capabilities": {"task": "chat", "endpoints": [], "source": "config", "vision": false}},
+        {"id": "sighted", "capabilities": {"task": "chat", "endpoints": [], "source": "config", "vision": true}},
     ]));
     let set = |alias: &str| DelegateConfig {
         look: Some(alias.into()),
@@ -170,7 +170,7 @@ async fn look_fails_up_front_on_an_alias_lmgw_lists_without_vision() {
     for (alias, listed) in [("sighted", true), ("unlisted", false)] {
         let lmgw = Lmgw::start(folders(None), vec![text_turn("done: ok")]).await;
         if listed {
-            lmgw.list_models(json!([{"id": alias, "capabilities": {"vision": true}}]));
+            lmgw.list_models(json!([{"id": alias, "capabilities": {"task": "chat", "endpoints": [], "source": "config", "vision": true}}]));
         }
         let r = rig(
             &lmgw.url,

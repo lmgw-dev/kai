@@ -26,6 +26,10 @@
 //!    thread first, while Kai's talk key is held; Kai finishes its turn in the old thread and stays
 //!    off, naming the other device.
 
+// The owner's requests to the dev lmgw's plain listener (its dashboard and admin API), never the
+// device link: device link D15's rule (`clippy.toml`) is a paired Kai's connections'.
+#![allow(clippy::disallowed_methods)]
+
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -38,15 +42,14 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use super::Notice;
 use super::link::{ServerEvent, SessionEvent};
 use super::lmgw_live_tests::{
-    Lmgw, Mic, Report, Tap, Tapped, URL, device_key, env, is_server, ms, notice, set_up_mocks,
-    shown, until,
+    Lmgw, Mic, Report, Tap, Tapped, URL, device, env, is_server, ms, notice, set_up_mocks, shown,
+    until,
 };
 use crate::audio::live_tests::{MIC, MIC_IN, SINK, out_dir, private_or_skip, read_wav, settings};
 use crate::audio::{Audio, RATE};
 use crate::config::Config;
 use crate::core::{Command, Core};
 use crate::lmgw_link::{FeedLink, FeedSettings, RealtimeLink, RealtimeSettings};
-use crate::pairing::DeviceKey;
 use crate::paths::Paths;
 use crate::secret::MemoryStore;
 use crate::tray::model::{Link, MenuEntry, Pairing, TrayModel, VoiceShown, render};
@@ -144,8 +147,8 @@ async fn lmgw_conversation_live() {
     let mut lmgw = Lmgw::new();
     let boot = lmgw.start().await;
     set_up_mocks(&lmgw).await;
-    let key = device_key(&lmgw, "kai-live").await;
-    let key2 = device_key(&lmgw, "kai-live-2").await;
+    let kai = device(&lmgw, "kai-live", json!({})).await;
+    let second = device(&lmgw, "kai-live-2", json!({})).await;
     assert!(
         owners_folder(&lmgw, "Kai").await.is_none(),
         "a fresh gateway"
@@ -174,7 +177,7 @@ async fn lmgw_conversation_live() {
     std::fs::write(
         &paths.config_file,
         format!(
-            "[lmgw]\nurl = \"{URL}\"\nretry_max_s = 2\n[audio]\ninput = \"{MIC}\"\noutput = \"{SINK}\"\n\
+            "[lmgw]\nretry_max_s = 2\n[audio]\ninput = \"{MIC}\"\noutput = \"{SINK}\"\n\
              [voice]\nmode = \"push_to_talk\"\ngrace_s = 2\n[shortcuts]\nbind = false\n"
         ),
     )
@@ -183,14 +186,11 @@ async fn lmgw_conversation_live() {
     let remembered = || Config::load(&config_file).unwrap().conversation.folder_id;
     let config = Config::load(&paths.config_file).unwrap();
     let store = Arc::new(MemoryStore::default());
-    store.items.lock().unwrap().insert(
-        URL.into(),
-        ("kai-live".into(), DeviceKey::parse(&key).unwrap()),
-    );
-    let feed = FeedLink::new(FeedSettings::from_config(&config)).unwrap();
+    kai.store(&paths, &store);
+    let feed = FeedLink::new(FeedSettings::from_config(&config));
     let tap = Tap::default();
     let voice_link = Tapped {
-        link: RealtimeLink::new(RealtimeSettings::from_config(&config), feed.client()),
+        link: RealtimeLink::new(RealtimeSettings::from_config(&config)),
         tap: tap.clone(),
     };
     let (model_tx, mut model) = watch::channel(TrayModel::starting(false));
@@ -291,12 +291,11 @@ async fn lmgw_conversation_live() {
     );
     assert_eq!(settings_status, 200);
     // Why Kai never sends the folder's retention: a device's write of it is refused.
-    let (status, text) = lmgw
+    let (status, text) = kai
         .call(
             "POST",
             &format!("/chat/api/folders/{folder}"),
             Some(json!({"purge_days": 365})),
-            &key,
         )
         .await;
     r.line(format!(
@@ -542,8 +541,8 @@ async fn lmgw_conversation_live() {
             .cloned()
             .collect()
     });
-    let (t3_status, _) = lmgw
-        .call("GET", &format!("/chat/api/threads/{t3}"), None, &key)
+    let (t3_status, _) = kai
+        .call("GET", &format!("/chat/api/threads/{t3}"), None)
         .await;
     let kai_log = std::fs::read_to_string(&log_path).unwrap_or_default();
     let out_of_reach_lines = kai_log
@@ -683,24 +682,26 @@ async fn lmgw_conversation_live() {
     tokio::time::sleep(Duration::from_millis(150)).await;
     mic.say(&clip);
     tokio::time::sleep_until((a3 + Duration::from_secs(64)).into()).await;
-    let (status, text) = lmgw
+    let (status, text) = second
         .call(
             "POST",
             &format!("/chat/api/folders/{folder}/current"),
             Some(json!({})),
-            &key2,
         )
         .await;
     let rolled2: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
     let roll2_at = Instant::now();
     assert_eq!(status, 200, "{text}");
     let t4 = rolled2["thread"]["id"].as_i64().unwrap();
-    let mut req = format!("ws://127.0.0.1:8897/v1/realtime?chat_thread={t4}")
+    let req = lmgw_client::requests::realtime(t4)
+        .ws_url(&second.creds.url())
+        .unwrap()
         .into_client_request()
         .unwrap();
-    req.headers_mut()
-        .insert("authorization", format!("Bearer {key2}").parse().unwrap());
-    let (mut other, _) = tokio_tungstenite::connect_async(req)
+    let (mut other, _) = second
+        .creds
+        .tls
+        .websocket(req, None, false, Duration::from_secs(10))
         .await
         .expect("the second device binds");
     loop {
@@ -785,7 +786,7 @@ async fn lmgw_conversation_live() {
     r.line(format!("Kai quit; the dev lmgw {how}"));
     r.line(super::lmgw_live_tests::log_is_clean(
         &log_path,
-        &[&key, &key2],
+        &[&kai.secret(), &second.secret()],
     ));
     std::fs::write(out_dir().join("report.txt"), &r.0).unwrap();
 }

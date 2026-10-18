@@ -12,23 +12,17 @@ const NAME: &str = "Kai live check";
 const PERSONA: &str = "You are Kai, a calm desktop assistant.";
 const RULE: &str = "One sentence, details on request.";
 
-/// lmgw's profile list, read with the device key outside the page.
+/// lmgw's profile list, read over the pairing outside the page.
 async fn listed(r: &Run) -> Vec<Value> {
     let Some(creds) = r.lmgw.creds.clone() else {
         return Vec::new();
     };
-    let client = r.lmgw.client.clone();
     let got = r
         .lmgw
         .rt
         .spawn(async move {
-            let url = format!("{}/chat/api/profiles", creds.url.trim_end_matches('/'));
-            let resp = client
-                .get(url)
-                .bearer_auth(creds.key.expose())
-                .send()
-                .await
-                .ok()?;
+            let url = format!("{}/chat/api/profiles", creds.url().trim_end_matches('/'));
+            let resp = creds.http().get(url).send().await.ok()?;
             resp.json::<Value>().await.ok()
         })
         .await
@@ -229,7 +223,7 @@ pub(super) async fn drive(r: &mut Run) {
         format!("{a}; armed: {b}"),
     );
 
-    // Nothing else under the prefix; the key is not in the page.
+    // Nothing else under the prefix; no credential is in the page.
     for (method, path) in [
         ("GET", format!("/lmgw/chat/api/profiles/{id}")),
         ("GET", "/lmgw/chat/api/threads".to_owned()),
@@ -243,21 +237,14 @@ pub(super) async fn drive(r: &mut Run) {
             st,
         );
     }
-    let secret = r
-        .lmgw
-        .creds
-        .as_ref()
-        .map(|c| c.key.expose().to_owned())
-        .unwrap_or_default();
-    let tail = &secret[secret.len().saturating_sub(16)..];
     let seen = r
-        .js(&format!(
-            "document.documentElement.outerHTML.includes('{tail}') || \
-             performance.getEntries().some(e => e.name.includes('{tail}'))"
-        ))
+        .js(
+            "document.documentElement.outerHTML.includes('PRIVATE KEY') || \
+             performance.getEntries().some(e => e.name.includes('PRIVATE KEY'))",
+        )
         .await;
     r.ok(
-        "the device key is nowhere in the page",
+        "the device's key is nowhere in the page",
         seen == "false",
         seen,
     );

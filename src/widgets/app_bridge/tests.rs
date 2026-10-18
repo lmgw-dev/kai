@@ -696,12 +696,7 @@ async fn a_cancelled_open_ends_its_session() {
     }))
     .await;
     let apps = Apps {
-        creds: watch::channel(Some(Credentials {
-            url: f.url.clone(),
-            key: crate::pairing::DeviceKey::from_store("lmgw-device-test".into()),
-        }))
-        .1,
-        client: reqwest::Client::builder().no_proxy().build().unwrap(),
+        creds: creds(&f.url),
         connect: Duration::from_secs(5),
         bound: Bound {
             bytes: 1 << 20,
@@ -1061,17 +1056,12 @@ async fn a_call_that_ends_without_its_result_is_cancelled_to_the_view() {
 }
 
 fn creds(url: &str) -> watch::Receiver<Option<Credentials>> {
-    watch::channel(Some(Credentials {
-        url: url.to_owned(),
-        key: crate::pairing::DeviceKey::from_store("lmgw-device-test".into()),
-    }))
-    .1
+    watch::channel(Some(crate::lmgw_link::test_pki::creds(url))).1
 }
 
 fn apps_at(url: &str) -> Apps {
     Apps {
         creds: creds(url),
-        client: reqwest::Client::builder().no_proxy().build().unwrap(),
         connect: Duration::from_secs(5),
         bound: Bound {
             bytes: 1 << 20,

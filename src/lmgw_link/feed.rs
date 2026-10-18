@@ -1,15 +1,22 @@
-//! The feed task (§3.2, §3.3): one `GET /chat/api/feed` at a time over reqwest, its bytes through
-//! `lmgw-client`'s [`FeedReader`], its events mapped onto [`LinkEvent`]s by [`Translate`].
+//! The feed task (§3.2, §3.3): one `GET /chat/api/feed` at a time over the device link's reqwest
+//! client (`super::tls::Tls`), tried on the pairing's URLs by the device link's rule
+//! (`super::tls::race`), its bytes through `lmgw-client`'s [`FeedReader`], its events mapped onto
+//! [`LinkEvent`]s by [`Translate`].
 
 use std::time::Duration;
 
-use lmgw_client::feed::{FeedEvent, FeedItem, FeedReader, FolderNow, ThreadNow};
+use lmgw_client::feed::{
+    ApprovalRequested, ApprovalsChange, FeedEvent, FeedItem, FeedReader, FolderNow, ThreadNow,
+};
 use lmgw_client::requests;
 use lmgw_client::types::chat_feed::{LiveTurn, LiveVoice};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use super::{Credentials, FolderEvent, KeyLoss, LinkEvent, LmgwLink, ProfileEvent, describe};
+use super::{
+    Credentials, DeviceFacts, FolderEvent, KeyLoss, LinkEvent, LmgwLink, ProfileEvent, describe,
+    tls,
+};
 use crate::config::Config;
 use crate::conversation::FolderInfo;
 use crate::voice::{By, FeedFact};
@@ -26,6 +33,9 @@ pub struct FeedSettings {
     /// `lmgw.timeout_s`: the request's answer and the body's first bytes, and the keep-alive
     /// interval's stand-in until lmgw states one ([`Wait`]).
     pub timeout: Duration,
+    /// `lmgw.url_stagger_ms`: with several URLs, how long one may go without a connection before
+    /// the next is tried beside it (`super::tls::race`).
+    pub stagger: Duration,
 }
 
 impl FeedSettings {
@@ -33,6 +43,7 @@ impl FeedSettings {
         Self {
             retry_max: c.lmgw.retry_max(),
             timeout: c.lmgw.timeout(),
+            stagger: c.lmgw.url_stagger(),
         }
     }
 }
@@ -40,38 +51,23 @@ impl FeedSettings {
 /// Kai's lmgw link: the feed task, started and stopped by the core.
 pub struct FeedLink {
     settings: FeedSettings,
-    client: reqwest::Client,
     task: Option<JoinHandle<()>>,
 }
 
 impl FeedLink {
-    /// The HTTP client is built once (it reads the system's trust store, for an https gateway).
-    /// No proxy: Kai talks to its gateway directly (loopback, the LAN, a tunnel), and a proxy
-    /// would hold back the event stream.
-    pub fn new(settings: FeedSettings) -> Result<Self, String> {
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .build()
-            .map_err(|e| format!("cannot build the HTTP client: {}", describe(&e)))?;
-        Ok(Self {
+    pub fn new(settings: FeedSettings) -> Self {
+        Self {
             settings,
-            client,
             task: None,
-        })
-    }
-
-    /// The HTTP client, for the voice's requests to the same gateway (`RealtimeLink`).
-    pub fn client(&self) -> reqwest::Client {
-        self.client.clone()
+        }
     }
 }
 
 impl LmgwLink for FeedLink {
     fn start(&mut self, creds: Credentials, events: mpsc::UnboundedSender<LinkEvent>) {
         self.stop();
-        tracing::info!(url = %creds.url, "lmgw link: opening the feed");
+        tracing::info!(urls = ?creds.reach.urls(), "lmgw link: opening the feed");
         let run = Run {
-            client: self.client.clone(),
             creds,
             settings: self.settings,
             events,
@@ -105,12 +101,14 @@ enum End {
         was_up: bool,
         dead: bool,
     },
+    /// lmgw's 403 `device_unconfirmed`: the owner has not confirmed the code yet; asked again after
+    /// the backoff.
+    Unconfirmed,
     /// The core no longer listens.
     Gone,
 }
 
 struct Run {
-    client: reqwest::Client,
     creds: Credentials,
     settings: FeedSettings,
     events: mpsc::UnboundedSender<LinkEvent>,
@@ -155,6 +153,21 @@ impl Run {
                     tokio::time::sleep(delay).await;
                     delay = (delay * 2).min(self.settings.retry_max);
                 }
+                End::Unconfirmed => {
+                    let note = format!(
+                        "Kai asks again in {} s (the wait doubles up to {} s, lmgw.retry_max_s)",
+                        delay.as_secs(),
+                        self.settings.retry_max.as_secs()
+                    );
+                    tracing::info!(
+                        "lmgw link: the device waits for the owner's confirmation; {note}"
+                    );
+                    if !self.send(LinkEvent::Unconfirmed { note }) {
+                        return;
+                    }
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(self.settings.retry_max);
+                }
                 End::Dropped { why, was_up, dead } => {
                     if was_up {
                         delay = FIRST_RETRY;
@@ -183,35 +196,84 @@ impl Run {
     async fn connect(&self, cursor: &mut Option<String>, stated: &mut Option<u32>) -> End {
         let timeout = self.settings.timeout;
         let secs = timeout.as_secs();
-        // The request carries the key: it is never logged.
-        let req = requests::feed(cursor.as_deref()).bearer(self.creds.key.expose());
-        let mut rb = self.client.get(req.url(&self.creds.url));
-        for h in &req.headers {
-            match super::header(h) {
-                Ok((name, value)) => rb = rb.header(name, value),
-                Err(e) => {
-                    return End::Dropped {
-                        why: e,
-                        was_up: false,
-                        dead: false,
-                    };
-                }
-            }
-        }
-        tracing::debug!(resume = cursor.is_some(), "lmgw link: connecting the feed");
         let dropped = |why: String| End::Dropped {
             why,
             was_up: false,
             dead: false,
         };
-        let mut resp = match tokio::time::timeout(timeout, rb.send()).await {
+        let req = requests::feed(cursor.as_deref(), None);
+        let mut headers = Vec::with_capacity(req.headers.len());
+        for h in &req.headers {
+            match super::header(h) {
+                Ok(h) => headers.push(h),
+                Err(e) => return dropped(e),
+            }
+        }
+        // Kai's own date decides a lapse (lmgw's device link §5.3), checked before each try: lmgw
+        // ends the links at `notAfter`, and the next try finds it here. A handshake's alert never
+        // does (the security review's B1, `tls`'s module doc).
+        if self.creds.tls.lapsed(crate::pairing::now_ms()) {
+            let date = self.creds.tls.not_after_ms().map(crate::pairing::date);
+            tracing::warn!(
+                ?date,
+                "lmgw link: the device's certificate lapsed by Kai's date"
+            );
+            return End::Revoked(
+                format!(
+                    "this device's certificate lapsed on {} by Kai's date",
+                    date.unwrap_or_default()
+                ),
+                Some(KeyLoss::Lapsed),
+            );
+        }
+        tracing::debug!(resume = cursor.is_some(), "lmgw link: connecting the feed");
+        // Each try's client is its own, so the race sees when its connection is up (§6.3).
+        let attempt = |base: &str, answered: tls::Answered| {
+            let http = self.creds.tls.racing(answered);
+            let url = req.url(base);
+            let headers = &headers;
+            async move {
+                let mut rb = http?.get(url);
+                for (name, value) in headers {
+                    rb = rb.header(name, value);
+                }
+                rb.send().await
+            }
+        };
+        let raced = tls::race(self.creds.reach.order(), self.settings.stagger, attempt);
+        let mut resp = match tokio::time::timeout(timeout, raced).await {
             Err(_) => {
                 return dropped(format!(
                     "lmgw did not answer the feed's request within {secs} s (lmgw.timeout_s)"
                 ));
             }
-            Ok(Err(e)) => return dropped(format!("lmgw is not reachable: {}", describe(&e))),
-            Ok(Ok(r)) => r,
+            Ok(Err(failed)) => {
+                // An alert about the device's certificate is said and tried again, never acted
+                // on: it may come from whoever answers at the address before the server proved
+                // anything (B1). Kai's date above decides a lapse; one the alert claims while that
+                // date holds is said as the clocks disagreeing.
+                let mut why = unreachable(&failed);
+                for (url, e) in &failed {
+                    if let Some(alert) = tls::certificate_alert(e) {
+                        tracing::warn!(%url, %alert, "lmgw link: the server refused the device's certificate in the handshake; Kai tries again");
+                    }
+                }
+                let lapse_claimed = failed.iter().any(|(_, e)| {
+                    tls::refusal(e) == Some(lmgw_client::tls::TlsRefusal::CertificateLapsed)
+                });
+                if lapse_claimed && let Some(t) = self.creds.tls.not_after_ms() {
+                    why.push_str(&format!(
+                        " (by Kai's date this device's certificate holds until {}: check this \
+                         computer's clock and lmgw's)",
+                        crate::pairing::date(t)
+                    ));
+                }
+                return dropped(why);
+            }
+            Ok(Ok((url, r))) => {
+                self.creds.reach.reached(&url);
+                r
+            }
         };
         let status = resp.status();
         if !status.is_success() {
@@ -220,14 +282,23 @@ impl Run {
                 _ => String::new(),
             };
             let e = requests::read_refusal(status.as_u16(), &body);
-            if status == reqwest::StatusCode::UNAUTHORIZED {
-                // A device's 401s (`device_key_unknown`: rotated or deleted, `device_disabled`,
-                // `key_expired`) and any other: the key opens nothing now. "Pair again" with
-                // lmgw's words, except for a disabled device and an expired key, whose key works
-                // again once the owner enables the device or moves the expiry (§3.3).
-                let why = requests::key_refused(&e);
-                tracing::warn!(code = %e.code, ?why, "lmgw link: the feed answered 401");
+            let why = requests::key_refused(&e);
+            if status == reqwest::StatusCode::UNAUTHORIZED
+                || why == Some(requests::KeyRefused::CredentialOnDeviceListener)
+            {
+                // A device's 401s (`device_key_unknown`: re-paired or deleted, `device_disabled`,
+                // `key_expired`, `device_certificate_expired`, `client_certificate_required`), the
+                // 400 for a credential beside the certificate, and any other 401: the pairing
+                // opens nothing now. "Pair again" with lmgw's words, except for a disabled device
+                // and an expired key, which work again once the owner enables the device or moves
+                // the expiry (§3.3).
+                tracing::warn!(code = %e.code, ?why, "lmgw link: lmgw refused the feed");
                 return End::Revoked(e.message, Some(KeyLoss::of_code(&e.code)));
+            }
+            if why == Some(requests::KeyRefused::Unconfirmed) {
+                // Device link §3.5: lmgw's words are for people; Kai says its own code.
+                tracing::info!("lmgw link: the device is not confirmed yet");
+                return End::Unconfirmed;
             }
             return dropped(format!(
                 "lmgw refused the feed (HTTP {}, {}: {})",
@@ -274,7 +345,13 @@ impl Run {
                     FeedItem::Event(ev) => {
                         // Up from `hello` on, not from the chunk's end: the catch-up lmgw sends
                         // right behind it may share its chunk (review KAI-3 K3-3).
-                        up |= matches!(ev, FeedEvent::Hello(_));
+                        let hello = matches!(ev, FeedEvent::Hello(_));
+                        up |= hello;
+                        // What `hello` says about this device, as the reader kept it, before the
+                        // connection is said (lmgw's device link §7.2).
+                        if hello && !self.send(LinkEvent::Device(DeviceFacts::of(&reader))) {
+                            return End::Gone;
+                        }
                         match translate.event(ev) {
                             Step::Revoked(reason, loss) => return End::Revoked(reason, loss),
                             Step::Events(evs) => {
@@ -287,6 +364,15 @@ impl Run {
                         }
                     }
                     FeedItem::KeepAlive => {}
+                    // The open approvals (device link §7.3): the whole set at `caught_up`, then
+                    // what is added and withdrawn.
+                    FeedItem::Approvals(change) => {
+                        if let Some(e) = Translate::approvals(change)
+                            && !self.send(e)
+                        {
+                            return End::Gone;
+                        }
+                    }
                     // An event of a type this build does not know (a newer gateway's): skipped,
                     // never a link failure. Its name only, never its data, which may be the
                     // owner's messages (review KAI-2 K2-10).
@@ -333,6 +419,20 @@ impl Run {
                 *stated = Some(k);
             }
         }
+    }
+}
+
+/// Every URL failed: why, in lmgw-client's words for a refused handshake.
+fn unreachable(failed: &[(String, reqwest::Error)]) -> String {
+    match failed {
+        [(_, e)] => tls::unreachable(e),
+        many => format!(
+            "lmgw is not reachable at any of its addresses: {}",
+            many.iter()
+                .map(|(u, e)| format!("{u}: {}", tls::why(e)))
+                .collect::<Vec<_>>()
+                .join("; ")
+        ),
     }
 }
 
@@ -435,6 +535,36 @@ impl Translate {
                 .map(|t| (t.thread_id, self.by(t.by)))
                 .collect(),
         })
+    }
+
+    /// A change of the open approvals as the approval card's fact; `None` for a change a newer
+    /// `lmgw-client` added (logged).
+    fn approvals(change: ApprovalsChange) -> Option<LinkEvent> {
+        fn requested(r: ApprovalRequested) -> crate::approvals::Requested {
+            crate::approvals::Requested {
+                thread_id: r.thread_id,
+                request: lmgw_client::requests::approvals::ApprovalRequest {
+                    approval_request_id: r.approval_request_id,
+                    server_label: r.server_label,
+                    name: r.name,
+                    arguments: r.arguments,
+                    call_id: r.call_id,
+                },
+            }
+        }
+        let fact = match change {
+            ApprovalsChange::Open(set) => {
+                FeedFact::ApprovalsOpen(set.into_iter().map(requested).collect())
+            }
+            ApprovalsChange::Added(r) => FeedFact::ApprovalRequested(requested(r)),
+            ApprovalsChange::Withdrawn(ids) => FeedFact::ApprovalsWithdrawn(ids),
+            // Not its Debug: a call's arguments may be in it.
+            _ => {
+                tracing::debug!("lmgw link: an approvals change this build does not know, skipped");
+                return None;
+            }
+        };
+        Some(LinkEvent::Fact(fact))
     }
 
     fn event(&mut self, ev: FeedEvent) -> Step {
@@ -557,24 +687,22 @@ impl Translate {
             FeedEvent::ThreadDeleted(g) => fact(FeedFact::ThreadGone {
                 thread_id: g.thread_id,
             }),
-            // WP19: the approval card's calls (any thread the device sees).
+            // WP19: the approval card's calls come from the reader's open set
+            // (`FeedItem::Approvals`, device link §7.3), never from these events themselves: one
+            // in the catch-up is already in `hello`'s set, and after `caught_up` the reader says
+            // what each changed right after it.
             FeedEvent::ApprovalRequested(r) => {
-                fact(FeedFact::ApprovalRequested(crate::approvals::Requested {
-                    thread_id: r.thread_id,
-                    request: lmgw_client::requests::approvals::ApprovalRequest {
-                        approval_request_id: r.approval_request_id,
-                        server_label: r.server_label,
-                        name: r.name,
-                        arguments: r.arguments,
-                        call_id: r.call_id,
-                    },
-                }))
+                tracing::debug!(call = %r.approval_request_id, thread = r.thread_id, "lmgw link: approval.requested");
+                Step::Events(Vec::new())
             }
-            FeedEvent::ApprovalDecided(d) => fact(FeedFact::ApprovalDecided {
-                id: d.approval_request_id,
-                approve: d.approve && !d.not_run,
-                by: d.by,
-            }),
+            FeedEvent::ApprovalDecided(d) => {
+                tracing::debug!(call = %d.approval_request_id, approve = d.approve && !d.not_run, by = ?d.by, "lmgw link: approval.decided");
+                Step::Events(Vec::new())
+            }
+            FeedEvent::CaughtUp(c) => {
+                tracing::debug!(cursor = %c.cursor, "lmgw link: caught up");
+                Step::Events(Vec::new())
+            }
             // WP18: a job's result entered its thread (the voice speaks or notifies it).
             FeedEvent::TaskDone(d) => fact(FeedFact::TaskDone(d)),
             // WP18: a deleted device's jobs here are cancelled (the kind is `device`; an owner

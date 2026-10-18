@@ -66,7 +66,10 @@ trap 'cleanup; kgs_check || exit 1' EXIT
 grep -q TOOL_SCRIPT "$LMGW/scripts/mock-openai.py" || fail "$LMGW's mock-openai.py has no TOOL_SCRIPT (M7)"
 git -C "$LMGW" grep -q 'mcp_approval_request' -- crates/lmgw-core/src || fail "$LMGW has no approvals (M3)"
 for c in kwin_wayland spectacle magick; do command -v "$c" >/dev/null || fail "needs $c"; done
-if ss -ltnH "sport = :8897" | grep -q .; then fail "something listens on 8897 already"; fi
+# 8898: the dev lmgw's device listener, which Kai pairs over (loopback, the HTTP port plus one).
+for port in 8897 8898; do
+    if ss -ltnH "sport = :$port" | grep -q .; then fail "something listens on $port already"; fi
+done
 
 rm -rf "$OUT"
 mkdir -p "$OUT" "$DATA"

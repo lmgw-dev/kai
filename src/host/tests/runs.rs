@@ -11,13 +11,6 @@ use tokio::io::AsyncReadExt;
 use super::*;
 use crate::host::settings::ToolState;
 
-fn creds(url: &str) -> Credentials {
-    Credentials {
-        url: url.to_owned(),
-        key: DeviceKey::parse(KEY).unwrap(),
-    }
-}
-
 async fn offline_note(r: &mut Rig) -> String {
     match r.status(|s| matches!(s, HostStatus::Offline { .. })).await {
         HostStatus::Offline { note } => note,
@@ -144,17 +137,13 @@ async fn a_restart_forgets_the_old_identity() {
 #[tokio::test]
 async fn the_providers_see_the_current_credentials() {
     let mut r = rig().await;
-    let url = |r: &Rig| r.creds.borrow().as_ref().map(|c| c.url.clone());
+    let url = |r: &Rig| r.creds.borrow().as_ref().map(|c| c.url());
     assert_eq!(url(&r), Some(r.fake.url.clone()));
     let other = FakeHost::new().await;
     let (tx, events) = mpsc::unbounded_channel();
     r.events = events;
     r.host.start(creds(&other.url), tx);
     assert_eq!(url(&r), Some(other.url.clone()), "a re-pairing's");
-    assert_eq!(
-        r.creds.borrow().as_ref().map(|c| c.key.expose().to_owned()),
-        Some(KEY.to_owned())
-    );
     r.host.stop();
     assert_eq!(url(&r), None);
 }

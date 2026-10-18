@@ -12,7 +12,7 @@
 <p align="center">
   <a href="https://github.com/lmgw-dev/kai/releases/latest"><img src="https://img.shields.io/github/v/release/lmgw-dev/kai" alt="Latest release"></a>
   <a href="https://github.com/lmgw-dev/kai/actions/workflows/ci.yml"><img src="https://github.com/lmgw-dev/kai/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="LICENSE.md"><img src="https://img.shields.io/badge/license-FSL--1.1--MIT-blue" alt="License: FSL-1.1-MIT"></a>
+  <a href="LICENSE.md"><img src="https://img.shields.io/badge/license-MIT-blue" alt="License: MIT"></a>
   <img src="https://img.shields.io/badge/desktop-KDE%20Plasma%206%20%C2%B7%20Wayland-informational" alt="Desktop: KDE Plasma 6 on Wayland">
   <img src="https://img.shields.io/badge/built%20with-Rust-orange" alt="Built with Rust">
 </p>
@@ -26,7 +26,8 @@ files, type for you. You decide which tools run on their own and which ask first
 Kai runs no models itself. Speech recognition, the chat model and the voice all come from
 [lmgw](https://github.com/lmgw-dev/lmgw), a self-hosted gateway that runs models on your own GPU
 and can route to cloud providers too. Kai talks to whatever lmgw serves, and your conversation
-stays in a gateway you run.
+stays in a gateway you run. The Android client is
+[Kai mobile](https://github.com/lmgw-dev/kai-mobile).
 
 <p align="center">
   <a href="docs/images/desktop.png"><img src="docs/images/desktop.png" width="820" alt="Kai's overlays on a desktop: a recipe as a text overlay, a weather card, and the ring while Kai speaks"></a>
@@ -98,11 +99,12 @@ again.</sub>
 
 - **KDE Plasma 6 on Wayland**, with PipeWire. Kai is packaged as an x86_64 RPM, built on current
   Fedora.
-- **lmgw 0.4.3 or newer**, on this machine or reachable over the network, with
+- **lmgw 0.5.0 or later, with device pairing over TLS** (its device listener), on this machine or reachable over
+  the network, with
   - a chat model (one with vision for the tools that look at the screen), and
   - speech-to-text and text-to-speech models set up for voice: **Settings → Chat → Voice** in lmgw,
     or **Settings → Realtime**, which the Chat falls back to.
-- **KWallet** (or another Secret Service) to keep Kai's device key.
+- **KWallet** (or another Secret Service) to keep Kai's key.
 
 ## Install
 
@@ -123,22 +125,31 @@ the release's. The tray's **Check for Updates…** looks right away.
 
 ## Connect it to lmgw
 
-Kai signs in to lmgw with a device key of its own, which you create by pairing.
+Kai and lmgw talk over an encrypted, mutually authenticated link: Kai makes a key of its own when
+you pair it, and lmgw gives it a certificate for that key.
 
 1. Start **Kai** from the application menu. It shows up in the tray as "not paired".
 2. In lmgw's dashboard, open **Usage → Keys & budgets** and choose **Pair a device…**. Give it a
    name, pick what it may use, and for the desktop tools a label under **hosts tools as**. Models
-   then see the tools as `<label>__<tool>`, for example `kai__window_list`.
+   then see the tools as `<label>__<tool>`, for example `kai__window_list`. For Kai on the same
+   machine as lmgw, the device is on **this computer**.
 3. lmgw shows a pairing link. Click it, or paste it into the dialog from Kai's tray menu (**Pair
-   with lmgw…**). Kai shows what it is about to pair with and asks you to confirm, then stores the
-   key in KWallet and offers **Start with Plasma**.
-4. On its first connection Kai creates the Chat folder **Kai**. In lmgw's Chat, open that folder's
+   with lmgw…**). Kai shows what it is about to pair with and asks you to confirm, then makes its
+   key, enrols it with lmgw, keeps the key in KWallet and switches **Start with Plasma** on.
+4. Kai shows a code, and lmgw's Devices card shows one for the new device. When they match, click
+   **Confirm** there; Kai connects at its next try (within 30 s, `retry_max_s` under `[lmgw]`).
+5. On its first connection Kai creates the Chat folder **Kai**. In lmgw's Chat, open that folder's
    **Folder settings**, choose its **Model**, switch on **Ongoing conversation** (with the idle time
    after which a new conversation starts) and set **Retention**. Until the folder is ready, Kai
    lists the missing steps in a notification and in the tray tooltip.
 
-The key belongs to Kai alone. It has a name, you can revoke it on the same lmgw page at any time,
-and it never reaches lmgw's admin side.
+The key never leaves your desktop, and the pairing belongs to Kai alone. It has a name, you can
+revoke it on the same lmgw page at any time, and it never reaches lmgw's admin side. Its certificate
+lasts a year by default; Kai says when it is due, and you pair it again.
+
+**Open in lmgw** opens lmgw's dashboard at the address lmgw itself gives Kai. When Kai runs on
+another machine and lmgw's dashboard listens on its own machine only, Kai says so: open the
+dashboard there.
 
 ## Use it
 
@@ -222,21 +233,21 @@ flowchart LR
         tools["Desktop tools<br/>KWin · portals · accessibility · PipeWire"]
         kai --- tools
     end
-    kai <-->|"voice session, conversation feed,<br/>tools over MCP (device key)"| lmgw
+    kai <-->|"voice session, conversation feed,<br/>tools over MCP (mutual TLS)"| lmgw
     lmgw["lmgw<br/>conversation · voice pipeline · keys"]
     lmgw --> local["Local models<br/>llama.cpp · audio.cpp"]
     lmgw --> cloud["Cloud providers"]
     other["lmgw's Chat, agents,<br/>other MCP clients"] --> lmgw
 ```
 
-Kai keeps three links to lmgw, all under its device key: a realtime voice session bound to the Kai
+Kai keeps three links to lmgw, all over its device link (TLS, with its own certificate): a realtime voice session bound to the Kai
 conversation; the Chat's change feed, so it knows when the conversation moves on or a call waits
 for approval; and an MCP connection over which Kai *serves* its desktop tools. lmgw lists those
 tools to models under the label you chose, so lmgw's own Chat, its agents and other MCP clients can
 use your desktop as well. Every call still passes Kai's policy on your machine.
 
 Which model answers, where it runs and what happens while the GPU is busy is up to lmgw. Kai needs
-no special case there: device keys, pairing links, the change feed, ongoing conversations,
+no special case there: device pairing, the change feed, ongoing conversations,
 approvals and devices that host tools are general lmgw features that any client can use.
 
 ## Privacy and permissions
@@ -251,7 +262,7 @@ approvals and devices that host tools are general lmgw features that any client 
 - Nothing else. Kai has no telemetry. Its log says what happened, never what was said, typed or
   shown, and never a key.
 
-**What stays on your desktop:** the configuration, your routines, and the device key in KWallet.
+**What stays on your desktop:** the configuration, your routines, and Kai's key in KWallet.
 
 **What tools may do without asking** (the defaults; each tool can be set differently)
 
@@ -264,7 +275,9 @@ approvals and devices that host tools are general lmgw features that any client 
 | Configuration tools (a model changing Kai's settings) | Not offered until you switch them on, and even then they cannot widen a tool's permissions unless you allow that separately. |
 
 "Asked about" means a dialog on your desktop, or the approval card when the call waits in an lmgw
-conversation. A call you already approved in lmgw's dashboard is not asked about again. While the
+conversation. For a caller you trust, the dialog has an **Always allow** box: tick it and allow, and
+Kai sets that tool to `allow_trusted`, so it runs without the dialog from then on (the tray's
+**Settings…** → **Tools** changes it back). A call you already approved in lmgw's dashboard is not asked about again. While the
 screen is locked, no card shows. Overlays are sandboxed: no network, no sound, no popups, and an
 MCP App's view reaches only its own server's tools.
 
@@ -322,8 +335,4 @@ design record is [docs/design/2026-10-06-kai-design.md](docs/design/2026-10-06-k
 
 ## Licence
 
-Kai is source-available under the Functional Source License, version 1.1, with MIT as its future
-licence ([FSL-1.1-MIT](LICENSE.md)), like lmgw. Anyone can run it, at home or inside a company, and
-change and share it. Selling it is the exception: a commercial product or service that substitutes
-for Kai needs a separate licence from its author until the release it builds on turns two years
-old, and from then on that release is plain MIT.
+Kai is under the MIT License ([LICENSE.md](LICENSE.md)), like lmgw.
