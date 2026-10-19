@@ -10,7 +10,9 @@
 //! which it moves the scope's PIDs, as the manager does. So a drop's `cgroup.kill` and `KillUnit`
 //! reach what the command started, `setsid` and reparented processes too; the rig kills what is
 //! left in them and removes them when it ends. Where it cannot (no cgroup v2, a read-only one),
-//! `KillUnit` kills the PIDs and their descendants, and `ManagerState::cgroups` stays empty.
+//! `KillUnit` kills the PIDs and their descendants, and `ManagerState::cgroups` stays empty. A test
+//! that must not depend on the host sets `ManagerState::no_cgroups`, which makes the fake behave
+//! like such a host.
 
 mod entries;
 mod mime;
@@ -56,6 +58,8 @@ pub struct ManagerState {
     pub env: Vec<String>,
     /// The cgroups the fake made for its scopes: (unit, directory) (module doc).
     pub cgroups: Vec<(String, PathBuf)>,
+    /// The fake makes no cgroup for its scopes, whatever the host allows (module doc).
+    pub no_cgroups: bool,
 }
 
 /// The test's own cgroup v2 directory, if it may make child cgroups in it.
@@ -145,9 +149,13 @@ impl FakeManager {
             .get("PIDs")
             .and_then(|v| Vec::<u32>::try_from(v.try_clone().ok()?).ok())
             .unwrap_or_default();
-        let cgroup = scope_cgroup(&name, &pids);
         let result = {
             let mut s = self.state.lock().unwrap();
+            let cgroup = if s.no_cgroups {
+                None
+            } else {
+                scope_cgroup(&name, &pids)
+            };
             if let Some(dir) = cgroup {
                 s.cgroups.push((name.clone(), dir));
             }

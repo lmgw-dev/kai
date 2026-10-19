@@ -266,14 +266,27 @@ async fn a_command_stops_at_its_calls_deadline() {
     );
 }
 
-/// lmgw's `notifications/cancelled` drops the call: every process of its scope is killed, one
-/// that left the process group too: by the scope's `cgroup.kill` at the drop, without the manager
-/// (where the fake made it a cgroup), else the process group and then `KillUnit`.
-#[tokio::test]
-async fn a_cancelled_command_is_killed_with_its_scope() {
-    let Some(r) = rig(LaunchConfig::default()).await else {
-        return;
-    };
+/// Waits (at most `T`) until the fake has been asked `n` times for `KillUnit`: the drop asks from
+/// a task of its own, after the process group is dead, so the processes being gone proves nothing
+/// about it yet.
+async fn until_kills(r: &super::Rig, n: usize) {
+    let end = std::time::Instant::now() + T;
+    while r.state.lock().unwrap().kills.len() < n {
+        assert!(
+            std::time::Instant::now() < end,
+            "only {} KillUnit calls",
+            r.state.lock().unwrap().kills.len()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// A command cancelled while it runs, with a scope the fake gave a cgroup (`cgroup`) or none: the
+/// fake's `no_cgroups` decides the path, not the host. Returns `None` where `cgroup` was asked
+/// for and the host does not allow one (no cgroup v2, a read-only one).
+async fn cancelled(cgroup: bool) -> Option<()> {
+    let r = rig(LaunchConfig::default()).await?;
+    r.state.lock().unwrap().no_cgroups = !cgroup;
     let pidfile = r.path("pids");
     let cmd = argv(&[
         "sh",
@@ -288,40 +301,71 @@ async fn a_cancelled_command_is_killed_with_its_scope() {
         p = read_when_there(&pidfile) => p,
     };
     // The select dropped the call's future: the cancellation.
-    // The shell and the plain background sleep die with the process group either way. The
-    // `setsid` one is out of that group and, once the shell is gone, reparented away from the
-    // PIDs the fake knows: only a cgroup still reaches it. Without one the fake's `KillUnit`
-    // cannot (the real manager would, by its own cgroup), so it is not expected gone there.
-    // (The scope got a cgroup only where the test's own was writable.)
-    let cgroup = !r.state.lock().unwrap().cgroups.is_empty();
-    let reach = if cgroup { 3 } else { 2 };
-    for pid in pids.split_whitespace().take(reach) {
-        gone(pid.parse().unwrap()).await;
-    }
-    if !cgroup {
-        // Nothing else will end it: the test does.
-        if let Some(p) = pids
-            .split_whitespace()
-            .nth(2)
-            .and_then(|p| p.parse::<i32>().ok())
-        {
-            // SAFETY: kill on the test's own process.
-            unsafe {
-                libc::kill(p, libc::SIGKILL);
-            }
-        }
-    }
-    let kills = r.state.lock().unwrap().kills.len();
     if cgroup {
+        r.until_scopes(1).await;
+        if r.state.lock().unwrap().cgroups.is_empty() {
+            // The host gave the scope no cgroup: the other test's path. Not this one's point.
+            for pid in pids.split_whitespace().take(2) {
+                gone(pid.parse().unwrap()).await;
+            }
+            if let Some(p) = pids.split_whitespace().nth(2) {
+                // SAFETY: kill on the test's own process.
+                unsafe {
+                    libc::kill(p.parse().unwrap(), libc::SIGKILL);
+                }
+            }
+            return None;
+        }
+        // The cgroup's kill reaches all three, the `setsid` one too.
+        for pid in pids.split_whitespace().take(3) {
+            gone(pid.parse().unwrap()).await;
+        }
         assert_eq!(
             r.state.lock().unwrap().cgroups.len(),
             1,
             "the scope's cgroup"
         );
-        assert_eq!(kills, 0, "the cgroup's kill, no KillUnit");
-    } else {
-        assert_eq!(kills, 1, "KillUnit on the scope");
+        assert_eq!(
+            r.state.lock().unwrap().kills.len(),
+            0,
+            "the cgroup's kill, no KillUnit"
+        );
+        return Some(());
     }
+    // The shell and the plain background sleep die with the process group. The `setsid` one is
+    // out of that group and, once the shell is gone, reparented away from the PIDs the fake
+    // knows: only a cgroup still reaches it. Without one the fake's `KillUnit` cannot (the real
+    // manager would, by its own cgroup), so it is not expected gone there.
+    for pid in pids.split_whitespace().take(2) {
+        gone(pid.parse().unwrap()).await;
+    }
+    until_kills(&r, 1).await;
+    // Nothing else will end the escaped one: the test does.
+    if let Some(p) = pids.split_whitespace().nth(2) {
+        // SAFETY: kill on the test's own process.
+        unsafe {
+            libc::kill(p.parse().unwrap(), libc::SIGKILL);
+        }
+    }
+    let state = r.state.lock().unwrap();
+    assert!(state.cgroups.is_empty(), "the fake made no cgroup");
+    assert_eq!(state.kills.len(), 1, "KillUnit on the scope");
+    Some(())
+}
+
+/// lmgw's `notifications/cancelled` drops the call: every process of its scope is killed, one
+/// that left the process group too, by the scope's `cgroup.kill` at the drop (where the fake made
+/// the scope a cgroup; the test is left out on a host that allows none).
+#[tokio::test]
+async fn a_cancelled_command_is_killed_by_its_scopes_cgroup() {
+    cancelled(true).await;
+}
+
+/// The same without a cgroup, on any host (the fake makes none): the process group is killed and
+/// then `KillUnit` asked for the scope.
+#[tokio::test]
+async fn a_cancelled_command_without_a_cgroup_is_killed_with_its_scope() {
+    cancelled(false).await.unwrap();
 }
 
 /// A command that leaves a writer in the background: the answer comes when the command ends, the
