@@ -754,12 +754,16 @@ impl ActionNode {
     #[zbus(property, name = "NActions")]
     fn n_actions(&self) -> i32 {
         use std::sync::atomic::Ordering::SeqCst;
-        if let Some(late) = &self.0.late_actions
-            && late
-                .fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1))
-                .is_ok()
-        {
-            return 0;
+        // A compare-exchange loop, not `fetch_update`: newer Rust deprecates that name for
+        // `try_update`, which older toolchains lack.
+        if let Some(late) = &self.0.late_actions {
+            let mut n = late.load(SeqCst);
+            while let Some(less) = n.checked_sub(1) {
+                match late.compare_exchange_weak(n, less, SeqCst, SeqCst) {
+                    Ok(_) => return 0,
+                    Err(now) => n = now,
+                }
+            }
         }
         self.0.actions.len() as i32
     }
