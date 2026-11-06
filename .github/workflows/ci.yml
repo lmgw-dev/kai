@@ -79,6 +79,10 @@ jobs:
     container:
       # Fedora's own registry: Docker Hub's unauthenticated pull limit fails GitHub's runners.
       image: quay.io/fedora/fedora:latest
+      # page_text's PDF tests run pdftotext in its bwrap sandbox, as on a desktop. Docker's
+      # default container lets bwrap create no namespaces ("No permissions to create a new
+      # namespace"); the runner VM is thrown away after the job.
+      options: --privileged
     # This bounds what a hung test can cost.
     timeout-minutes: 60
     env:
@@ -112,7 +116,8 @@ jobs:
           dnf -y install rust cargo clippy rustfmt gcc gcc-c++ make pkgconf-pkg-config \
             clang clang-devel gtk3-devel webkit2gtk4.1-devel libsoup3-devel gtk-layer-shell-devel \
             pipewire-devel wayland-devel rust-std-static-wasm32-unknown-unknown \
-            desktop-file-utils python3 curl xorg-x11-server-Xvfb xorg-x11-xauth dbus-daemon
+            desktop-file-utils python3 curl xorg-x11-server-Xvfb xorg-x11-xauth dbus-daemon \
+            poppler-utils bubblewrap
           mkdir -p "$CARGO_HOME/bin"
           bash packaging/install-trunk.sh "$CARGO_HOME/bin"
           bash packaging/install-wasm-tools.sh "$CARGO_HOME/bin"
