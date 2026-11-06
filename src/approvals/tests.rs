@@ -111,7 +111,7 @@ fn spoken(ms: u64) -> Vec<i16> {
 fn the_card_shows_a_call_and_goes_when_it_is_decided_elsewhere() {
     let (mut a, cards) = approvals();
     assert!(!a.waiting());
-    a.turn_started(7, "device 'phone'", false);
+    a.turn_started(7, "device 'phone'", false, false);
     a.thread_title(7, "Plans");
     a.requested(
         7,
@@ -684,7 +684,7 @@ fn the_voice_answers_only_kais_own_call_once_the_card_armed() {
     let (mut a, _) = approvals();
     a.observe(vec![812], Some(1));
     // A phone's turn in another thread waits.
-    a.turn_started(5, "device 'phone'", false);
+    a.turn_started(5, "device 'phone'", false, false);
     a.requested(5, req("mcpr_5", "a", "{}"), None);
     armed(&mut a, "mcpr_5");
     assert!(
@@ -692,7 +692,7 @@ fn the_voice_answers_only_kais_own_call_once_the_card_armed() {
         "another thread's call holds back no audio"
     );
     assert!(!a.voice_answers(), "and the talk key keeps its meaning");
-    assert!(!a.press(vec![]));
+    assert!(!a.press());
     let m = a.card().unwrap();
     assert_eq!(m.hint, "Enter approves, Esc declines.");
     assert!(!m.typed.contains("voice"));
@@ -708,7 +708,7 @@ fn the_voice_answers_only_kais_own_call_once_the_card_armed() {
     a.requested(812, req("mcpr_1", "a", "{}"), None);
     assert!(a.gates_audio());
     assert!(!a.voice_answers(), "not armed yet: a press is talk");
-    assert!(!a.press(vec![]));
+    assert!(!a.press());
     armed(&mut a, "mcpr_1");
     assert!(a.voice_answers());
     // The card waits again (the keyboard came back to it): the voice waits too.
@@ -725,30 +725,57 @@ fn the_voice_answers_only_kais_own_call_once_the_card_armed() {
     assert!(!a.voice_answers());
     armed(&mut a, "mcpr_1");
     assert!(a.card().unwrap().hint.contains("talk key"));
-    assert!(a.press(vec![]));
+    assert!(a.press());
     // The conversation moved to another thread: the call is the card's alone now.
     a.cancel_recording();
     a.observe(vec![900], None);
     assert!(!a.gates_audio() && !a.voice_answers());
 }
 
+/// A turn Kai relayed for Firefox's sidebar (kai-firefox §8.3) in Kai's own thread: its call is
+/// answered on the card or in the sidebar, never by voice, and holds back no audio; the card names
+/// the sidebar. Kai's next own turn there makes the thread's calls Kai's own again.
+#[test]
+fn the_sidebars_call_in_kais_own_thread_is_not_answered_by_voice() {
+    let (mut a, _) = approvals();
+    a.observe(vec![812], None);
+    a.turn_started(812, crate::browser::sidebar::turns::NAME, false, true);
+    a.requested(812, req("mcpr_1", "a", "{}"), None);
+    armed(&mut a, "mcpr_1");
+    assert!(!a.gates_audio(), "the sidebar's call holds back no audio");
+    assert!(!a.voice_answers(), "and the talk key keeps its meaning");
+    assert!(!a.press());
+    let m = a.card().unwrap();
+    assert!(
+        m.asked.starts_with("asked by Kai's sidebar in Firefox"),
+        "{}",
+        m.asked
+    );
+    assert!(!m.typed.contains("voice"));
+    // Kai's own turn in the thread: its calls are Kai's again.
+    a.decided("mcpr_1", true, None);
+    a.turn_started(812, "device 'desktop'", true, false);
+    a.requested(812, req("mcpr_2", "a", "{}"), None);
+    assert!(a.gates_audio(), "Kai's own call");
+}
+
 #[test]
 fn the_spoken_answer_is_recorded_checked_for_speech_transcribed_and_matched() {
     let (mut a, _) = approvals();
     // Nothing waits: the press records nothing.
-    assert!(!a.press(vec![]));
+    assert!(!a.press());
     a.observe(vec![7], Some(1));
     a.requested(7, req("mcpr_1", "a", "{}"), Some(1));
     armed(&mut a, "mcpr_1");
     // Near silence (a tap, a held key over a quiet room): no answer, nothing sent.
-    assert!(a.press(vec![1; 10]));
+    assert!(a.press());
     a.record(&[3; 4800]);
     assert!(a.release().is_empty());
     let note = a.card().unwrap().note.clone().unwrap();
     assert!(note.starts_with("Kai heard no speech (0 ms"), "{note}");
     assert!(note.contains("approvals.speech_ms"), "{note}");
-    // Speech, after a quiet pre-roll.
-    assert!(a.press(vec![1; 10]));
+    // Speech.
+    assert!(a.press());
     assert!(a.recording());
     assert!(
         a.card()
@@ -771,14 +798,14 @@ fn the_spoken_answer_is_recorded_checked_for_speech_transcribed_and_matched() {
         panic!("{acts:?}");
     };
     assert_eq!((*thread_id, call.as_str()), (7, "mcpr_1"));
-    assert_eq!(wav.len(), 44 + (10 + 7200) * 2, "the pre-roll and the hold");
+    assert_eq!(wav.len(), 44 + 7200 * 2, "the hold, no pre-roll");
     assert!(!a.recording());
     assert_eq!(
         a.card().unwrap().busy.as_deref(),
         Some("Hearing the answer…")
     );
     // A second press while the first answer is heard waits.
-    assert!(!a.press(vec![]));
+    assert!(!a.press());
     let heard = |a: &mut Approvals, r: Result<String, Refusal>| {
         a.on_wake(
             Wake::Done(
@@ -791,7 +818,7 @@ fn the_spoken_answer_is_recorded_checked_for_speech_transcribed_and_matched() {
         )
     };
     let say = |a: &mut Approvals| {
-        assert!(a.press(vec![]));
+        assert!(a.press());
         a.record(&spoken(300));
         assert_eq!(a.release().len(), 1);
     };
@@ -853,14 +880,14 @@ fn a_call_that_goes_while_its_answer_is_recorded_or_heard_takes_the_answer_along
     a.observe(vec![7], None);
     a.requested(7, req("mcpr_1", "a", "{}"), None);
     armed(&mut a, "mcpr_1");
-    assert!(a.press(vec![]));
+    assert!(a.press());
     a.decided("mcpr_1", false, None);
     assert!(!a.recording());
     assert!(a.release().is_empty());
     a.requested(7, req("mcpr_2", "a", "{}"), None);
     assert!(!a.voice_answers(), "a new call arms anew");
     armed(&mut a, "mcpr_2");
-    a.press(vec![]);
+    a.press();
     a.record(&spoken(300));
     a.release();
     a.thread_gone(7);
@@ -935,7 +962,7 @@ fn a_call_the_card_cannot_show_is_left_to_lmgw() {
 #[test]
 fn names_on_the_card_are_escaped() {
     let (mut a, _) = approvals();
-    a.turn_started(7, "key 'a\nb'", false);
+    a.turn_started(7, "key 'a\nb'", false, false);
     a.thread_title(7, "t\u{202e}x");
     a.requested(
         7,
@@ -955,7 +982,7 @@ fn names_on_the_card_are_escaped() {
         "asked by a principal lmgw names \"key 'a\\nb'\" in thread \"t\\u202ex\""
     );
     // A device named as Kai's session reads as a device.
-    a.turn_started(7, "device 'Kai's voice session'", false);
+    a.turn_started(7, "device 'Kai's voice session'", false, false);
     a.thread_title(7, "Plans");
     a.requested(7, req("mcpr_2", "a", "{}"), None);
     a.decided("mcpr_1", false, None);
@@ -998,4 +1025,230 @@ fn the_cards_call_learns_the_calls_id_without_changing_its_key() {
     assert_eq!(a.call_id_of("mcpr_3"), Some("call_3"));
     a.decided("mcpr_3", true, None);
     assert_eq!(a.call_id_of("mcpr_3"), None, "gone with its call");
+}
+
+/// kai-firefox WP10b: Kai's own question (`asked`) holds back the session's audio, is answered by
+/// a press only once its spoken question ended, needs speech, is transcribed in Kai's own thread
+/// and matched whole; neither yes nor no asks again in words; its end forgets it.
+#[tokio::test]
+async fn kais_own_question_is_answered_by_voice_like_a_call_of_its_own() {
+    let (mut a, _cards) = approvals();
+    a.observe(vec![7], Some(1));
+    let (to_voice, mut voice) = tokio::sync::oneshot::channel();
+    let over = tokio_util::sync::CancellationToken::new();
+    let u = a
+        .asked(asked::Ask {
+            id: "kai_ask_1".into(),
+            words: crate::voice::speak::Words::new(
+                "May Kai press the link? Yes or no?",
+                "Darf Kai?",
+            ),
+            answer: to_voice,
+            over: over.clone(),
+        })
+        .expect("the first question is spoken at once");
+    assert_eq!(u.kind, crate::voice::speak::Kind::Question);
+    assert_eq!(u.text.en(), "May Kai press the link? Yes or no?");
+    assert!(a.gates_audio(), "no audio to the session while it waits");
+    assert!(
+        a.note()
+            .unwrap()
+            .contains("hold the talk key and say yes or no")
+    );
+    // Before its question was spoken a press answers nothing.
+    assert!(!a.voice_answers());
+    assert!(!a.press());
+    let replies = u.reply.clone().unwrap();
+    replies
+        .send((u.tag, crate::voice::speak::Said::Started))
+        .unwrap();
+    let w = a.next().await;
+    a.on_wake(w, None);
+    assert!(!a.voice_answers(), "still being spoken");
+    replies
+        .send((
+            u.tag,
+            crate::voice::speak::Said::Done(crate::voice::speak::Spoken::Heard),
+        ))
+        .unwrap();
+    let w = a.next().await;
+    a.on_wake(w, None);
+    assert!(a.voice_answers());
+    // A press without speech is no answer: Kai asks again in words.
+    assert!(a.press());
+    a.record(&[3; 4800]);
+    let acts = a.release();
+    let [Act::Speak { id, words }] = &acts[..] else {
+        panic!("{acts:?}");
+    };
+    assert_eq!(id, "kai_ask_1");
+    assert!(words.en.starts_with("Kai heard no answer."), "{words:?}");
+    assert!(a.speak_again(id, words.clone()).is_some());
+    // Words that are neither yes nor no: asked again.
+    let hear = |a: &mut Approvals, text: &str| {
+        assert!(a.press());
+        a.record(&spoken(300));
+        let acts = a.release();
+        let [
+            Act::Transcribe {
+                thread_id, call, ..
+            },
+        ] = &acts[..]
+        else {
+            panic!("{acts:?}");
+        };
+        assert_eq!(
+            (*thread_id, call.as_str()),
+            (7, "kai_ask_1"),
+            "in Kai's own thread"
+        );
+        a.on_wake(
+            Wake::Done(
+                Op::Hear { call: call.clone() },
+                Done::Heard(Ok(text.into())),
+            ),
+            None,
+        )
+    };
+    let acts = hear(&mut a, "maybe later");
+    assert!(
+        matches!(&acts[..], [Act::Speak { words, .. }] if words.en.starts_with("Kai heard neither yes nor no")),
+        "{acts:?}"
+    );
+    assert!(voice.try_recv().is_err());
+    // Yes, whole: the asker gets it; its end forgets the question.
+    assert!(hear(&mut a, "Yes.").is_empty());
+    assert_eq!(voice.try_recv(), Ok(true));
+    over.cancel();
+    let w = a.next().await;
+    a.on_wake(w, None);
+    assert!(!a.gates_audio());
+    assert!(!a.voice_answers());
+}
+
+/// One of Kai's own questions, handed to the approvals: its utterance when it is spoken at once,
+/// the asker's side of its answer, and its end.
+fn ask(
+    a: &mut Approvals,
+    id: &str,
+) -> (
+    Option<crate::voice::speak::Utterance>,
+    tokio::sync::oneshot::Receiver<bool>,
+    tokio_util::sync::CancellationToken,
+) {
+    let (to_voice, voice) = tokio::sync::oneshot::channel();
+    let over = tokio_util::sync::CancellationToken::new();
+    let u = a.asked(asked::Ask {
+        id: id.into(),
+        words: crate::voice::speak::Words::new(format!("{id}? Yes or no?"), "Ja oder nein?"),
+        answer: to_voice,
+        over: over.clone(),
+    });
+    (u, voice, over)
+}
+
+/// The speech of utterance `u` ended (heard), and the approvals took it in.
+async fn heard_out(a: &mut Approvals, u: &crate::voice::speak::Utterance) {
+    u.reply
+        .as_ref()
+        .unwrap()
+        .send((
+            u.tag,
+            crate::voice::speak::Said::Done(crate::voice::speak::Spoken::Heard),
+        ))
+        .unwrap();
+    let w = a.next().await;
+    a.on_wake(w, None);
+}
+
+/// The press answers `call` (the recording goes to be transcribed for it).
+fn press_answers(a: &mut Approvals, call: &str) {
+    assert!(a.press(), "a press records for {call}");
+    a.record(&spoken(300));
+    let acts = a.release();
+    assert!(
+        matches!(&acts[..], [Act::Transcribe { call: c, .. }] if c == call),
+        "{acts:?}"
+    );
+    a.on_wake(
+        Wake::Done(
+            Op::Hear { call: call.into() },
+            Done::Heard(Ok("maybe".into())),
+        ),
+        None,
+    );
+}
+
+/// kai-firefox WP10b's review (M2): with two of Kai's questions waiting, one is spoken at a time;
+/// the second is spoken once the first is over, and the press answers the question heard last.
+#[tokio::test]
+async fn two_questions_are_spoken_one_at_a_time_and_the_press_answers_the_one_heard() {
+    let (mut a, _cards) = approvals();
+    a.observe(vec![7], Some(1));
+    let (first, mut first_answer, first_over) = ask(&mut a, "kai_ask_1");
+    let first = first.expect("spoken at once");
+    let (second, _second_answer, _second_over) = ask(&mut a, "kai_ask_2");
+    assert!(second.is_none(), "it waits for the first");
+    heard_out(&mut a, &first).await;
+    press_answers(&mut a, "kai_ask_1");
+    // A yes for the first: its asker ends it, and the second is spoken now.
+    assert!(a.press());
+    a.record(&spoken(300));
+    let _ = a.release();
+    let acts = a.on_wake(
+        Wake::Done(
+            Op::Hear {
+                call: "kai_ask_1".into(),
+            },
+            Done::Heard(Ok("Yes.".into())),
+        ),
+        None,
+    );
+    assert!(acts.is_empty(), "{acts:?}");
+    assert_eq!(first_answer.try_recv(), Ok(true));
+    first_over.cancel();
+    let w = a.next().await;
+    let acts = a.on_wake(w, None);
+    let [Act::Speak { id, words }] = &acts[..] else {
+        panic!("{acts:?}");
+    };
+    assert_eq!(
+        (id.as_str(), words.en.as_str()),
+        ("kai_ask_2", "kai_ask_2? Yes or no?")
+    );
+    assert!(!a.voice_answers(), "not before its speech ended");
+    let u = a.speak_again(id, words.clone()).unwrap();
+    heard_out(&mut a, &u).await;
+    press_answers(&mut a, "kai_ask_2");
+}
+
+/// kai-firefox WP10b's review (M2, L4): a card's call of Kai's own and one of Kai's questions: the
+/// press answers the one that became answerable last; a card's call not armed yet holds back no
+/// question that was spoken, and Kai's "say yes or no" makes its question the latest again.
+#[tokio::test]
+async fn a_cards_call_and_a_question_the_press_answers_the_one_heard_last() {
+    let (mut a, _cards) = approvals();
+    a.observe(vec![7], Some(1));
+    a.requested(7, req("mcpr_1", "element_press", "{}"), None);
+    // The card has not armed yet: the question's end makes it the press's.
+    let (u, _answer, _over) = ask(&mut a, "kai_ask_2");
+    let u = u.unwrap();
+    heard_out(&mut a, &u).await;
+    assert!(
+        a.voice_answers(),
+        "a card not armed yet holds back no question"
+    );
+    press_answers(&mut a, "kai_ask_2");
+    // The card arms after it: the card's call.
+    armed(&mut a, "mcpr_1");
+    press_answers(&mut a, "mcpr_1");
+    // Kai says "say yes or no" for its question and that speech ends: the question's again.
+    let again = a
+        .speak_again(
+            "kai_ask_2",
+            crate::voice::speak::Words::new("Say yes or no.", "Sag ja oder nein."),
+        )
+        .unwrap();
+    heard_out(&mut a, &again).await;
+    press_answers(&mut a, "kai_ask_2");
 }

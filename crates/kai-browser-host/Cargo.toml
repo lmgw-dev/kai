@@ -1,0 +1,19 @@
+[package]
+name = "kai-browser-host"
+version = "0.3.0"
+edition = "2024"
+description = "Kai for Firefox's native-messaging host: relays frames between Firefox's stdio and Kai's browser.sock, holding nothing"
+license = "MIT"
+publish = false
+
+[dependencies]
+# The `t` of the extension's frames and its `config` frame; every other frame is relayed unread.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# SIGTERM back to its default action at the start (Firefox ends the host with it; a mask or an
+# ignored disposition inherited from Firefox would keep it running), and the stdio pipes' size
+# (F_SETPIPE_SZ).
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

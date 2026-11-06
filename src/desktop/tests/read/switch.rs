@@ -601,6 +601,7 @@ fn win() -> Target {
     Target {
         pid: std::process::id(),
         title: "Kai Test".into(),
+        exact: false,
     }
 }
 
@@ -609,6 +610,7 @@ async fn atspi_with(r: &Rig, switch: A11ySwitch) -> Atspi {
         bus: SessionBus::connected(r.session.connect().await, T),
         timeout: T,
         concurrency: 16,
+        action_settle: std::time::Duration::from_millis(100),
         switch: Some(switch),
     }
 }

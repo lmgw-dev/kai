@@ -141,6 +141,7 @@ fn only_the_operations_are_reachable() {
         ("PUT", "/api/apply", 405),
         ("POST", "/api/tools", 405),
         ("DELETE", "/api/tools", 405),
+        ("POST", "/api/notices", 405),
         ("GET", "/api/quit", 404),
         ("GET", "/api/", 404),
         ("POST", "/api/other", 404),
@@ -259,14 +260,36 @@ fn the_page_reads_what_the_operations_answer_and_sends_what_they_read() {
     };
     let grace = entries.iter().find(|e| e.key == "voice.grace_s").unwrap();
     assert_eq!((grace.value.clone(), grace.set), (json!(30), true));
-    assert!(grace.choices.is_empty());
-    // The page reads a fixed-word setting's words from Kai's answer (its select's options).
+    assert_eq!(grace.meta.label, "Keep a hold-to-talk session open");
+    assert_eq!(grace.meta.unit.as_deref(), Some("s"));
+    assert!(matches!(
+        grace.meta.control,
+        wire::Control::Number { min: Some(0), .. }
+    ));
+    // The page reads a fixed-word setting's words and their names from Kai's answer (its select's
+    // options).
     let weather = entries
         .iter()
         .find(|e| e.key == "overlay.weather.position")
         .unwrap();
-    assert_eq!(weather.choices.len(), 9);
-    assert!(weather.choices.iter().any(|w| w == "bottom-left"));
+    let wire::Control::Choice { options, .. } = &weather.meta.control else {
+        panic!("a choice: {:?}", weather.meta.control);
+    };
+    assert_eq!(options.len(), 9);
+    assert!(
+        options
+            .iter()
+            .any(|o| o.word == "bottom-left" && o.name == "Bottom left")
+    );
+    // The conversation's name is the shared-or-own choice.
+    let name = entries
+        .iter()
+        .find(|e| e.key == "conversation.folder_name")
+        .unwrap();
+    assert!(matches!(
+        &name.meta.control,
+        wire::Control::SharedName { shared, .. } if shared == "Kai"
+    ));
     assert!(
         entries
             .iter()
@@ -331,8 +354,15 @@ fn the_page_offers_the_words_kai_accepts() {
     assert_eq!(wire::STATES.len(), 5);
     assert_eq!(wire::LEVELS.len(), 4);
     assert_eq!(wire::PROVIDERS.len(), 3);
-    // The keys pairing writes are read-only in the page and refused by the operations.
-    assert_eq!(wire::READ_ONLY_KEYS[..], *crate::settings::PAIRING_KEYS);
+    // The keys pairing writes are read-only in the page (the catalog's control) and refused by
+    // the operations.
+    for key in crate::settings::PAIRING_KEYS {
+        assert_eq!(
+            settings::catalog::meta(key).map(|m| m.control),
+            Some(settings::catalog::Control::ReadOnly),
+            "{key}"
+        );
+    }
 }
 
 #[test]
@@ -416,6 +446,25 @@ fn the_zoom_steps_stay_in_bounds_and_zero_goes_home() {
     assert_eq!(s, 0.5);
 }
 
+/// The notices above the pages (kai-firefox's §8.3 warning) are the core's to say; the page reads
+/// them again on the event Kai sends when they change.
+#[test]
+fn the_notices_are_read_from_the_core() {
+    assert_eq!(wire::NOTICES_EVENT, super::NOTICES_EVENT);
+    assert_eq!(
+        route(&incoming("GET", "kai://settings/api/notices", b"")),
+        Routed::Notices
+    );
+    assert_eq!(
+        answer(route(&Incoming {
+            origin: Some("https://evil.example"),
+            ..incoming("GET", "kai://settings/api/notices", b"")
+        }))
+        .status,
+        403
+    );
+}
+
 /// The Desktop page's remote-control permission (WP16c): the look and the forget reach the core,
 /// other methods do not, the origin checks hold, and the page reads what the core answers.
 #[test]
@@ -489,4 +538,117 @@ fn the_remote_control_permission_is_looked_at_and_forgotten_through_the_core() {
     );
     let again = super::remote::answer(&file, true).unwrap();
     assert_eq!(again.forgot, Some(false), "nothing left to forget");
+}
+
+/// The Firefox section (kai-firefox design §10): the look and the click reach the core, other
+/// methods and origins do not, and the page reads the facts the core answers with, which never hold
+/// the build's link.
+#[test]
+fn the_firefox_section_is_looked_at_and_clicked_through_the_core() {
+    assert_eq!(wire::BROWSER_EVENT, super::BROWSER_EVENT);
+    assert_eq!(
+        route(&incoming("GET", "kai://settings/api/browser", b"")),
+        Routed::Browser { install: false }
+    );
+    assert_eq!(
+        route(&incoming("POST", "kai://settings/api/browser/install", b"")),
+        Routed::Browser { install: true }
+    );
+    for (method, path) in [
+        ("POST", "/api/browser"),
+        ("GET", "/api/browser/install"),
+        ("DELETE", "/api/browser"),
+    ] {
+        let uri = format!("kai://settings{path}");
+        assert_eq!(
+            answer(route(&incoming(method, &uri, b""))).status,
+            405,
+            "{method} {path}"
+        );
+    }
+    let foreign = Incoming {
+        origin: Some("https://evil.example"),
+        ..incoming("POST", "kai://settings/api/browser/install", b"")
+    };
+    assert_eq!(answer(route(&foreign)).status, 403);
+    let same_site_only = Incoming {
+        fetch_site: Some("cross-site"),
+        ..incoming("POST", "kai://settings/api/browser/install", b"")
+    };
+    assert_eq!(answer(route(&same_site_only)).status, 403);
+    assert_eq!(
+        answer(route(&incoming(
+            "POST",
+            "kai://app/api/browser/install",
+            b""
+        )))
+        .status,
+        403
+    );
+
+    use crate::browser::install::{Facts, look};
+    let read =
+        |f: &Facts| -> wire::Browser { serde_json::from_slice(&Answer::json(f).body).unwrap() };
+    let link = "https://deploy:s3cret@git.example/kai-firefox.xpi";
+    let facts = read(&look(Some(link), 1));
+    assert_eq!(
+        facts,
+        wire::Browser {
+            install: true,
+            problem: None,
+            linked: 1,
+            opened: None
+        }
+    );
+    let body = String::from_utf8(Answer::json(&look(Some(link), 1)).body).unwrap();
+    assert!(
+        !body.contains("s3cret") && !body.contains("git.example"),
+        "{body}"
+    );
+    assert!(!read(&look(None, 0)).install);
+    assert!(read(&look(Some("ftp://x/y.xpi"), 0)).problem.is_some());
+}
+
+/// One set of names: the Tools and Desktop pages name states, levels and providers as the catalog
+/// does.
+#[test]
+fn the_pages_use_the_catalogs_choice_names() {
+    use crate::settings::catalog::{Control, meta};
+    for key in [
+        "policy.tools.key_press",
+        "policy.levels.key_press",
+        "desktop.windows",
+    ] {
+        let Control::Choice { options, .. } = meta(key).unwrap().control else {
+            panic!("{key} is a choice");
+        };
+        assert!(!options.is_empty());
+        for o in options {
+            assert_eq!(wire::word_name(&o.word), o.name, "{key}: {}", o.word);
+        }
+    }
+}
+
+/// The page's pickers read what `GET /api/devices` says.
+#[test]
+fn the_devices_answer_is_what_the_page_reads() {
+    use crate::settings::window::devices::{Choice, Devices};
+    let d = Devices {
+        microphones: vec![Choice {
+            name: "alsa_input.usb".into(),
+            label: "USB microphone".into(),
+        }],
+        speakers: Vec::new(),
+        screens: vec![Choice {
+            name: "DP-1".into(),
+            label: "Test Monitor 27 (DP-1)".into(),
+        }],
+    };
+    let read: wire::Devices = serde_json::from_slice(&serde_json::to_vec(&d).unwrap()).unwrap();
+    assert_eq!(
+        read.of(wire::Source::Microphones)[0].label,
+        "USB microphone"
+    );
+    assert_eq!(read.of(wire::Source::Screens)[0].name, "DP-1");
+    assert!(read.of(wire::Source::Speakers).is_empty());
 }

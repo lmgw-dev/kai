@@ -53,6 +53,18 @@ impl<L: VoiceLink> Voice<L> {
         if self.approvals.voice_answers() {
             return self.approval_press(audio, now).await;
         }
+        // Kai's speech without a model (an announcement, a paragraph read aloud) stops at the
+        // press, which spends the gesture as over a reply (K6); a reading pauses (`speak`).
+        if self.speak_cut("you pressed the talk key") {
+            tracing::info!("talk: the press stops what Kai says by itself (K6)");
+            self.key = Some(Key {
+                at: now,
+                consumed: true,
+                muted: self.muted,
+                gated: false,
+            });
+            return self.settle();
+        }
         // While Kai speaks, the press stops it and spends the gesture (K6).
         let speaking = self
             .session

@@ -19,6 +19,14 @@
 //!   has the focus then, such as lmgw's dashboard, which is not one of Kai's own windows.
 //! - **One call at a time** (`Services::input_turn`): a call waits for the one before it to end,
 //!   at most until its own deadline less `launch::ANSWER_MARGIN`; a cancelled call stops waiting.
+//!   The browser's trusted press takes the same turn ([`take_turn`]) before its focus check and
+//!   sends its key in it ([`act`]).
+//! - **Kai for Firefox's input spans** (`crate::browser::spans`, kai-firefox design §6.3): in its
+//!   turn, before its first event, every call opens a span in each linked Firefox, so Firefox
+//!   counts what it gets meanwhile as Kai's input, never as the user's act its focus rule reads;
+//!   the spans end after the last event, `browser.input_settle_ms` later in the background. A
+//!   Firefox whose span did not open is logged and its tabs count as touched by Kai (best effort:
+//!   the input goes on).
 //! - **The focus guard:** before the first event and before every further character and chord the
 //!   window with the keyboard focus must be the confirmed one, and Kai's approval card must not hold
 //!   the keyboard (`crate::approvals::keyboard`: KWin's window list does not name layer-shell
@@ -32,6 +40,16 @@
 //! - **Never Kai's own windows** (`resolve::not_kais`): the focused window for `type_text` and
 //!   `key_press`, `ui_press`'s window; refused before the confirmation, so no input call can
 //!   answer Kai's own dialog or drive its configuration window.
+//! - **Kai's browser site rules** (`crate::desktop::sites`): a Firefox window that shows a site Kai
+//!   may only read or does not reach (or one Kai cannot tell, while some site is so) is refused
+//!   before the confirmation (for `ui_press` before its element is looked up) and again when the
+//!   call runs after it; `ui_press` presses only inside a page whose page and frame Kai may act
+//!   on (`sites::pages`); `key_press` refuses Firefox's own tab, address and history chords there,
+//!   and the desktop's window shortcuts while some site is `none`; and before each chord and
+//!   character the focus guard hands the window to `sites::keys::KeyWatch`, which checks it again
+//!   once the focus is back after the dialog, whenever its title changes, and checks the frame
+//!   with the keyboard focus. A refusal names such a window by its id, never its title. The
+//!   browser's trusted press ([`act`]) is checked by the browser tool that sends it.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -41,9 +59,13 @@ use kai_desktop::caps::input::{Guard, keysyms, parse_keys};
 use kai_desktop::caps::windows::{Window, Windows};
 use kai_desktop::caps::{Failure, Fut};
 
+use tokio_util::sync::CancellationToken;
+
 use super::launch::ANSWER_MARGIN;
 use super::{Ctx, Services};
+use crate::browser::shown::Reach;
 use crate::desktop::resolve::{self, quoted, shown_text, window_line};
+use crate::desktop::sites;
 use crate::host::registry::{Args, Origin, Prepared, Preparer};
 
 /// How often the guard looks again while it waits for the focus to come back at the start.
@@ -113,6 +135,9 @@ pub fn prepare(services: &Services, name: &'static str) -> Preparer {
                 state: Arc::new(c),
                 options: Vec::new(),
                 notes,
+                ask: None,
+                spoken: None,
+                confirmed: false,
             })
         })
     })
@@ -148,11 +173,16 @@ async fn confirmed(
     match name {
         "type_text" => {
             text(args)?;
-            Ok(Confirmed::Focus(keyed(services, args).await?))
+            let w = keyed(services, args).await?;
+            sites::check(services, &w, Reach::Act, name).await?;
+            Ok(Confirmed::Focus(w))
         }
         "key_press" => {
-            parse_keys(args.text("keys").unwrap_or_default())?;
-            Ok(Confirmed::Focus(keyed(services, args).await?))
+            let chords = parse_keys(args.text("keys").unwrap_or_default())?;
+            let w = keyed(services, args).await?;
+            sites::keys::chords(services, &w, &chords, name)?;
+            sites::check(services, &w, Reach::Act, name).await?;
+            Ok(Confirmed::Focus(w))
         }
         "ui_press" => {
             let (Some(access), Some(windows)) = (&services.accessibility, &services.windows) else {
@@ -162,15 +192,18 @@ async fn confirmed(
             let snap = windows.snapshot().await.map_err(say)?;
             let win = resolve::window(&snap, args.text("window"))?;
             resolve::not_kais(win)?;
+            sites::check(services, win, Reach::Act, name).await?;
             let target = Target {
                 pid: win.pid,
                 title: win.title.clone(),
+                exact: sites::exact(services, win),
             };
             let hold = match &services.a11y {
                 Some(s) => Some(Arc::new(s.hold().await)),
                 None => None,
             };
             let found = access.find(&target, &query).await.map_err(say)?;
+            sites::pages::found(services, win, &found, name)?;
             Ok(Confirmed::Element(win.clone(), found, hold))
         }
         other => Err(format!("Kai's desktop module has no tool {other}")),
@@ -190,8 +223,8 @@ async fn keyed(services: &Services, args: &Args) -> Result<Window, String> {
         return Err(format!(
             "{} does not have the keyboard focus (the keys would go to {}); activate it first \
              (window_activate)",
-            window_line(named),
-            window_line(&focused)
+            sites::named(services, named),
+            sites::named(services, &focused)
         ));
     }
     Ok(focused)
@@ -240,19 +273,63 @@ pub async fn run(
         .prepared
         .as_ref()
         .and_then(|p| p.state.clone().downcast::<Confirmed>().ok());
-    let confirmed = match prepared {
-        Some(c) => (*c).clone(),
+    let (confirmed, prepared_first) = match prepared {
+        Some(c) => ((*c).clone(), true),
         // A call with no confirmation step (Kai's own, the tests) resolves now.
-        None => confirmed(services, name, args, Origin::default()).await?,
+        None => (
+            confirmed(services, name, args, Origin::default()).await?,
+            false,
+        ),
     };
-    let _turn = turn(services, ctx).await?;
+    let _turn = take_turn(services, ctx.deadline, ctx.timeout_ms).await?;
+    if prepared_first {
+        // The site rules again: the tab in front may have changed since, while a dialog waited.
+        let (Confirmed::Focus(w) | Confirmed::Element(w, ..)) = &confirmed;
+        sites::check_now(services, &w.id, Reach::Act, name).await?;
+    }
+    let span = match &services.spans {
+        Some(s) => Some(s.begin(name_of(name), &CancellationToken::new()).await),
+        None => None,
+    };
+    let done = act(services, name, args, confirmed).await;
+    if let Some(open) = span {
+        open.end_later();
+    }
+    done
+}
+
+/// The input tool's name as the spans log it.
+fn name_of(name: &str) -> &'static str {
+    match name {
+        "type_text" => "type_text",
+        "key_press" => "key_press",
+        "ui_press" => "ui_press",
+        _ => "an input tool",
+    }
+}
+
+/// The input of a call whose caller holds its turn ([`take_turn`]) and brackets it (the
+/// browser's trusted press, which takes the turn before its focus check).
+pub async fn act(
+    services: &Services,
+    name: &str,
+    args: &Args,
+    confirmed: Confirmed,
+) -> Result<String, String> {
     match (name, confirmed) {
         ("type_text", Confirmed::Focus(window)) => {
             let Some(input) = &services.input else {
                 return missing("keyboard input");
             };
             let keysyms = text(args)?;
-            let guard = FocusGuard::new(services, window, keysyms.len(), Unit::Characters)?;
+            // The focused frame is checked before the first character and after each that can
+            // move the focus (Tab, a line break).
+            let frames = std::iter::once(true)
+                .chain(keysyms.iter().map(|k| matches!(*k, 0xff09 | 0xff0d)))
+                .take(keysyms.len())
+                .collect();
+            let watch = sites::keys::KeyWatch::new(services, &window, frames);
+            let guard = FocusGuard::new(services, window, keysyms.len(), Unit::Characters, watch)?;
             guard.check(0).await.map_err(say)?;
             input.type_keysyms(&keysyms, guard).await.map_err(say)?;
             Ok(format!("typed {} characters", keysyms.len()))
@@ -262,7 +339,10 @@ pub async fn run(
                 return missing("keyboard input");
             };
             let chords = parse_keys(args.text("keys").unwrap_or_default())?;
-            let guard = FocusGuard::new(services, window, chords.len(), Unit::Chords)?;
+            sites::keys::chords(services, &window, &chords, name)?;
+            // Any chord can move the focus: the focused frame is checked before each.
+            let watch = sites::keys::KeyWatch::new(services, &window, vec![true; chords.len()]);
+            let guard = FocusGuard::new(services, window, chords.len(), Unit::Chords, watch)?;
             guard.check(0).await.map_err(say)?;
             input.press_chords(&chords, guard).await.map_err(say)?;
             Ok(match chords.len() {
@@ -274,6 +354,9 @@ pub async fn run(
             let Some(access) = &services.accessibility else {
                 return missing("accessibility");
             };
+            // The rules may have changed while the dialog waited; the provider presses only
+            // while the element's pages are still these.
+            sites::pages::found(services, &window, &found, name)?;
             let pressed = access.press(&found).await.map_err(say)?;
             let name = if pressed.name.is_empty() {
                 String::new()
@@ -292,13 +375,15 @@ pub async fn run(
     }
 }
 
-/// This call's turn among the input calls (module doc).
-async fn turn<'a>(
-    services: &'a Services,
-    ctx: &Ctx,
-) -> Result<tokio::sync::MutexGuard<'a, ()>, String> {
-    let lock = services.input_turn.lock();
-    match ctx.deadline {
+/// A call's turn among the input calls (module doc), held until dropped: at most until
+/// `deadline` less the answer's margin (`timeout_ms` names it).
+pub async fn take_turn(
+    services: &Services,
+    deadline: Option<tokio::time::Instant>,
+    timeout_ms: Option<u64>,
+) -> Result<tokio::sync::OwnedMutexGuard<()>, String> {
+    let lock = services.input_turn.clone().lock_owned();
+    match deadline {
         None => Ok(lock.await),
         Some(d) => {
             let until = d.checked_sub(ANSWER_MARGIN).unwrap_or(d);
@@ -307,7 +392,7 @@ async fn turn<'a>(
                     "another input call was still running when this one's time was up \
                      (lmgw/timeout_ms = {}, less {:.1} s for the answer); nothing was typed or \
                      pressed",
-                    ctx.timeout_ms.unwrap_or_default(),
+                    timeout_ms.unwrap_or_default(),
                     ANSWER_MARGIN.as_secs_f64()
                 )
             })
@@ -330,6 +415,8 @@ struct FocusGuard {
     unit: Unit,
     /// How long the first check waits for the focus to come back (`dbus.timeout_s`).
     wait: Duration,
+    /// Kai's site rules while the keys go into a Firefox window (`sites::keys`).
+    watch: Option<sites::keys::KeyWatch>,
 }
 
 impl FocusGuard {
@@ -338,6 +425,7 @@ impl FocusGuard {
         want: Window,
         total: usize,
         unit: Unit,
+        watch: Option<sites::keys::KeyWatch>,
     ) -> Result<Arc<FocusGuard>, String> {
         Ok(Arc::new(FocusGuard {
             windows: windows(services)?.clone(),
@@ -346,6 +434,7 @@ impl FocusGuard {
             total,
             unit,
             wait: services.focus_wait,
+            watch,
         }))
     }
 
@@ -400,7 +489,14 @@ impl Guard for FocusGuard {
                     ))
                 })?;
                 let card = self.card.holds();
-                if !card && now.as_ref().is_some_and(|w| w.id == self.want.id) {
+                if !card && let Some(w) = now.as_ref().filter(|w| w.id == self.want.id) {
+                    // Kai's site rules on the window as it is now: at the first unit once the
+                    // focus is back after the dialog, and before each one after.
+                    if let Some(watch) = &self.watch {
+                        watch.before(w, done).await.map_err(|r| {
+                            Failure::Refused(format!("{r}; {}", self.progress(done)))
+                        })?;
+                    }
                     return Ok(());
                 }
                 if done > 0 || tokio::time::Instant::now() >= end {

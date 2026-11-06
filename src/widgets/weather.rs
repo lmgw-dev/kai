@@ -13,7 +13,7 @@
 //!
 //! ```toml
 //! [weather]
-//! places = { home = "52.52,13.405", work = "48.137,11.575" }   # name = "latitude,longitude"
+//! places = { home = "53.5511,9.9937", work = "48.137,11.575" }   # name = "latitude,longitude"
 //! ```
 
 use std::collections::BTreeMap;
@@ -94,7 +94,7 @@ impl WeatherConfig {
 
 /// `latitude,longitude` in degrees.
 pub fn coordinates(s: &str) -> Result<(f64, f64), String> {
-    let bad = || "must be latitude,longitude in degrees (e.g. 52.52,13.405)".to_owned();
+    let bad = || "must be latitude,longitude in degrees (e.g. 53.5511,9.9937)".to_owned();
     let (la, lo) = s.split_once(',').ok_or_else(bad)?;
     let (la, lo) = (
         la.trim().parse::<f64>().map_err(|_| bad())?,
@@ -263,7 +263,7 @@ mod tests {
     fn places() -> WeatherConfig {
         WeatherConfig {
             places: [
-                ("home".to_owned(), "52.52,13.405".to_owned()),
+                ("home".to_owned(), "53.5511,9.9937".to_owned()),
                 ("Work".to_owned(), "48.137, 11.575".to_owned()),
             ]
             .into(),
@@ -281,8 +281,8 @@ mod tests {
     #[test]
     fn a_place_is_a_saved_name_or_coordinates_and_a_bad_one_is_named() {
         let p = places();
-        assert_eq!(p.resolve(None), Ok((52.52, 13.405)));
-        assert_eq!(p.resolve(Some(" ")), Ok((52.52, 13.405)));
+        assert_eq!(p.resolve(None), Ok((53.5511, 9.9937)));
+        assert_eq!(p.resolve(Some(" ")), Ok((53.5511, 9.9937)));
         assert_eq!(p.resolve(Some("work")), Ok((48.137, 11.575)));
         assert_eq!(p.resolve(Some("-33.87, 151.21")), Ok((-33.87, 151.21)));
         let e = p.resolve(Some("Atlantis")).unwrap_err();
@@ -319,13 +319,13 @@ mod tests {
     async fn the_widget_shows_the_data_the_attribution_and_nothing_unescaped() {
         let s = serve(vec![
             (
-                "/current_weather?lat=52.52&lon=13.405",
+                "/current_weather?lat=53.5511&lon=9.9937",
                 ok(json!({"weather": {"timestamp": "2026-10-09T14:00:00+02:00", "temperature": 14.4,
                     "icon": "partly-cloudy-day", "wind_speed_10": 12.0, "relative_humidity": 71},
-                    "sources": [{"station_name": "Berlin <b>Tempelhof</b>"}]})),
+                    "sources": [{"station_name": "Hamburg <b>Fuhlsbüttel</b>"}]})),
             ),
             (
-                "/weather?lat=52.52&lon=13.405&date=2026-10-09",
+                "/weather?lat=53.5511&lon=9.9937&date=2026-10-09",
                 ok(json!({"weather": [
                     {"timestamp": "2026-10-09T00:00:00+02:00", "temperature": 8.1, "precipitation": 0.0},
                     {"timestamp": "2026-10-09T15:00:00+02:00", "temperature": 16.9, "precipitation": 1.5},
@@ -350,7 +350,7 @@ mod tests {
             d.contains("Deutscher Wetterdienst (DWD), via Bright Sky"),
             "attribution"
         );
-        assert!(d.contains("Berlin &lt;b&gt;Tempelhof"), "escaped: {d}");
+        assert!(d.contains("Hamburg &lt;b&gt;Fuhlsbüttel"), "escaped: {d}");
         assert_eq!(
             s.seen.lock().unwrap().len(),
             2,

@@ -318,6 +318,7 @@ pub async fn send_full(
     let method = match req.method {
         Method::Get => reqwest::Method::GET,
         Method::Post => reqwest::Method::POST,
+        Method::Put => reqwest::Method::PUT,
     };
     let mut b = client.request(method, req.url(base));
     for h in &req.headers {
@@ -401,6 +402,15 @@ mod tests {
             )
             .unwrap_err(),
             "lmgw answered 503 gpu_hold: the GPU is held"
+        );
+        assert_eq!(
+            read_turn(
+                503,
+                r#"{"error":{"code":"gpu_deferred","message":"the GPU is busy","type":"x"}}"#
+            )
+            .unwrap_err(),
+            "lmgw answered 503 gpu_deferred: the GPU is busy",
+            "a deferral is formatted like any code; it passes where the hold does not"
         );
         assert_eq!(
             read_turn(502, "<html>bad gateway</html>").unwrap_err(),

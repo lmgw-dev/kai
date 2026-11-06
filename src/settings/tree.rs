@@ -43,9 +43,9 @@ impl View {
     pub(super) fn read(path: &Path) -> Result<Self, Refusal> {
         let text = config::read_text(path)?;
         let config = Config::parse(&text, path)?;
-        let file = text
-            .parse()
-            .map_err(|e: toml_edit::TomlError| Refusal(format!("{}: {e}", path.display())))?;
+        let file = text.parse().map_err(|e: toml_edit::TomlError| {
+            Refusal::plain(format!("{}: {e}", path.display()))
+        })?;
         Ok(Self {
             leaves: leaves(&config),
             file,
@@ -64,7 +64,7 @@ impl View {
     fn entry(&self, key: &str, value: Value) -> Entry {
         Entry {
             key: key.to_owned(),
-            choices: super::choices::of(key, &value),
+            meta: super::catalog::meta_or_plain(key),
             value,
             set: self.in_file(key),
         }

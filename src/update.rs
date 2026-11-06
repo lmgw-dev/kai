@@ -917,17 +917,17 @@ impl<U: Updates, D: Desk> Updater<U, D> {
     }
 }
 
-/// Makes `dest`'s directory (0700, the user's) and removes a file a download or install that was
-/// cut short left there.
+/// Makes `dest`'s directory (0700, the user's: `crate::paths::private_dir`) and removes a file a
+/// download or install that was cut short left there.
 async fn fresh_download_path(dest: &Path) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
     if let Some(dir) = dest.parent() {
-        tokio::fs::create_dir_all(dir)
-            .await
-            .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-        tokio::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
-            .await
-            .map_err(|e| format!("cannot make {} private: {e}", dir.display()))?;
+        let dir = dir.to_owned();
+        tokio::task::spawn_blocking(move || {
+            crate::paths::private_dir(&dir)
+                .map_err(|e| format!("cannot make {} (private, mode 0700): {e}", dir.display()))
+        })
+        .await
+        .map_err(|e| e.to_string())??;
     }
     match tokio::fs::remove_file(dest).await {
         Ok(()) => Ok(()),

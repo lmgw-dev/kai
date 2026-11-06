@@ -465,6 +465,9 @@ impl Inner {
                 state: Arc::new(()),
                 notes: Vec::new(),
                 options: Vec::new(),
+                ask: None,
+                spoken: None,
+                confirmed: false,
             });
         }
         let Some(root) = &self.dir else {
@@ -513,6 +516,9 @@ impl Inner {
             }),
             notes: Vec::new(),
             options,
+            ask: None,
+            spoken: None,
+            confirmed: false,
         })
     }
 
@@ -592,7 +598,7 @@ impl Inner {
     fn write_file(&self, file: &Path, request: Request) -> Result<(), String> {
         let outcome = crate::settings::apply(file, request).map_err(|e| e.0)?;
         if let Some(c) = outcome.config {
-            *self.policy.write().expect("never poisoned") = Policy::new(&c.policy);
+            *self.policy.write().expect("never poisoned") = Policy::of(&c);
         }
         Ok(())
     }
@@ -963,7 +969,7 @@ pub async fn serve(local: Local, rt: Runtime, socket: PathBuf, timeout: Duration
         crate::cli::server::Backend {
             local: local.clone(),
             creds: inner.creds.clone(),
-            cgroup_of: crate::cli::server::proc_cgroup,
+            cgroup_of: crate::local_socket::proc_cgroup,
             scopes,
         },
     );

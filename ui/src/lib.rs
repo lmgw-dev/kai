@@ -14,7 +14,11 @@ mod api;
 #[cfg(target_arch = "wasm32")]
 mod app;
 #[cfg(target_arch = "wasm32")]
+mod firefox;
+#[cfg(target_arch = "wasm32")]
 mod personality;
+#[cfg(target_arch = "wasm32")]
+mod settings_page;
 
 /// The kit's HTTP base: the scheme handler forwards lmgw's routes under it, with Kai's device key
 /// (`src/settings/window/profiles.rs`'s `PREFIX`).

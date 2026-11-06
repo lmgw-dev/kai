@@ -92,7 +92,7 @@ pub const AREA: Area = Area {
             "Show the current weather and today's range (DWD data through Bright Sky) over the desktop; returns its id.",
             &[
                 Param::new("place", Kind::Text).optional().described(
-                    "a saved place name or latitude,longitude (e.g. 52.52,13.405); default: home",
+                    "a saved place name or latitude,longitude (e.g. 53.5511,9.9937); default: home",
                 ),
                 POSITION,
             ],

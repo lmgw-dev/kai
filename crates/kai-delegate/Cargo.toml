@@ -1,6 +1,6 @@
 [package]
 name = "kai-delegate"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "K25's delegate loop, client-neutral: a task-tuned prompt (static part first, dynamic part last), the model and the tools behind traits, a plan confirmed once, a short done, partial or failed answer"
 license = "MIT"

@@ -74,6 +74,7 @@ impl<L: VoiceLink> Voice<L> {
         match wake {
             Wake::Tick => {
                 self.drain_capture();
+                self.speak_tick(audio);
                 self.stuck_key(now).await;
                 if let Some(s) = self.session.as_mut()
                     && let Some(w) = s.pump(now)
@@ -101,6 +102,7 @@ impl<L: VoiceLink> Voice<L> {
             }
             Wake::SessionGone => self.on_closed(CLOSE_DROPPED, String::new()),
             Wake::Approval(w) => self.on_approval(w).await,
+            Wake::Speak(w) => self.speak_wake(w, audio),
         }
         self.settle();
     }
@@ -183,8 +185,13 @@ impl<L: VoiceLink> Voice<L> {
             return;
         }
         // K17: the talk key records the spoken answer; while a call of Kai's own waits the session
-        // gets no audio, and the pre-roll is kept for the answer.
+        // gets no audio. What the microphone hears while Kai speaks (its reply, its own speech) and
+        // its echo's guard after is silence in the answer (`crate::approvals::asked`, M1).
         if self.approvals.recording() {
+            let now = Instant::now();
+            if self.answer_hears_kai(now) {
+                buf.fill(0);
+            }
             self.approvals.record(&buf);
             return;
         }
@@ -199,7 +206,13 @@ impl<L: VoiceLink> Voice<L> {
             self.keep_preroll(&buf);
             return;
         }
-        if self.muted || (automatic && !talking && self.other_turn().is_some()) {
+        // Kai's speech without a model (`speak`), which lmgw does not know: in half duplex the
+        // session hears silence while it plays, so only the key interrupts it (§5.5), and after
+        // it stops it hears silence for its echo's guard, so the echo's tail starts no turn.
+        if self.muted
+            || (automatic && !talking && self.other_turn().is_some())
+            || (!talking && self.speak.mutes_mic(self.half_duplex, Instant::now()))
+        {
             buf.fill(0);
         }
         match self.session.as_mut().filter(|s| s.created) {
@@ -212,6 +225,20 @@ impl<L: VoiceLink> Voice<L> {
             }
             None => self.pending.extend_from_slice(&buf),
         }
+    }
+
+    /// What the microphone hears now may be Kai's own voice (`crate::approvals::asked`, M1):
+    /// Kai's reply plays, or did within `browser.speech_echo_guard_ms`; or Kai's speech without a
+    /// model plays, or its echo's guard runs.
+    fn answer_hears_kai(&mut self, now: Instant) -> bool {
+        if self
+            .session
+            .as_ref()
+            .is_some_and(|s| s.machine.playing().is_some())
+        {
+            self.reply_echo_until = Some(now + self.s.speech_echo_guard);
+        }
+        self.reply_echo_until.is_some_and(|t| now < t) || self.speak.echo_risk(now)
     }
 
     fn keep_preroll(&mut self, samples: &[i16]) {
@@ -571,6 +598,26 @@ impl<L: VoiceLink> Voice<L> {
                 tracing::debug!(turn_detection = ?f.turn_detection, settled, "voice: session.updated");
             }
             ServerEvent::SpeechStarted => {
+                // The owner talks: what Kai says by itself stops, a reading pauses (`speak`).
+                // Speech heard while it played, or within its echo's guard, may hold its echo:
+                // the barge-in is spent on the cut (K6) and the input buffer is cleared, so only
+                // what is said after the guard forms a turn and page text never becomes the
+                // owner's (`speak`'s module doc).
+                let echo = !talking && self.speak.echo_risk(now);
+                self.speak_cut("you spoke");
+                let Some(s) = self.session.as_mut() else {
+                    return;
+                };
+                if echo {
+                    tracing::info!(
+                        "voice: speech heard over Kai's own speech; the input buffer is cleared \
+                         so its echo forms no turn"
+                    );
+                    // What waits to fill a chunk was heard before the clear: it goes too.
+                    self.carry.clear();
+                    s.send(ClientEvent::Clear);
+                    self.speak.guard_echo(now);
+                }
                 if let Some(rid) = s.machine.playing().map(str::to_owned) {
                     tracing::info!(response_id = %rid, "voice: barge-in");
                     s.cut(&rid, Cut::BargeIn, flush_wait, now).await;
@@ -646,6 +693,11 @@ impl<L: VoiceLink> Voice<L> {
                 // K25: the words kept so far are a past turn's (the user message of a heard turn
                 // races its reply).
                 crate::delegate::response_created(&response_id);
+                // Kai's reply takes the playback: Kai's own speech waits for its end (`speak`).
+                self.speak_yield();
+                let Some(s) = self.session.as_mut() else {
+                    return;
+                };
                 s.last_error = None;
                 s.response_created(&response_id, now, || audio.open_playback());
                 self.note = None;
@@ -799,6 +851,22 @@ impl<L: VoiceLink> Voice<L> {
             Some(THREAD_NOT_FOUND) => self.note = Some(format!("voice error: {words}")),
             Some("gpu_hold") => {
                 self.hold_notice("", "", &e.message);
+            }
+            // A background deferral: unlike the hold, this one passes. The GPU is busy with the
+            // owner's other work, so the turn can be said again shortly. A tooltip line and one
+            // notification per message, not the hold's once-per-period notice.
+            Some("gpu_deferred") => {
+                self.note = Some(format!("voice error: {words}"));
+                if n == 1 {
+                    self.notify(
+                        "Kai: GPU busy",
+                        format!(
+                            "the GPU is busy with other work right now, so Kai could not answer: \
+                             try again shortly ({})",
+                            e.message
+                        ),
+                    );
+                }
             }
             // The verdicts the session carried: the approvals say it on the card (above).
             Some(c) if c.starts_with("approval_") => {

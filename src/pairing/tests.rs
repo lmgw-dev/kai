@@ -177,6 +177,10 @@ async fn an_enrolment_gets_a_certificate_that_opens_the_device_listener() {
         let sent: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(sent["token"], TOKEN);
         assert!(sent["client"].as_str().unwrap().starts_with("Kai "));
+        assert_eq!(
+            sent["device_name"].as_str().map(str::to_owned),
+            device_name()
+        );
         let answer = test_pki::enrolment_answer(&PKI, &g.url, &body);
         s.write_all(test_pki::answer("201 Created", &answer).as_bytes())
             .await
@@ -523,6 +527,28 @@ fn the_client_names_kai_the_host_and_the_system() {
     let host = std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap();
     assert!(text.contains(&format!(" on {} (", host.trim())), "{text}");
     assert!(text.ends_with(')'), "{text}");
+}
+
+/// The device's own name: the pretty hostname, quotes off, else the hostname, else nothing.
+#[test]
+fn the_device_name_is_the_pretty_hostname_else_the_hostname() {
+    let info = "CHASSIS=desktop\nPRETTY_HOSTNAME=\"Ada's Laptop\"\nICON_NAME=computer\n";
+    assert_eq!(
+        machine_name(Some(info), Some("desk1\n")).as_deref(),
+        Some("Ada's Laptop")
+    );
+    assert_eq!(
+        machine_name(Some("PRETTY_HOSTNAME='Laptop'\n"), None).as_deref(),
+        Some("Laptop")
+    );
+    for none_set in [Some("CHASSIS=desktop\n"), Some("PRETTY_HOSTNAME=\n"), None] {
+        assert_eq!(
+            machine_name(none_set, Some("desk1\n")).as_deref(),
+            Some("desk1")
+        );
+    }
+    assert_eq!(machine_name(None, Some(" \n")), None);
+    assert_eq!(machine_name(None, None), None);
 }
 
 /// Not a unit test: the enrolment the live checks that hand a pairing to a live test of their own

@@ -86,6 +86,17 @@ pub enum Routed {
     Apply(Request),
     /// The core's facts about Kai's conversation ([`profiles::Conversation`]).
     Conversation,
+    /// The microphones, speakers and screens Kai can list ([`super::devices::Devices`]).
+    Devices,
+    /// The lines the window shows above its pages (`Command::WindowNotices`).
+    Notices,
+    /// The Firefox section: what the build and the links say (`install: false`), or the click
+    /// that opens the extension's link (`Command::WindowBrowser`).
+    Browser {
+        install: bool,
+    },
+    /// "Restart Kai now": the quit sequence, then the installed binary starts (`Command::Restart`).
+    Restart,
     /// A profile-editor request the core sends to lmgw over the device link; lmgw's answer is the
     /// page's.
     Proxy(Forward),
@@ -121,6 +132,11 @@ pub fn route(req: &Incoming<'_>) -> Routed {
     match (req.method, url.path()) {
         ("GET", "/api/tools") => Routed::Answer(Answer::json(&tools::all())),
         ("GET", "/api/conversation") => Routed::Conversation,
+        ("GET", "/api/devices") => Routed::Devices,
+        ("GET", "/api/notices") => Routed::Notices,
+        ("GET", "/api/browser") => Routed::Browser { install: false },
+        ("POST", "/api/browser/install") => Routed::Browser { install: true },
+        ("POST", "/api/restart") => Routed::Restart,
         ("GET", "/api/remote-control") => Routed::RemoteControl { forget: false },
         ("POST", "/api/remote-control/forget") => Routed::RemoteControl { forget: true },
         ("POST", "/api/apply") => match serde_json::from_slice::<Request>(req.body) {
@@ -139,6 +155,11 @@ pub fn route(req: &Incoming<'_>) -> Routed {
             "/api/tools"
             | "/api/apply"
             | "/api/conversation"
+            | "/api/devices"
+            | "/api/notices"
+            | "/api/browser"
+            | "/api/browser/install"
+            | "/api/restart"
             | "/api/remote-control"
             | "/api/remote-control/forget",
         ) => Routed::Answer(Answer::text(405, "wrong method")),

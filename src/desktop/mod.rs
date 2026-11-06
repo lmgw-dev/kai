@@ -15,6 +15,9 @@
 //!   service and, for do not disturb, brightness and Night Light, the provider's feature, WP15's
 //!   seeing and reading tools ([`read`]) theirs. A missing grant is the tool's error (§11.1).
 //! - **K22's resolution** of `window`, `desktop` and `output` is [`resolve`].
+//! - **Kai's browser site rules** hold for the tools that capture, read or act in a window: a
+//!   Firefox window that shows a site Kai does not reach is not captured or read, one on a site
+//!   Kai may only read is not acted in, and `see_screen` blanks the first kind ([`sites`]).
 
 pub mod fdo;
 #[cfg(test)]
@@ -24,6 +27,7 @@ pub mod probe;
 pub mod read;
 pub mod resolve;
 pub mod settings;
+pub mod sites;
 #[cfg(test)]
 pub(crate) mod tests;
 pub mod tools;
@@ -271,10 +275,11 @@ pub async fn has_owner(
     .map_err(|e| e.to_string())
 }
 
-/// The probe's outcome: the table and the entries it lists.
+/// The probe's outcome: the table, the entries it lists and the services behind them.
 struct Ready {
     chosen: Vec<Chosen>,
     entries: Vec<Entry>,
+    services: Services,
 }
 
 struct State {
@@ -285,6 +290,10 @@ struct State {
     changes: Changes,
     /// The running Kai's provider publishes the tray line; a test's does not.
     publish: bool,
+    /// Kai for Firefox's input spans, which bracket the input tools' keys (`tools::input`).
+    spans: Option<crate::browser::spans::Spans>,
+    /// Kai's browser site rules over the tools that capture, read or act in a window ([`sites`]).
+    sites: Option<crate::browser::shown::Shown>,
 }
 
 /// The desktop module's provider (module doc). A clone shares the probe and its entries (the
@@ -294,9 +303,11 @@ pub struct DesktopTools {
     state: Arc<State>,
 }
 
-/// The provider `registry::providers` lists. In the unit tests it probes nothing (no session,
-/// no display): `tests` build their own over private buses.
-pub fn provider(deps: &Deps) -> DesktopTools {
+/// The provider `registry::providers` lists, its input tools bracketed by Kai for Firefox's input
+/// `spans`, and the tools that capture, read or act in a window under Kai's browser site rules
+/// ([`sites`]). In the unit tests it probes nothing (no session, no display): `tests` build their
+/// own over private buses.
+pub fn provider(deps: &Deps, spans: crate::browser::spans::Spans) -> DesktopTools {
     #[cfg(not(test))]
     let (env, publish) = (Env::from_deps(deps), true);
     #[cfg(test)]
@@ -307,6 +318,11 @@ pub fn provider(deps: &Deps) -> DesktopTools {
         deps.changes.clone(),
         publish,
     )
+    .with_spans(spans)
+    .with_sites(crate::browser::shown::Shown::new(
+        deps.browser.clone(),
+        deps.policy.clone(),
+    ))
 }
 
 impl DesktopTools {
@@ -319,8 +335,33 @@ impl DesktopTools {
                 started: AtomicBool::new(false),
                 changes,
                 publish,
+                spans: None,
+                sites: None,
             }),
         }
+    }
+
+    /// The provider's own state while nothing shares it yet; a wiring after it was cloned would
+    /// be lost (the probe's services were taken from it), so that is a bug that stops Kai at
+    /// start, never a silent no-op.
+    fn unshared(&mut self, what: &str) -> &mut State {
+        Arc::get_mut(&mut self.state).unwrap_or_else(|| {
+            panic!("DesktopTools::{what} must run before the provider is cloned or probed")
+        })
+    }
+
+    /// Its input tools bracket their keys with Kai for Firefox's input `spans` (`tools::input`);
+    /// before the provider is cloned or probed.
+    pub fn with_spans(mut self, spans: crate::browser::spans::Spans) -> Self {
+        self.unshared("with_spans").spans = Some(spans);
+        self
+    }
+
+    /// Its tools that capture, read or act in a window follow Kai's browser site rules
+    /// ([`sites`]); before the provider is cloned or probed.
+    pub fn with_sites(mut self, sites: crate::browser::shown::Shown) -> Self {
+        self.unshared("with_sites").sites = Some(sites);
+        self
     }
 
     /// Runs the probe now, in this task, unless it ran or runs (the tests).
@@ -339,6 +380,11 @@ impl DesktopTools {
             .get()
             .map(|r| r.chosen.clone())
             .unwrap_or_default()
+    }
+
+    /// The chosen services, once probed (the browser's trusted path, `crate::browser::desk`).
+    pub fn services(&self) -> Option<Services> {
+        self.state.ready.get().map(|r| r.services.clone())
     }
 
     fn start_probe(&self) {
@@ -382,6 +428,8 @@ impl State {
             focus_wait: self.env.timeout,
             card_keyboard: crate::approvals::keyboard::Holder::global(),
             a11y: self.env.a11y.clone(),
+            spans: self.spans.clone(),
+            sites: self.sites.clone(),
             ..Services::default()
         };
         for c in &chosen {
@@ -411,7 +459,11 @@ impl State {
         if self.publish {
             TABLE.send_replace(vec![probe::tray_line(&chosen, &built)]);
         }
-        let _ = self.ready.set(Ready { chosen, entries });
+        let _ = self.ready.set(Ready {
+            chosen,
+            entries,
+            services,
+        });
     }
 }
 

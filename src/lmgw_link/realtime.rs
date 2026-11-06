@@ -51,8 +51,8 @@ use super::{Credentials, describe};
 use crate::audio::RATE;
 use crate::conversation::FolderInfo;
 use crate::voice::link::{
-    CLOSE_DROPPED, Current, FolderPatched, Pending, ProfileList, Refusal, SessionEvent, ThreadRef,
-    VoiceLink, VoiceSocket, append_samples,
+    CLOSE_DROPPED, Current, FolderPatched, KaiVoice, Pending, ProfileList, Refusal, SessionEvent,
+    SpeechVoice, ThreadRef, VoiceLink, VoiceSocket, append_samples,
 };
 
 /// The reason of Kai's own close (1000): listening off, the press session's grace over, a rebind or
@@ -68,6 +68,8 @@ pub struct RealtimeSettings {
     pub keepalive: Duration,
     /// `voice.send_queue_s`: the audio the outgoing queue holds.
     pub send_queue: Duration,
+    /// `browser.speech_timeout_s`: one speech of Kai's own, made by lmgw (`VoiceLink::speech`).
+    pub speech_timeout: Duration,
 }
 
 impl RealtimeSettings {
@@ -76,6 +78,7 @@ impl RealtimeSettings {
             timeout: c.lmgw.timeout(),
             keepalive: c.voice.keepalive(),
             send_queue: c.voice.send_queue(),
+            speech_timeout: Duration::from_secs(c.browser.speech_timeout_s),
         }
     }
 }
@@ -113,6 +116,7 @@ impl RealtimeLink {
             let mut rb = match req.method {
                 requests::Method::Get => client.get(url),
                 requests::Method::Post => client.post(url),
+                requests::Method::Put => client.put(url),
             };
             for h in &req.headers {
                 let (name, value) = super::header(h).map_err(Refusal::no_answer)?;
@@ -196,6 +200,7 @@ async fn send_head(
     let mut rb = match req.method {
         requests::Method::Get => client.get(url),
         requests::Method::Post => client.post(url),
+        requests::Method::Put => client.put(url),
     };
     for h in &req.headers {
         let (name, value) = super::header(h).map_err(Refusal::no_answer)?;
@@ -403,6 +408,58 @@ impl VoiceLink for RealtimeLink {
         })
     }
 
+    fn kai_voice(&mut self, thread: i64) -> Pending<Result<KaiVoice, Refusal>> {
+        let req = requests::thread(thread);
+        self.call(req, "Kai's voice", read_kai_voice)
+    }
+
+    fn speech(&mut self, voice: &SpeechVoice, text: &str) -> Pending<Result<Vec<i16>, Refusal>> {
+        let Some(creds) = self.creds.clone() else {
+            return Box::pin(async { Err(Refusal::no_answer("Kai is not paired")) });
+        };
+        let timeout = self.settings.speech_timeout;
+        let req = speech_request(voice, text);
+        Box::pin(async move {
+            let secs = timeout.as_secs();
+            let bound = |what: &str| {
+                Refusal::no_answer(format!(
+                    "lmgw did not {what} within {secs} s (browser.speech_timeout_s)"
+                ))
+            };
+            let work = async {
+                let resp = creds
+                    .http()
+                    .post(req.url(&creds.url()))
+                    .header(reqwest::header::CONTENT_TYPE, "application/json")
+                    .body(req.body.unwrap_or_default())
+                    .send()
+                    .await
+                    .map_err(|e| Refusal::no_answer(unreachable(&e)))?;
+                let status = resp.status().as_u16();
+                let bytes = resp.bytes().await.map_err(|e| {
+                    Refusal::no_answer(format!("lmgw's answer broke off: {}", describe(&e)))
+                })?;
+                Ok::<_, Refusal>((status, bytes))
+            };
+            let (status, bytes) = tokio::time::timeout(timeout, work)
+                .await
+                .map_err(|_| bound("make the speech"))??;
+            if !(200..300).contains(&status) {
+                let e = requests::read_refusal(status, &String::from_utf8_lossy(&bytes));
+                return Err(Refusal {
+                    status,
+                    code: Some(e.code),
+                    message: e.message,
+                });
+            }
+            crate::audio::wav::pcm24k(&bytes).map_err(|why| Refusal {
+                status,
+                code: None,
+                message: format!("lmgw's speech does not play: {why}"),
+            })
+        })
+    }
+
     fn proxy(&mut self, forward: Forward, limits: ProxyLimits) -> Pending<Proxied> {
         let Some(creds) = self.creds.clone() else {
             return Box::pin(async {
@@ -410,6 +467,23 @@ impl VoiceLink for RealtimeLink {
             });
         };
         Box::pin(async move { super::proxy::send(&creds, forward, limits).await })
+    }
+
+    fn sidebar(
+        &mut self,
+        out: super::proxy::relay::Outbound,
+        limits: ProxyLimits,
+    ) -> Pending<Result<super::proxy::relay::Answer, Proxied>> {
+        let Some(creds) = self.creds.clone() else {
+            return Box::pin(async {
+                Err(Proxied::refused(
+                    503,
+                    "not_paired",
+                    "Kai is not paired with lmgw",
+                ))
+            });
+        };
+        Box::pin(async move { super::proxy::relay::send(&creds, out, limits).await })
     }
 
     fn open(
@@ -798,6 +872,79 @@ fn dechunk(mut rest: &[u8]) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests;
+
+/// `POST /v1/audio/speech` for `text` in `voice` (lmgw's OpenAI-shaped route; lmgw-client has no
+/// builder for it yet): WAV, which names its own rate, so a model of any rate plays right. The
+/// route hands the body's fields to whatever answers, so the body carries only what lmgw's own
+/// speech sends every route (`proxy/synthesize.rs`' `clause_body`: `model`, `input`, `voice`,
+/// `instructions`, `response_format: "wav"`) and the seed [`read_kai_voice`] kept; never a
+/// `language` (a design decision, Kai's design WP24).
+pub(super) fn speech_request(voice: &SpeechVoice, text: &str) -> requests::Request {
+    let mut body = serde_json::json!({
+        "model": voice.model,
+        "input": text,
+        "response_format": "wav",
+    });
+    if let Some(v) = &voice.voice {
+        body["voice"] = v.clone().into();
+    }
+    if let Some(i) = voice.instructions.as_ref().filter(|i| !i.trim().is_empty()) {
+        body["instructions"] = i.clone().into();
+    }
+    if let Some(seed) = voice.seed {
+        body["seed"] = seed.into();
+    }
+    requests::Request {
+        method: requests::Method::Post,
+        path: "/v1/audio/speech".into(),
+        headers: Vec::new(),
+        body: Some(body.to_string()),
+    }
+}
+
+/// Kai's voice from `GET /chat/api/threads/{id}`'s `voice_resolved` (`VoiceLink::kai_voice`): the
+/// text-to-speech alias, the voice (the voice mode's default where the thread names none), the
+/// speech style, the language of Kai's own words (`reply_language`) and the thread's seed.
+///
+/// The seed, as lmgw's own speech sends it (a design decision, Kai's design WP24): lmgw sends a
+/// thread's seed only to an lmgw audio row (`proxy/synthesize.rs`' `sends_seed`), never to a
+/// cloud route, and `/v1/audio/speech` passes a client's seed to whatever answers. So Kai keeps it
+/// only where the thread says its text-to-speech alias is served on this machine (`tts.local`)
+/// and every fallback it names is too; which rows read a seed (`reads_seed`, `seeds_voice`, a
+/// seed the row pins) lmgw does not tell a client yet, and a row that reads none ignores it.
+pub(super) fn read_kai_voice(status: u16, body: &str) -> Result<KaiVoice, requests::ApiError> {
+    #[derive(serde::Deserialize)]
+    struct Detail {
+        thread: lmgw_client::types::chat::Thread,
+    }
+    if !(200..300).contains(&status) {
+        return Err(requests::read_refusal(status, body));
+    }
+    let d: Detail = serde_json::from_str(body).map_err(|e| requests::ApiError {
+        code: "unreadable".into(),
+        message: format!("the thread does not read: {e}"),
+        ..Default::default()
+    })?;
+    let v = d.thread.voice_resolved;
+    let local = v.tts.local == Some(true) && v.tts.fallback.as_ref().is_none_or(|f| f.local);
+    let model = v.tts.alias.ok_or_else(|| requests::ApiError {
+        code: "no_tts".into(),
+        message: "Kai's conversation has no text-to-speech model (lmgw: Settings → Chat → \
+                  Voice, or the folder's or thread's voice settings)"
+            .into(),
+        ..Default::default()
+    })?;
+    let text = v.speech_style.text.trim().to_owned();
+    Ok(KaiVoice {
+        voice: SpeechVoice {
+            model,
+            voice: v.voice.name.or(v.voice.inherits),
+            instructions: (!text.is_empty()).then_some(text),
+            seed: v.seed.filter(|_| local),
+        },
+        lang: crate::voice::speak::Lang::of(v.reply_language.value.as_deref()),
+    })
+}
 
 /// `GET /chat/api/threads/{id}`'s answer, as far as WP19 reads it: every call its messages'
 /// `pending_approvals` list (lmgw lists only the calls a reply still waits on).

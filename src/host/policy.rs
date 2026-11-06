@@ -10,6 +10,8 @@
 //! 3. **The per-tool state:** `deny` refuses, `allow` runs, `allow_trusted` runs for trusted callers
 //!    (as step 4's read-only default), `confirm` asks; the last two unless a trusted approver
 //!    approved the call in its thread.
+//!    The hands-and-eyes switch (`browser.hands_and_eyes`, kai-firefox design §6.4) gives the
+//!    browser's acting tools `allow_trusted` where no state is set (`BrowserPolicy`).
 //! 4. **No state set, K15's default:** a trusted approval runs the call (where it applies, below),
 //!    K24's confirmed-by-default tools included, which are asked for every other call; a read-only
 //!    tool (and an overlay, PD4) runs for trusted callers and is asked for the others; every other
@@ -54,6 +56,7 @@ use lmgw_client::mcp_host::{CallerKind, Principal};
 use super::confirm::shown_text;
 use super::registry::Args;
 use super::settings::{Named, PolicyConfig, ToolState};
+use crate::browser::policy::BrowserPolicy;
 
 /// Whether a trusted approver's approval (F) may decide this call (module doc): every call, K24's
 /// confirmed-by-default tools included, but `routine_enable` switching a routine on.
@@ -157,10 +160,14 @@ pub struct Policy {
     tools: BTreeMap<String, ToolState>,
     levels: BTreeMap<String, Level>,
     config_tools: bool,
+    /// `[browser]`'s part (kai-firefox design §6.4): the hands-and-eyes switch's defaults, the focus
+    /// rule's exception and the site rules.
+    browser: BrowserPolicy,
 }
 
 impl Policy {
-    /// `config` was validated (`crate::config`): an entry that does not read is skipped.
+    /// `config` was validated (`crate::config`): an entry that does not read is skipped. The
+    /// browser's part is off ([`Policy::of`] reads it too).
     pub fn new(config: &PolicyConfig) -> Self {
         let named = |list: &[String]| list.iter().filter_map(|e| Named::parse(e)).collect();
         Self {
@@ -173,7 +180,24 @@ impl Policy {
                 .map(|(k, v)| (k.clone(), Level::from(*v)))
                 .collect(),
             config_tools: config.config_tools,
+            browser: BrowserPolicy::default(),
         }
+    }
+
+    /// The policy of a whole configuration: `[policy]` and `[browser]`'s part.
+    pub fn of(config: &crate::config::Config) -> Self {
+        Self::new(&config.policy).with_browser(&config.browser)
+    }
+
+    /// With `[browser]`'s part.
+    pub fn with_browser(mut self, browser: &crate::browser::settings::BrowserConfig) -> Self {
+        self.browser = BrowserPolicy::new(browser);
+        self
+    }
+
+    /// `[browser]`'s part.
+    pub fn browser(&self) -> &BrowserPolicy {
+        &self.browser
     }
 
     /// The tooltip's notes on trust that reaches every program of the user (module doc): `cli`
@@ -315,7 +339,10 @@ impl Policy {
     /// (`lmgw/approval`), if anyone did (module doc).
     pub fn decide(&self, spec: &ToolSpec, caller: &Caller, approver: Option<&Caller>) -> Decision {
         let tool = spec.name;
-        let state = self.tools.get(tool).copied();
+        let set = self.tools.get(tool).copied();
+        // The hands-and-eyes switch's default, where the owner set no state (§6.4).
+        let by_switch = set.is_none() && self.browser.default_state(tool).is_some();
+        let state = set.or_else(|| self.browser.default_state(tool));
         if state == Some(ToolState::Off) {
             return Decision::Deny(format!(
                 "Kai does not offer {tool} (policy.tools.{tool} = \"off\")"
@@ -346,6 +373,9 @@ impl Policy {
             Some(ToolState::AllowTrusted) if approved || self.trusted_caller(caller) => {
                 Decision::Allow
             }
+            Some(ToolState::AllowTrusted) if by_switch => Decision::Confirm {
+                why: "browser.hands_and_eyes lets trusted callers only act unasked",
+            },
             Some(ToolState::AllowTrusted) => Decision::Confirm {
                 why: "policy.tools says allow_trusted, for an untrusted caller",
             },

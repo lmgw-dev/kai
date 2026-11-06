@@ -183,7 +183,7 @@ pub(super) fn check(
     spec_of: &dyn Fn(&str) -> Option<&'static ToolSpec>,
 ) -> Result<(), Refusal> {
     let (old, new) = (&old_config.policy, &new_config.policy);
-    let refuse = |why: String| Err(Refusal(why));
+    let refuse = |why: String| Err(Refusal::plain(why));
     // The opt-ins themselves: switching one on is the owner's.
     for (tool, on) in &new.widen_by_tools {
         if *on && old.widen_by_tools.get(tool) != Some(&true) {

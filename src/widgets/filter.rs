@@ -41,7 +41,8 @@ type Done = Box<dyn FnOnce(Result<Filter, String>)>;
 /// Compiles [`FILTER_RULES`] into a store in `dir` and calls `done` on the GTK thread with the
 /// filter, or why it failed.
 pub fn compile(dir: &Path, done: impl FnOnce(Result<Filter, String>) + 'static) {
-    if let Err(e) = std::fs::create_dir_all(dir) {
+    // Mode 0700, and Kai's runtime folder above it when this makes it (`crate::paths::private_dir`).
+    if let Err(e) = crate::paths::private_dir(dir) {
         done(Err(format!("cannot make {}: {e}", dir.display())));
         return;
     }

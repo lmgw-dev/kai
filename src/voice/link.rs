@@ -28,8 +28,10 @@ use std::pin::Pin;
 
 use tokio::sync::mpsc;
 
+pub use super::speak::{KaiVoice, SpeechVoice};
 pub use crate::conversation::FolderInfo;
 use crate::lmgw_link::Credentials;
+use crate::lmgw_link::proxy::relay::{Answer as SidebarAnswer, Outbound};
 use crate::lmgw_link::proxy::{Forward, Limits as ProxyLimits, Proxied};
 pub use lmgw_client::requests::{FolderPatched, ProfileList};
 
@@ -215,6 +217,23 @@ pub trait VoiceLink: Send + 'static {
     fn proxy(&mut self, _forward: Forward, _limits: ProxyLimits) -> Pending<Proxied> {
         Box::pin(async { Proxied::refused(502, "no_proxy", "this link forwards nothing to lmgw") })
     }
+    /// One request of Firefox's sidebar (kai-firefox §8.2, `crate::lmgw_link::proxy::relay`), sent
+    /// to lmgw with the device key: lmgw's answer, whole or streamed, or Kai's refusal in lmgw's
+    /// error shape. Dropping the future or the answer's stream ends the request. A link without it
+    /// says so, 503 `no_proxy` as `browser.sock` without a proxy does.
+    fn sidebar(
+        &mut self,
+        _out: Outbound,
+        _limits: ProxyLimits,
+    ) -> Pending<Result<SidebarAnswer, Proxied>> {
+        Box::pin(async {
+            Err(Proxied::refused(
+                503,
+                "no_proxy",
+                "this link forwards nothing to lmgw",
+            ))
+        })
+    }
     /// `POST /chat/api/threads/{thread}/approvals` with the verdicts of every call the thread's
     /// last reply waits on (WP19, api §6.3). `Ok` once lmgw took them (its answer's head); the
     /// resumed turn's stream is read to its end beside, since a request that stopped reading would
@@ -238,6 +257,19 @@ pub trait VoiceLink: Send + 'static {
     /// nowhere.
     fn transcribe(&mut self, _thread: i64, _wav: Vec<u8>) -> Pending<Result<String, Refusal>> {
         Box::pin(async { Err(Refusal::no_answer("this link transcribes nothing")) })
+    }
+    /// Kai's own voice (kai-firefox §7.2, `super::speak`): the text-to-speech alias, the voice,
+    /// the speech style and the seed lmgw resolves for the conversation's thread `thread`
+    /// (`GET /chat/api/threads/{thread}`'s `voice_resolved`), and the language of Kai's own words
+    /// (its `reply_language`). A thread without a text-to-speech alias is a refusal that says
+    /// where to set one.
+    fn kai_voice(&mut self, _thread: i64) -> Pending<Result<KaiVoice, Refusal>> {
+        Box::pin(async { Err(Refusal::no_answer("this link reads no voice")) })
+    }
+    /// `POST /v1/audio/speech` of `text` (one sentence) in `voice`: the speech as 24 kHz mono
+    /// PCM16, bounded by `browser.speech_timeout_s`. Written nowhere (no thread).
+    fn speech(&mut self, _voice: &SpeechVoice, _text: &str) -> Pending<Result<Vec<i16>, Refusal>> {
+        Box::pin(async { Err(Refusal::no_answer("this link makes no speech")) })
     }
     /// Opens `/v1/realtime?chat_thread=<thread>` over the device link. `take_over`: the owner's
     /// own bind (a press, the tray), which takes the thread from another session; Kai's own binds

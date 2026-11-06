@@ -230,6 +230,14 @@ impl Run {
         )
     }
 
+    /// The Settings page's row of `key` (its `data-key`): runs `body` on it.
+    fn setting_js(key: &str, body: &str) -> String {
+        format!(
+            "(() => {{ const row = document.querySelector('.settings .setting[data-key=\"{key}\"]'); \
+             if (!row) return 'no row {key}'; {body} }})()"
+        )
+    }
+
     async fn pick(&mut self, selector: &str, key: &str, which: usize, value: &str) -> String {
         let body = format!(
             "const s = row.querySelectorAll('select')[{which}]; s.value = '{value}'; \
@@ -267,10 +275,27 @@ fn spawn_core(config: PathBuf, lmgw: std::rc::Rc<Lmgw>) -> mpsc::UnboundedSender
         while let Some(cmd) = rx.recv().await {
             match cmd {
                 Command::Setting { request, reply } => {
-                    let _ = reply.send(settings::apply(&config, request).map(|o| o.response));
+                    // As the core's window path: a refusal in the catalog's words.
+                    let _ = reply.send(
+                        settings::apply(&config, request)
+                            .map(|o| o.response)
+                            .map_err(|r| settings::Refusal::plain(settings::catalog::in_words(&r))),
+                    );
                 }
                 Command::WindowConversation { reply } => {
                     let _ = reply.send(lmgw.conversation());
+                }
+                Command::WindowDevices { reply } => {
+                    use super::devices::{Choice, Devices};
+                    let choice = |name: &str, label: &str| Choice {
+                        name: name.into(),
+                        label: label.into(),
+                    };
+                    let _ = reply.send(Devices {
+                        microphones: vec![choice("alsa_input.test", "Test USB microphone")],
+                        speakers: vec![choice("alsa_output.test", "Test speakers")],
+                        screens: vec![choice("DP-1", "Test Monitor 27 (DP-1)")],
+                    });
                 }
                 Command::WindowProxy { forward, reply } => lmgw.forward(forward, reply),
                 Command::WindowRemoteControl { forget, reply } => {
@@ -414,7 +439,7 @@ async fn drive(r: &mut Run) {
     );
     r.shot("tools").await;
 
-    // Tools: a state, then a level, written to the file at once and said "applied".
+    // Tools: a state, then a level, written to the file at once and said "Saved" for a moment.
     let said = r
         .pick("table.tools tbody tr", "run_command", 1, "allow")
         .await;
@@ -430,12 +455,12 @@ async fn drive(r: &mut Run) {
             &Run::row_js(
                 "table.tools tbody tr",
                 "run_command",
-                "return row.querySelector('.note.ok')?.textContent === 'applied';",
+                "return row.querySelector('.note.ok')?.textContent === 'Saved';",
             ),
             5,
         )
         .await;
-    r.ok("the row says applied", note, "");
+    r.ok("the row says Saved", note, "");
     r.pick("table.tools tbody tr", "run_command", 0, "owner")
         .await;
     let wrote = r.file_has("run_command = \"owner\"", 5).await;
@@ -533,9 +558,108 @@ async fn drive(r: &mut Run) {
         fields.parse::<usize>().unwrap_or(0) > 30,
         format!("{fields} fields"),
     );
+    // The owner's rule (2026-10-19): a setting's label is its words, never its key.
+    let keyed = r
+        .js("[...document.querySelectorAll('.settings .field > label')].map(l => l.textContent.trim()) \
+             .filter(t => /^[a-z_]+(\\.[a-z0-9_-]+)+$/.test(t) || t.includes('_')).join(', ')")
+        .await;
+    r.ok(
+        "no setting is labelled with its key",
+        keyed.is_empty(),
+        &keyed,
+    );
+    // The polish pass of 2026-10-19: plain checkboxes (no On/Off word), no raw folder id, labels
+    // on one line at 125 %, the pickers in place of identifier fields.
+    let words = r
+        .js("[...document.querySelectorAll('.settings .switch-line')].map(l => l.textContent.trim()) \
+             .filter(t => t !== '').join(', ')")
+        .await;
+    r.ok(
+        "a switch is a plain checkbox, with no On/Off word",
+        words.is_empty(),
+        &words,
+    );
+    let folder_id = r
+        .js("document.querySelector('.settings .setting[data-key=\"conversation.folder_id\"]') === null")
+        .await;
+    r.ok(
+        "the bare folder id is not shown",
+        folder_id == "true",
+        &folder_id,
+    );
+    let wrapped = r
+        .js(
+            "[...document.querySelectorAll('.settings .field > label')] \
+             .filter(l => l.getBoundingClientRect().height > 30) \
+             .map(l => l.textContent.trim()).join(' | ')",
+        )
+        .await;
+    r.ok(
+        "no label wraps onto a second line",
+        wrapped.is_empty(),
+        &wrapped,
+    );
+    let lower = r
+        .js("[...document.querySelectorAll('.settings .field-hint')].map(h => h.textContent.trim()) \
+             .filter(t => /^(On|Off),/.test(t)).join(' | ')")
+        .await;
+    r.ok(
+        "no help line starts with On, or Off,",
+        lower.is_empty(),
+        &lower,
+    );
+    let pickers = r
+        .js(&Run::setting_js(
+            "audio.input",
+            "const s = row.querySelector('select'); if (!s) return 'no select'; \
+             return [...s.options].map(o => o.textContent.trim()).join(' | ');",
+        ))
+        .await;
+    r.ok(
+        "the microphone is a picker with System default and the device's name",
+        pickers == "System default | Test USB microphone",
+        &pickers,
+    );
+    r.js(&Run::setting_js(
+        "audio.input",
+        "const s = row.querySelector('select'); s.value = 'alsa_input.test'; \
+         s.dispatchEvent(new Event('change', {bubbles: true})); return 'done';",
+    ))
+    .await;
+    let mic = r.file_has("input = \"alsa_input.test\"", 5).await;
+    r.ok("picking a microphone stores its node name", mic, "");
+    let reset = r
+        .until(
+            &Run::setting_js(
+                "audio.input",
+                "return row.querySelector('.ctl-reset button') !== null;",
+            ),
+            5,
+        )
+        .await;
+    r.ok("Reset shows for a value that is not the default", reset, "");
+    r.js(&Run::setting_js(
+        "audio.input",
+        "row.querySelector('.ctl-reset button').click(); return 'done';",
+    ))
+    .await;
+    let unset = r
+        .until(
+            &Run::setting_js(
+                "audio.input",
+                "return row.querySelector('select').value === '' \
+                 && row.querySelector('.ctl-reset button') === null;",
+            ),
+            5,
+        )
+        .await;
+    r.ok(
+        "Reset puts System default back and the button goes",
+        unset && !r.file().contains("alsa_input.test"),
+        "",
+    );
     let set = |key: &str, value: &str| {
-        Run::row_js(
-            ".settings .field",
+        Run::setting_js(
             key,
             &format!(
                 "const i = row.querySelector('input'); i.value = '{value}'; \
@@ -551,32 +675,210 @@ async fn drive(r: &mut Run) {
         wrote,
         "voice.grace_s = 45",
     );
-    let before = r.file();
-    r.js(&set("host.keepalive_s", "0")).await;
-    let refused = r
+    // It applies at the next start: the footer says which setting waits and offers the restart.
+    let footer = r
         .until(
-            &Run::row_js(
-                ".settings .field",
+            "(() => { const f = document.querySelector('.page-foot'); return !!f \
+             && f.textContent.includes('“Keep a hold-to-talk session open”') \
+             && [...f.querySelectorAll('button')].some(b => b.textContent.trim() === 'Restart Kai now'); })()",
+            5,
+        )
+        .await;
+    r.ok(
+        "the footer lists the setting waiting for a restart and offers Restart Kai now",
+        footer,
+        "",
+    );
+    // Reset sits in one column whatever the control: compare a number's with a choice's.
+    r.js(&Run::setting_js(
+        "ring.anchor",
+        "const s = row.querySelector('select'); s.value = 'top'; \
+         s.dispatchEvent(new Event('change', {bubbles: true})); return 'done';",
+    ))
+    .await;
+    let aligned = r
+        .until(
+            "(() => { const a = document.querySelector('.setting[data-key=\"voice.grace_s\"] .ctl-reset button'); \
+             const b = document.querySelector('.setting[data-key=\"ring.anchor\"] .ctl-reset button'); \
+             return !!a && !!b && Math.abs(a.getBoundingClientRect().left - b.getBoundingClientRect().left) < 1; })()",
+            5,
+        )
+        .await;
+    r.ok("Reset lines up across a number and a choice", aligned, "");
+    r.js(&Run::setting_js(
+        "ring.anchor",
+        "row.querySelector('.ctl-reset button').click(); return 'done';",
+    ))
+    .await;
+    r.js(&Run::setting_js(
+        "voice.grace_s",
+        "row.scrollIntoView({block: 'center'}); return 'done';",
+    ))
+    .await;
+    sleep(300).await;
+    r.shot("settings-reset").await;
+    r.js(&Run::setting_js(
+        "voice.on_at_start",
+        "row.scrollIntoView(); return 'done';",
+    ))
+    .await;
+    sleep(300).await;
+    r.shot("settings-switches").await;
+    let before = r.file();
+    // Below a bound the catalog knows, the page says so itself and sends nothing.
+    r.js(&set("host.keepalive_s", "0")).await;
+    let bounded = r
+        .until(
+            &Run::setting_js(
                 "host.keepalive_s",
-                "return (row.querySelector('.field-err')?.textContent ?? '').includes('host.keepalive_s');",
+                "return (row.querySelector('.field-err')?.textContent ?? '') === 'At least 1 s.';",
             ),
             5,
         )
         .await;
     r.ok(
-        "a refused value shows the loader's sentence inline",
+        "a value below its bound is said inline before it is sent",
+        bounded,
+        "",
+    );
+    // A rule only the loader knows (the buffer holds at least the connect timeout's audio): its
+    // sentence, naming the settings by their labels.
+    r.js(&set("voice.send_queue_s", "5")).await;
+    let refused = r
+        .until(
+            &Run::setting_js(
+                "voice.send_queue_s",
+                "return (row.querySelector('.field-err')?.textContent ?? '') \
+                 .startsWith('Outgoing audio buffer: must be at least 15 (seconds: “Connect timeout”');",
+            ),
+            5,
+        )
+        .await;
+    r.ok(
+        "a refused value shows the loader's sentence inline, naming the settings by their labels",
         refused,
         "",
     );
     r.ok("and writes nothing", r.file() == before, "");
-    r.js(&Run::row_js(
-        ".settings .field",
-        "voice.grace_s",
+    // The Conversation (2026-10-19): shared by default. "Only on this computer" only shows the
+    // name field (prefilled with this computer's name) and a button; nothing is written until the
+    // button is pressed, and then once.
+    let shared = r
+        .js(&Run::setting_js(
+            "conversation.folder_name",
+            "const [s, o] = row.querySelectorAll('input[type=radio]'); \
+             return `${s.checked} ${o.checked} ${row.querySelector('.own-name') === null}`;",
+        ))
+        .await;
+    r.ok(
+        "the conversation starts shared, with no name field",
+        shared == "true false true",
+        &shared,
+    );
+    r.js(&Run::setting_js(
+        "conversation.folder_name",
         "row.scrollIntoView(); return 'done';",
     ))
     .await;
     sleep(300).await;
-    r.shot("settings").await;
+    r.shot("settings-conversation-shared").await;
+    let before = r.file();
+    r.js(&Run::setting_js(
+        "conversation.folder_name",
+        "const o = row.querySelectorAll('input[type=radio]')[1]; o.checked = true; \
+         o.dispatchEvent(new Event('change', {bubbles: true})); return 'done';",
+    ))
+    .await;
+    let host = crate::settings::catalog::own_conversation_name();
+    let field = r
+        .until(
+            &Run::setting_js(
+                "conversation.folder_name",
+                &format!(
+                    "return row.querySelector('.own-name input')?.value === '{host}' \
+                     && row.querySelector('.own-name button')?.textContent.trim() === 'Use this conversation';"
+                ),
+            ),
+            5,
+        )
+        .await;
+    sleep(800).await;
+    r.ok(
+        "only on this computer shows the name field with this computer's name and the button",
+        field,
+        &host,
+    );
+    r.ok("and writes nothing yet", r.file() == before, "");
+    r.shot("settings-conversation-own").await;
+    r.js(&Run::setting_js(
+        "conversation.folder_name",
+        "row.querySelector('.own-name button').click(); return 'done';",
+    ))
+    .await;
+    let own = r.file_has(&format!("folder_name = \"{host}\""), 5).await;
+    r.ok("the button writes the name, once", own, "");
+    let said = r
+        .until(
+            &Run::setting_js(
+                "conversation.folder_name",
+                &format!(
+                    "return (row.querySelector('.note.ok')?.textContent ?? '').startsWith('Now using “{host}”');"
+                ),
+            ),
+            5,
+        )
+        .await;
+    r.ok("and says what happened", said, "");
+    r.js(&Run::setting_js(
+        "conversation.folder_name",
+        "const s = row.querySelectorAll('input[type=radio]')[0]; s.checked = true; \
+         s.dispatchEvent(new Event('change', {bubbles: true})); return 'done';",
+    ))
+    .await;
+    let mut back = false;
+    for _ in 0..50 {
+        if !r.file().contains("folder_name") {
+            back = true;
+            break;
+        }
+        sleep(100).await;
+    }
+    r.ok("shared again removes the name from the file", back, "");
+    // And back to the own name just used: it returns to it at once (after the page took Kai's
+    // answer to the removal).
+    sleep(600).await;
+    r.js(&Run::setting_js(
+        "conversation.folder_name",
+        "const o = row.querySelectorAll('input[type=radio]')[1]; o.checked = true; \
+         o.dispatchEvent(new Event('change', {bubbles: true})); return 'done';",
+    ))
+    .await;
+    let again = r.file_has(&format!("folder_name = \"{host}\""), 5).await;
+    r.ok(
+        "choosing the own conversation again returns to the name used",
+        again,
+        "",
+    );
+    sleep(600).await;
+    r.js(&Run::setting_js(
+        "conversation.folder_name",
+        "const s = row.querySelectorAll('input[type=radio]')[0]; s.checked = true; \
+         s.dispatchEvent(new Event('change', {bubbles: true})); return 'done';",
+    ))
+    .await;
+    let mut back = false;
+    for _ in 0..50 {
+        if !r.file().contains("folder_name") {
+            back = true;
+            break;
+        }
+        sleep(100).await;
+    }
+    r.ok("shared once more removes it", back, "");
+    r.js("document.querySelector('.page-body').scrollTop = 0; 'done'")
+        .await;
+    sleep(300).await;
+    r.shot("settings-top").await;
     overlay_position(r).await;
 
     personality::drive(r).await;
@@ -614,13 +916,13 @@ async fn drive(r: &mut Run) {
 async fn overlay_position(r: &mut Run) {
     let key = "overlay.weather.position";
     let shape = r
-        .js(&Run::row_js(
-            ".settings .field",
+        .js(&Run::setting_js(
             key,
             "const s = row.querySelector('select'); if (!s) return 'no select'; \
              const head = row.closest('.subsec')?.querySelector('.subsec-head')?.textContent; \
-             const words = [...s.options].filter(o => !o.hidden).map(o => o.value).join(','); \
-             return `${head} ${s.value} ${words}`;",
+             const words = [...s.options].map(o => o.value).join(','); \
+             const names = [...s.options].map(o => o.textContent).join(','); \
+             return `${head} ${s.value} ${words} ${names}`;",
         ))
         .await;
     let words: Vec<&str> = crate::widgets::kinds::POSITIONS
@@ -628,19 +930,33 @@ async fn overlay_position(r: &mut Run) {
         .map(|(_, w)| *w)
         .collect();
     r.ok(
-        "the weather overlay's position is a select of the nine positions under [overlay.weather]",
-        shape == format!("[overlay.weather] top-right {}", words.join(",")),
+        "the weather overlay's position is a select of the nine named positions under its heading",
+        shape
+            == format!(
+                "Weather card top-right {} Top left,Top,Top right,Left,Center,Right,Bottom left,Bottom,Bottom right",
+                words.join(",")
+            ),
         &shape,
     );
     let text = r
-        .js(&Run::row_js(
-            ".settings .field",
+        .js(&Run::setting_js(
             "overlay.weather.width",
-            "return row.querySelector('select') ? 'select' : row.querySelector('input')?.type;",
+            "return (row.querySelector('select') ? 'select' : row.querySelector('input')?.inputMode) \
+             + ' ' + row.querySelector('.unit')?.textContent;",
         ))
         .await;
-    r.ok("a number beside it stays a text box", text == "text", &text);
-    let said = r.pick(".settings .field", key, 0, "bottom-left").await;
+    r.ok(
+        "a number beside it is a number field with its unit",
+        text == "numeric px",
+        &text,
+    );
+    let said = r
+        .js(&Run::setting_js(
+            key,
+            "const s = row.querySelector('select'); s.value = 'bottom-left'; \
+             s.dispatchEvent(new Event('change', {bubbles: true})); return 'done';",
+        ))
+        .await;
     r.ok("the position's select answers", said == "done", &said);
     let wrote = r.file_has("position = \"bottom-left\"", 5).await;
     let loaded = crate::config::Config::parse(&r.file(), &r.config)
@@ -653,18 +969,16 @@ async fn overlay_position(r: &mut Run) {
     );
     let chip = r
         .until(
-            &Run::row_js(
-                ".settings .field",
+            &Run::setting_js(
                 key,
-                "return row.querySelector('.chip')?.textContent === 'set' \
+                "return [...row.querySelectorAll('button')].some(b => b.textContent === 'Reset') \
                  && row.querySelector('select').value === 'bottom-left';",
             ),
             5,
         )
         .await;
-    r.ok("the row reads set, showing bottom-left", chip, "");
-    r.js(&Run::row_js(
-        ".settings .field",
+    r.ok("the row offers Reset, showing bottom-left", chip, "");
+    r.js(&Run::setting_js(
         key,
         "row.closest('.subsec').scrollIntoView({block: 'center'}); return 'done';",
     ))

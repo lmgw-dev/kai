@@ -87,6 +87,14 @@ impl std::fmt::Debug for ConfirmRequest {
 /// saying so).
 pub trait Confirmer: Send + Sync + 'static {
     fn ask(&self, req: ConfirmRequest);
+
+    /// Asks the owner about a call of Kai's own that Kai may also speak and hear answered by voice
+    /// (`crate::approvals::asked`, kai-firefox WP10b): `spoken` is the question in Kai's words. The
+    /// dialog shows either way; a confirmer without a voice shows only the dialog.
+    fn ask_spoken(&self, req: ConfirmRequest, spoken: crate::voice::speak::Words) {
+        let _ = spoken;
+        self.ask(req);
+    }
 }
 
 /// The GTK dialog (`UiCmd::ConfirmTool`).

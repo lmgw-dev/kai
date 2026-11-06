@@ -68,6 +68,7 @@ async fn every_connection_refuses_a_server_under_another_ca() {
         timeout: Duration::from_secs(5),
         keepalive: Duration::from_secs(15),
         send_queue: Duration::from_secs(30),
+        speech_timeout: Duration::from_secs(60),
     });
     voice.set_credentials(Some(creds.clone()));
     let (e, ()) = tokio::join!(voice.current(1, false), refused_at(&g));

@@ -32,6 +32,7 @@ async fn session() {
         timeout: Duration::from_secs(2),
         keepalive: Duration::from_secs(15),
         send_queue: Duration::from_secs(30),
+        speech_timeout: Duration::from_secs(60),
     });
     link.set_credentials(Some(creds(&l.url)));
     let (tx, rx) = mpsc::unbounded_channel();

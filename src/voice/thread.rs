@@ -449,13 +449,27 @@ impl<L: VoiceLink> Voice<L> {
     /// The conversation's folder is gone (§3.2's `folder.deleted`): the session ends as at quit,
     /// listening goes off, and the thread is forgotten; `note` says why.
     pub async fn leave_conversation(&mut self, note: String) {
+        self.leave(Some(note)).await;
+    }
+
+    /// The owner moved the conversation to another folder (the settings window): the session ends
+    /// and the thread is forgotten as at [`Self::leave_conversation`], but nothing is reported (the
+    /// owner did it) and listening is handed back to the caller, who turns it on again once the new
+    /// folder is ready. Answers whether listening was on.
+    pub async fn move_conversation(&mut self) -> bool {
+        let was = self.listening;
+        self.leave(None).await;
+        was
+    }
+
+    async fn leave(&mut self, note: Option<String>) {
         let had = self.session.is_some() || self.listening || self.opening();
         self.listening = false;
         self.key = None;
         self.end_session().await;
         self.thread = None;
         self.last_turn = None;
-        if had {
+        if had && let Some(note) = note {
             self.note = Some(format!("voice stopped: {note}"));
             self.notify("Kai: voice stopped", note);
         }

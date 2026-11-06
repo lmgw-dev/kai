@@ -104,6 +104,18 @@ pub struct Prepared {
     /// Lines the dialog shows under the description, about what allowing the call means beyond
     /// its arguments (`type_text`'s remote-control permission, WP16c).
     pub notes: Vec<String>,
+    /// The tool's own reason to ask the owner where K15's policy would run the call unasked (the
+    /// browser's focus rule, kai-firefox design §6.4: an acting tool on a tab that is not the
+    /// user's). The dialog then offers no "always allow": the policy is not what asks.
+    pub ask: Option<&'static str>,
+    /// The question in Kai's words, spoken for a call of Kai's own whose dialog asks
+    /// (`super::confirm::Confirmer::ask_spoken`): the browser's tools say what they do and why
+    /// they ask; `None`: the dialog only.
+    pub spoken: Option<crate::voice::speak::Words>,
+    /// The owner allowed the call in Kai's dialog. The host sets it; a preparer leaves it `false`.
+    /// A handler whose preparation can go stale while the dialog waits looks again (the browser's
+    /// tab, which may have gone to another site meanwhile).
+    pub confirmed: bool,
 }
 
 /// How a call reached its tool, besides its arguments, for a [`Preparer`].
@@ -113,6 +125,11 @@ pub struct Origin {
     /// said yes in a thread before the call arrived, so what an implicit argument (the active
     /// window) would resolve to now is not what the owner saw.
     pub approved_in_lmgw: bool,
+    /// That approval decides the call (`super::policy::Policy::approval_counts`: a trusted
+    /// approver, not the caller approving itself): only such an approval spares a tool's own
+    /// question (the browser's focus rule). One that does not count still makes the call name its
+    /// target.
+    pub approval_counted: bool,
     /// Who calls (`None`: not said, the tests): `job_cancel` refuses another caller's job before
     /// anyone is asked.
     pub caller: Option<Caller>,
@@ -416,6 +433,12 @@ pub struct Deps {
     /// Kai's accessibility switch (`crate::desktop::fdo::atspi::switch`), shared with the core.
     #[allow(dead_code)]
     pub a11y: crate::desktop::fdo::atspi::switch::A11ySwitch,
+    /// Kai for Firefox's links (`crate::browser`), for the browser provider (kai-firefox's WP5).
+    /// A link that comes or goes signals [`Deps::changes`].
+    pub browser: crate::browser::Links,
+    /// Kai's state directory (`$XDG_STATE_HOME/kai`; `None` in the tests): the browser provider
+    /// keeps the highest element ref it handed out there (`crate::browser::refs`).
+    pub state_dir: Option<std::path::PathBuf>,
 }
 
 /// Every provider, in the order of Kai's tool list: one line per providing module.
@@ -426,11 +449,24 @@ pub fn providers(deps: &Deps) -> Vec<Box<dyn Provider>> {
         deps.cmds.clone(),
         deps.jobs.clone(),
     )));
-    let desktop = crate::desktop::provider(deps);
-    all.push(Box::new(crate::delegate::host_view(deps, desktop.clone())));
+    // Kai for Firefox's input spans: the desktop's input tools and the browser's trusted press
+    // bracket their keys with them, and the focus rule reads what they mark (kai-firefox §6.3).
+    let spans = crate::browser::spans::Spans::of(deps);
+    let desktop = crate::desktop::provider(deps, spans.clone());
+    let view = crate::delegate::host_view(deps, desktop.clone());
+    // Last: its list changes when Firefox starts or quits (kai-firefox design D3). Its trusted key
+    // goes through the desktop module's services (kai-firefox design §6.3), and its screenshots
+    // follow who looks at screenshots as the desktop's do (K25, `crate::delegate::screenshots`).
+    let browser = view.also(crate::browser::provider::provider(
+        deps,
+        desktop.clone(),
+        spans,
+    ));
+    all.push(Box::new(view));
     all.push(Box::new(crate::delegate::provider(deps, desktop)));
     all.push(Box::new(crate::widgets::provider(deps)));
     all.push(Box::new(crate::routines::provider(deps)));
+    all.push(Box::new(browser));
     #[cfg(feature = "live-test")]
     all.push(Box::new(super::live::Live));
     all

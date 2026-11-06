@@ -7,10 +7,21 @@
 //!   interface with at least one action and a name. [`Query::select`] picks: the name as given (any
 //!   case), else a fragment of it, narrowed by the role where the query names one. More than one
 //!   is a refusal that lists them, one `role "name"` line each; none is a refusal that says what the
-//!   walk could not see.
+//!   walk could not see. Only pages shown are walked (`super`'s module doc: a background tab's page
+//!   is not).
+//! - **Actions not ready yet** (kai-firefox WP12, from WP0 (d2)): Firefox can answer a link's or a
+//!   button's first `NActions` read with 0 and the same read about 100 ms later with 1. An element
+//!   the query names whose first read said none is read again after `accessibility.action_settle_ms`
+//!   (once per find, for all such elements together) before it is taken for one without an action;
+//!   so is the element at the press, right before its action runs.
 //! - **Before the confirmation:** the element is found ([`Atspi::find_element`]), so the dialog
 //!   names it and an ambiguity is refused without asking anyone; after it, exactly that element is
 //!   pressed ([`Atspi::press_found`]), once it still answers with the same role and name.
+//! - **The documents:** the element carries the addresses of the documents it is in below the
+//!   window, outermost first (`Found::documents`, read as the walk passes them); right before the
+//!   press they are read again from the element up (`Parent`), and an element whose documents are
+//!   no longer the same (a frame that went elsewhere), or whose page is no longer shown (another
+//!   tab came to the front), is not pressed. Kai's browser site rules judge the press by them.
 //! - **Refusing:** a control that is not enabled is not pressed.
 //! - **The action:** the first of `click`, `press`, `activate`, `toggle`, `check`, `select`, `open`,
 //!   `jump` the element offers (any case; toolkits name them differently), else its first action.
@@ -19,17 +30,21 @@
 //!   reported as made and the result says the app did not answer.
 //! - **Nothing is logged** of the names it matches.
 
+use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 
 use futures_util::future::{BoxFuture, join_all};
 use kai_desktop::caps::Failure;
 use kai_desktop::caps::accessibility::{Candidate, Found, Match, Pressed, Query, Target};
 
-use super::{ACCESSIBLE, Atspi, CONTROL_ROLES, Node, Walk, role_name, state};
+use zbus::zvariant::OwnedObjectPath;
+
+use super::walk::{Place, Walk};
+use super::{ACCESSIBLE, Atspi, CONTROL_ROLES, DOCUMENT, Node, ROOT, role_name, state};
 use crate::desktop::resolve::{quoted, shown_text};
 use crate::desktop::{call, property};
 
-const ACTION: &str = "org.a11y.atspi.Action";
+pub(super) const ACTION: &str = "org.a11y.atspi.Action";
 
 fn disabled(role: &str, name: &str) -> Failure {
     Failure::Refused(format!("{} {} is disabled", shown_text(role), quoted(name)))
@@ -46,6 +61,11 @@ struct Hit {
     role: String,
     name: String,
     disabled: bool,
+    /// The documents it is in (module doc).
+    documents: Vec<String>,
+    /// Its first `NActions` read said it has an action; `false`: it has the Action interface and
+    /// said none, which may not be ready yet (module doc).
+    ready: bool,
 }
 
 impl Atspi {
@@ -59,20 +79,38 @@ impl Atspi {
         let window = self.window(&bus, target).await?;
         let walk = Walk::new(window.dest.clone(), self.concurrency);
         let not_walked = std::sync::atomic::AtomicUsize::new(0);
-        let found = self.pressable(&bus, window, true, &walk, &not_walked).await;
-        let candidates: Vec<Candidate> = found
-            .iter()
-            .map(|f| Candidate {
-                role: f.role.clone(),
-                name: f.name.clone(),
-            })
-            .collect();
-        let chosen = match query.select(&candidates) {
+        let mut found = self
+            .pressable(&bus, window, Place::Root, Vec::new(), &walk, &not_walked)
+            .await;
+        // Elements the query names whose actions were not ready are read again once (module doc).
+        let named: Vec<usize> = match query.select(&candidates(&found)) {
+            Match::One(i) => vec![i],
+            Match::Many(v) => v,
+            Match::None => Vec::new(),
+        };
+        let late: Vec<usize> = named.into_iter().filter(|i| !found[*i].ready).collect();
+        let settled = !late.is_empty();
+        if settled {
+            tokio::time::sleep(self.action_settle).await;
+            let again = join_all(late.iter().map(|i| self.actions(&bus, &found[*i].node))).await;
+            for (i, n) in late.iter().zip(again) {
+                found[*i].ready = matches!(n, Ok(n) if n > 0);
+            }
+        }
+        found.retain(|h| h.ready);
+        let chosen = match query.select(&candidates(&found)) {
             Match::One(i) => &found[i],
             Match::None => {
                 let mut why = String::from(
                     "no pressable element of the window matches (read_window shows its controls)",
                 );
+                if settled {
+                    why.push_str(&format!(
+                        "; elements of that name had no action, also {} ms later \
+                         (accessibility.action_settle_ms)",
+                        self.action_settle.as_millis()
+                    ));
+                }
                 let unanswered = walk.unanswered.load(Ordering::Relaxed);
                 if unanswered > 0 {
                     why.push_str(&format!("; elements that did not answer: {unanswered}"));
@@ -108,7 +146,63 @@ impl Atspi {
             role: chosen.role.clone(),
             name: chosen.name.clone(),
             at: (chosen.node.dest.clone(), chosen.node.path.clone()),
+            documents: chosen.documents.clone(),
         })
+    }
+
+    /// The documents `node` is in below its window, outermost first, read from it up (module
+    /// doc): every element up to the window (the element whose parent is its app's root) that has
+    /// the Document interface, `node` included; and whether the outermost one is shown (`true`
+    /// where there is none).
+    pub(super) async fn documents_of(
+        &self,
+        bus: &zbus::Connection,
+        node: &Node,
+    ) -> Result<(Vec<String>, bool), Failure> {
+        let t = self.timeout;
+        let mut chain = Vec::new();
+        let mut outermost: Option<Node> = None;
+        let mut seen = HashSet::new();
+        let mut at = node.clone();
+        loop {
+            if !seen.insert(at.clone()) {
+                return Err(Failure::Refused(
+                    "the element's ancestors over AT-SPI loop, so Kai cannot tell which page it \
+                     is in"
+                        .into(),
+                ));
+            }
+            let (dest, path): (String, OwnedObjectPath) =
+                property(bus, &at.dest, &at.path, ACCESSIBLE, "Parent", t).await?;
+            let parent = Node {
+                dest,
+                path: path.to_string(),
+            };
+            if parent.path == ROOT && parent.dest == at.dest {
+                // `at` is the window.
+                break;
+            }
+            if parent.dest != at.dest || parent.path == "/org/a11y/atspi/null" {
+                return Err(Failure::Refused(
+                    "the element is no longer below its window over AT-SPI, so Kai cannot tell \
+                     which page it is in"
+                        .into(),
+                ));
+            }
+            let ifaces: Vec<String> =
+                call(bus, &at.dest, &at.path, ACCESSIBLE, "GetInterfaces", &(), t).await?;
+            if ifaces.iter().any(|i| i == DOCUMENT) {
+                chain.push(self.doc_url(bus, &at).await);
+                outermost = Some(at.clone());
+            }
+            at = parent;
+        }
+        chain.reverse();
+        let shown = match outermost {
+            None => true,
+            Some(o) => self.states(bus, &o).await? & (1u64 << state::SHOWING) != 0,
+        };
+        Ok((chain, shown))
     }
 
     /// Presses the element [`Self::find_element`] found, after checking it is still there with the
@@ -143,6 +237,7 @@ impl Atspi {
         if CONTROL_ROLES.contains(&role) && states & (1u64 << state::ENABLED) == 0 {
             return Err(disabled(&found.role, &found.name));
         }
+        self.same_documents(&bus, &node, found).await?;
         let action = self.do_action(&bus, &node).await?;
         Ok(Pressed {
             role: found.role.clone(),
@@ -151,12 +246,41 @@ impl Atspi {
         })
     }
 
-    /// The pressable elements below `node`, in the tree's order.
+    /// `found`'s documents are still those it was found in, and its page is still shown (module
+    /// doc); else a refusal, nothing pressed.
+    pub(super) async fn same_documents(
+        &self,
+        bus: &zbus::Connection,
+        node: &Node,
+        found: &Found,
+    ) -> Result<(), Failure> {
+        let (documents, shown) = self.documents_of(bus, node).await?;
+        if documents != found.documents {
+            return Err(Failure::Refused(format!(
+                "the page {} {} is in changed after the confirmation; nothing was pressed",
+                shown_text(&found.role),
+                quoted(&found.name)
+            )));
+        }
+        if !shown {
+            return Err(Failure::Refused(format!(
+                "the page {} {} is in is no longer shown (another tab came to the front of its \
+                 window); nothing was pressed",
+                shown_text(&found.role),
+                quoted(&found.name)
+            )));
+        }
+        Ok(())
+    }
+
+    /// The pressable elements below `node`, in the tree's order, with the named elements whose
+    /// actions may not be ready yet (`Hit::ready`); `documents`: those `node` is in (module doc).
     fn pressable<'a>(
         &'a self,
         bus: &'a zbus::Connection,
         node: Node,
-        root: bool,
+        place: Place,
+        mut documents: Vec<String>,
         walk: &'a Walk,
         not_walked: &'a std::sync::atomic::AtomicUsize,
     ) -> BoxFuture<'a, Vec<Hit>> {
@@ -200,24 +324,29 @@ impl Atspi {
                 return Vec::new();
             };
             let has = |bit: u32| states & (1u64 << bit) != 0;
-            if !root && !has(state::VISIBLE) {
+            if place != Place::Root && !has(state::VISIBLE) {
                 return Vec::new();
+            }
+            let page = walk.page(place, ifaces.iter().any(|i| i == DOCUMENT));
+            // A background tab's page is visible but not shown (`super`'s module doc).
+            if page && place == Place::Ui && !has(state::SHOWING) {
+                return Vec::new();
+            }
+            if page {
+                documents.push(walk.bounded(self.doc_url(bus, &node)).await);
             }
             let mut out = Vec::new();
             if !name.is_empty() && ifaces.iter().any(|i| i == ACTION) {
-                let n = walk
-                    .bounded(property::<i32>(
-                        bus, &node.dest, &node.path, ACTION, "NActions", t,
-                    ))
-                    .await;
+                let n = walk.bounded(self.actions(bus, &node)).await;
                 match n {
-                    Ok(n) if n > 0 => out.push(Hit {
+                    Ok(n) => out.push(Hit {
                         node: node.clone(),
                         role: role_name(role),
                         name,
                         disabled: CONTROL_ROLES.contains(&role) && !has(state::ENABLED),
+                        documents: documents.clone(),
+                        ready: n > 0,
                     }),
-                    Ok(_) => {}
                     Err(_) => {
                         walk.unanswered.fetch_add(1, Ordering::Relaxed);
                     }
@@ -231,9 +360,10 @@ impl Atspi {
                 walk.unanswered.fetch_add(1, Ordering::Relaxed);
                 return out;
             };
+            let place = walk.below(place, page);
             for below in join_all(
                 kids.into_iter()
-                    .map(|k| self.pressable(bus, k, false, walk, not_walked)),
+                    .map(|k| self.pressable(bus, k, place, documents.clone(), walk, not_walked)),
             )
             .await
             {
@@ -243,10 +373,55 @@ impl Atspi {
         })
     }
 
-    /// Runs the element's preferred action; the action's name (empty when the app calls it so).
-    async fn do_action(&self, bus: &zbus::Connection, node: &Node) -> Result<String, Failure> {
+    /// How many actions `node` has (`NActions`), read once.
+    pub(super) async fn actions(
+        &self,
+        bus: &zbus::Connection,
+        node: &Node,
+    ) -> Result<i32, Failure> {
+        property(
+            bus,
+            &node.dest,
+            &node.path,
+            ACTION,
+            "NActions",
+            self.timeout,
+        )
+        .await
+    }
+
+    /// [`Self::actions`], read again after `accessibility.action_settle_ms` where the first read
+    /// said none (module doc).
+    pub(super) async fn actions_settled(
+        &self,
+        bus: &zbus::Connection,
+        node: &Node,
+    ) -> Result<i32, Failure> {
+        let n = self.actions(bus, node).await?;
+        if n > 0 {
+            return Ok(n);
+        }
+        tokio::time::sleep(self.action_settle).await;
+        self.actions(bus, node).await
+    }
+
+    /// Runs the element's preferred action; the action's name (empty when the app calls it so). An
+    /// element whose actions read none is read again after `accessibility.action_settle_ms`
+    /// (module doc).
+    pub(super) async fn do_action(
+        &self,
+        bus: &zbus::Connection,
+        node: &Node,
+    ) -> Result<String, Failure> {
         let t = self.timeout;
-        let n: i32 = property(bus, &node.dest, &node.path, ACTION, "NActions", t).await?;
+        let n = self.actions_settled(bus, node).await?;
+        if n <= 0 {
+            return Err(Failure::Refused(format!(
+                "the element has no action to run, also {} ms later \
+                 (accessibility.action_settle_ms); nothing was pressed",
+                self.action_settle.as_millis()
+            )));
+        }
         let mut names = Vec::new();
         for i in 0..n.max(0) {
             let name: String = call(bus, &node.dest, &node.path, ACTION, "GetName", &(i,), t)
@@ -282,4 +457,15 @@ impl Atspi {
             Err(_) => Ok(action),
         }
     }
+}
+
+/// The candidates a query picks among.
+fn candidates(found: &[Hit]) -> Vec<Candidate> {
+    found
+        .iter()
+        .map(|f| Candidate {
+            role: f.role.clone(),
+            name: f.name.clone(),
+        })
+        .collect()
 }

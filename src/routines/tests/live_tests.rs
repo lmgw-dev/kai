@@ -16,10 +16,11 @@ use serde_json::Map;
 use tokio_util::sync::CancellationToken;
 
 use super::*;
-use crate::cli::server::{Backend, proc_cgroup};
+use crate::cli::server::Backend;
 use crate::desktop::fdo::launch::spawn::UserManager;
 use crate::host::policy::Caller;
 use crate::host::settings::{LevelSetting, ToolState};
+use crate::local_socket::proc_cgroup;
 
 fn routine_scopes() -> String {
     let out = std::process::Command::new("systemctl")

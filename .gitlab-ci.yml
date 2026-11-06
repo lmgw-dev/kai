@@ -16,6 +16,14 @@
 #     RPM, hence read-only. A *protected* variable reaches only protected branches (`main` must be
 #     one). Missing, the build still succeeds with a warning, and its updater cannot reach the feed.
 #
+# OPTIONAL CI/CD variable:
+#   KAI_FIREFOX_INSTALL_URL — the signed Kai for Firefox XPI of the builds channel (kai-firefox's
+#     package registry), compiled into the build as the link the settings window's "Install Kai for
+#     Firefox" opens (src/browser/install.rs). While that channel is private the URL carries a
+#     read-only deploy token as its user information, so
+#     mask it where GitLab allows and never print it; it ends up in the RPM, hence read-only. Unset,
+#     the build succeeds and its settings say how to install the extension by hand (about:addons).
+#
 # lmgw-client and lmgw-update are path dependencies (Cargo.toml): ../lmgw/crates/<crate>; the
 # configuration window's page (ui/) takes lmgw-ui-kit the same way. The job builds the page with trunk
 # (packaging/install-trunk.sh, the wasm32 standard library) before the release build embeds it.

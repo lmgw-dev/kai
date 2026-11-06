@@ -84,17 +84,80 @@ impl Capture for FakeCapture {
 pub struct FakeAccess {
     pub tree: Tree,
     pub selection: Vec<String>,
+    /// The selection as a tree, where a test sets one (else `selection`'s pieces, one element
+    /// each).
+    pub selection_tree: Option<Tree>,
     pub asked: Arc<Mutex<Vec<Target>>>,
     /// What `find` answers (none: a refusal), the finds asked for, and the presses.
     pub found: Option<Element>,
     pub finds: Arc<Mutex<Vec<(Target, Query)>>>,
     pub presses: Arc<Mutex<Vec<Element>>>,
+    /// The windows' names on the bus, where a test sets them: a target is picked among them as
+    /// AT-SPI's provider picks (exactly, else the only one, else by a part; exactly only where
+    /// the target asks), and one that picks none is refused; empty: every target is the tree.
+    pub windows: Vec<String>,
+    /// The names of the windows read and searched, as picked.
+    pub picked: Arc<Mutex<Vec<String>>>,
+    /// Runs after each read (a window that changes while it is read).
+    pub then: Arc<Mutex<Option<AfterRead>>>,
+}
+
+/// What runs after each read ([`FakeAccess::then`]).
+type AfterRead = Box<dyn Fn() + Send>;
+
+impl FakeAccess {
+    /// The window `target` names among `windows` (the type's doc).
+    fn pick(&self, target: &Target) -> Result<(), Failure> {
+        if self.windows.is_empty() {
+            return Ok(());
+        }
+        let exact: Vec<&String> = self
+            .windows
+            .iter()
+            .filter(|w| **w == target.title)
+            .collect();
+        let chosen = match (exact.as_slice(), target.exact) {
+            ([one], _) => Some(*one),
+            ([], false) if self.windows.len() == 1 => Some(&self.windows[0]),
+            ([], false) => {
+                let part: Vec<&String> = self
+                    .windows
+                    .iter()
+                    .filter(|w| target.title.contains(w.as_str()) || w.contains(&target.title))
+                    .collect();
+                (part.len() == 1).then(|| part[0])
+            }
+            _ => None,
+        };
+        match chosen {
+            Some(w) => {
+                self.picked.lock().unwrap().push(w.clone());
+                Ok(())
+            }
+            None => Err(Failure::Refused(
+                "none of the app's windows on the accessibility bus is that window".into(),
+            )),
+        }
+    }
+
+    fn done(&self) {
+        if let Some(f) = &*self.then.lock().unwrap() {
+            f();
+        }
+    }
+
+    /// `f` runs after each read from now on.
+    pub fn then(&self, f: impl Fn() + Send + 'static) {
+        *self.then.lock().unwrap() = Some(Box::new(f));
+    }
 }
 
 impl Accessibility for FakeAccess {
     fn tree<'a>(&'a self, target: &'a Target) -> Fut<'a, Tree> {
         Box::pin(async move {
             self.asked.lock().unwrap().push(target.clone());
+            self.pick(target)?;
+            self.done();
             Ok(self.tree.clone())
         })
     }
@@ -105,6 +168,7 @@ impl Accessibility for FakeAccess {
                 .lock()
                 .unwrap()
                 .push((target.clone(), query.clone()));
+            self.pick(target)?;
             self.found
                 .clone()
                 .ok_or_else(|| Failure::Refused("no pressable element matches".into()))
@@ -122,10 +186,26 @@ impl Accessibility for FakeAccess {
         })
     }
 
-    fn selection<'a>(&'a self, target: &'a Target) -> Fut<'a, Vec<String>> {
+    fn selection<'a>(&'a self, target: &'a Target) -> Fut<'a, Tree> {
         Box::pin(async move {
             self.asked.lock().unwrap().push(target.clone());
-            Ok(self.selection.clone())
+            self.pick(target)?;
+            self.done();
+            Ok(self.selection_tree.clone().unwrap_or_else(|| Tree {
+                root: kai_desktop::caps::accessibility::Element {
+                    role: "frame".into(),
+                    children: self
+                        .selection
+                        .iter()
+                        .map(|t| kai_desktop::caps::accessibility::Element {
+                            text: t.clone(),
+                            ..Default::default()
+                        })
+                        .collect(),
+                    ..Default::default()
+                },
+                unanswered: 0,
+            }))
         })
     }
 }
@@ -532,6 +612,21 @@ struct Spec {
     done: Option<Done>,
     /// `DoAction` does not return for this long (a handler that waits in a dialog).
     hangs: Option<Duration>,
+    /// A document's address (the Document interface's `DocURL`), changeable while it is served.
+    doc: Option<Arc<Mutex<String>>>,
+    /// The states, changeable while it is served (in place of `states`).
+    live_states: Option<Arc<Mutex<Vec<u32>>>>,
+    /// How many reads of `NActions` answer 0 before the actions are there (Firefox's first read,
+    /// kai-firefox WP0 (d2)).
+    late_actions: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    /// The object attributes (`GetAttributes`); a document searches its subtree by them
+    /// (the Collection interface).
+    attrs: &'static [(&'static str, &'static str)],
+    /// An editable text's content (the EditableText interface).
+    editable: Option<Arc<Mutex<String>>>,
+    /// `SetTextContents` answers yes and keeps the text as it was (Firefox's prompt field,
+    /// headless).
+    sticky: bool,
 }
 
 /// Counts the calls a fake tree gets: how many `GetRole` are in flight at once (each takes a
@@ -548,6 +643,8 @@ struct Node {
     path: String,
     /// The children's (bus name, path).
     kids: Vec<(String, OwnedObjectPath)>,
+    /// The parent's (bus name, path): the null object for the app's root.
+    parent: (String, OwnedObjectPath),
 }
 
 #[zbus::interface(name = "org.a11y.atspi.Accessible")]
@@ -574,13 +671,29 @@ impl Node {
     fn child_count(&self) -> i32 {
         self.spec.child_count.unwrap_or(self.kids.len() as i32)
     }
+    #[zbus(property, name = "Parent")]
+    fn parent(&self) -> (String, OwnedObjectPath) {
+        self.parent.clone()
+    }
     #[zbus(name = "GetState")]
     fn get_state(&self) -> Vec<u32> {
         let mut words = vec![0u32, 0u32];
-        for &s in self.spec.states {
+        let states = match &self.spec.live_states {
+            Some(l) => l.lock().unwrap().clone(),
+            None => self.spec.states.to_vec(),
+        };
+        for s in states {
             words[(s / 32) as usize] |= 1 << (s % 32);
         }
         words
+    }
+    #[zbus(name = "GetAttributes")]
+    fn get_attributes(&self) -> std::collections::HashMap<String, String> {
+        self.spec
+            .attrs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
     }
     #[zbus(name = "GetInterfaces")]
     fn get_interfaces(&self) -> Vec<String> {
@@ -593,6 +706,13 @@ impl Node {
         }
         if !self.spec.actions.is_empty() {
             i.push("org.a11y.atspi.Action".into());
+        }
+        if self.spec.doc.is_some() {
+            i.push("org.a11y.atspi.Document".into());
+            i.push("org.a11y.atspi.Collection".into());
+        }
+        if self.spec.editable.is_some() {
+            i.push("org.a11y.atspi.EditableText".into());
         }
         i
     }
@@ -608,7 +728,12 @@ struct TextNode(Spec);
 impl TextNode {
     #[zbus(name = "GetText")]
     fn get_text(&self, start: i32, end: i32) -> String {
-        let t: Vec<char> = self.0.text.unwrap_or_default().chars().collect();
+        let held = self.0.editable.as_ref().map(|e| e.lock().unwrap().clone());
+        let t: Vec<char> = held
+            .as_deref()
+            .unwrap_or(self.0.text.unwrap_or_default())
+            .chars()
+            .collect();
         let end = if end < 0 { t.len() } else { end as usize };
         t[start as usize..end.min(t.len())].iter().collect()
     }
@@ -628,6 +753,14 @@ struct ActionNode(Spec);
 impl ActionNode {
     #[zbus(property, name = "NActions")]
     fn n_actions(&self) -> i32 {
+        use std::sync::atomic::Ordering::SeqCst;
+        if let Some(late) = &self.0.late_actions
+            && late
+                .fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+        {
+            return 0;
+        }
         self.0.actions.len() as i32
     }
     #[zbus(name = "GetName")]
@@ -641,6 +774,91 @@ impl ActionNode {
         }
         if let Some(h) = self.0.hangs {
             tokio::time::sleep(h).await;
+        }
+        true
+    }
+}
+
+struct DocNode(Arc<Mutex<String>>);
+
+#[zbus::interface(name = "org.a11y.atspi.Document")]
+impl DocNode {
+    #[zbus(name = "GetAttributeValue")]
+    fn get_attribute_value(&self, name: &str) -> String {
+        if name == "DocURL" {
+            self.0.lock().unwrap().clone()
+        } else {
+            String::new()
+        }
+    }
+}
+
+/// A document's search by object attributes (AT-SPI's Collection, `GetMatches`): its own subtree,
+/// served below `path` on `dest`.
+struct CollectionNode {
+    spec: Spec,
+    path: String,
+    dest: String,
+}
+
+/// The paths below `path` (as [`serve_below`] numbers them) of `spec`'s descendants whose
+/// attributes hold every pair of `want`.
+fn matching(
+    spec: &Spec,
+    path: &str,
+    want: &std::collections::HashMap<String, String>,
+    out: &mut Vec<String>,
+) {
+    for (i, k) in spec.children.iter().enumerate() {
+        let p = format!("{path}/{i}");
+        if want
+            .iter()
+            .all(|(wk, wv)| k.attrs.iter().any(|(ak, av)| ak == wk && av == wv))
+        {
+            out.push(p.clone());
+        }
+        matching(k, &p, want, out);
+    }
+}
+
+type Rule = (
+    Vec<i32>,
+    i32,
+    std::collections::HashMap<String, String>,
+    i32,
+    Vec<i32>,
+    i32,
+    Vec<String>,
+    i32,
+    bool,
+);
+
+#[zbus::interface(name = "org.a11y.atspi.Collection")]
+impl CollectionNode {
+    #[zbus(name = "GetMatches")]
+    fn get_matches(
+        &self,
+        rule: Rule,
+        _sortby: u32,
+        _count: i32,
+        _traverse: bool,
+    ) -> Vec<(String, OwnedObjectPath)> {
+        let mut out = Vec::new();
+        matching(&self.spec, &self.path, &rule.2, &mut out);
+        out.into_iter()
+            .map(|p| (self.dest.clone(), OwnedObjectPath::try_from(p).unwrap()))
+            .collect()
+    }
+}
+
+struct EditableNode(Arc<Mutex<String>>, bool);
+
+#[zbus::interface(name = "org.a11y.atspi.EditableText")]
+impl EditableNode {
+    #[zbus(name = "SetTextContents")]
+    fn set_text_contents(&self, text: &str) -> bool {
+        if !self.1 {
+            *self.0.lock().unwrap() = text.into();
         }
         true
     }
@@ -662,6 +880,17 @@ fn serve<'a>(
     spec: Spec,
     path: String,
 ) -> futures_util::future::BoxFuture<'a, (String, OwnedObjectPath)> {
+    serve_below(c, spec, path, None)
+}
+
+/// [`serve`] below the parent at `parent` (on `c`; `None`: the app's root, whose parent is the
+/// null object).
+fn serve_below<'a>(
+    c: &'a zbus::Connection,
+    spec: Spec,
+    path: String,
+    parent: Option<String>,
+) -> futures_util::future::BoxFuture<'a, (String, OwnedObjectPath)> {
     Box::pin(async move {
         let mut kids = Vec::new();
         for (i, k) in spec.children.iter().enumerate() {
@@ -669,10 +898,35 @@ fn serve<'a>(
                 Some((dest, p)) => {
                     kids.push((dest.to_owned(), OwnedObjectPath::try_from(p).unwrap()))
                 }
-                None => kids.push(serve(c, k.clone(), format!("{path}/{i}")).await),
+                None => kids.push(
+                    serve_below(c, k.clone(), format!("{path}/{i}"), Some(path.clone())).await,
+                ),
             }
         }
+        let me = c.unique_name().unwrap().to_string();
+        let parent = match parent {
+            Some(p) => (me, OwnedObjectPath::try_from(p).unwrap()),
+            None => (
+                String::new(),
+                OwnedObjectPath::try_from("/org/a11y/atspi/null").unwrap(),
+            ),
+        };
         let objects = c.object_server();
+        if let Some(d) = &spec.doc {
+            objects.at(path.as_str(), DocNode(d.clone())).await.unwrap();
+            let collection = CollectionNode {
+                spec: spec.clone(),
+                path: path.clone(),
+                dest: c.unique_name().unwrap().to_string(),
+            };
+            objects.at(path.as_str(), collection).await.unwrap();
+        }
+        if let Some(t) = &spec.editable {
+            objects
+                .at(path.as_str(), EditableNode(t.clone(), spec.sticky))
+                .await
+                .unwrap();
+        }
         if spec.text.is_some() {
             objects
                 .at(path.as_str(), TextNode(spec.clone()))
@@ -695,6 +949,7 @@ fn serve<'a>(
                     spec,
                     path: path.clone(),
                     kids,
+                    parent,
                 },
             )
             .await
@@ -898,6 +1153,7 @@ fn atspi(b: &A11y, session: zbus::Connection) -> Atspi {
         bus: SessionBus::connected(session, T),
         timeout: T,
         concurrency: 16,
+        action_settle: std::time::Duration::from_millis(100),
         switch: None,
     }
 }
@@ -911,6 +1167,7 @@ async fn at_spi_reads_a_windows_visible_tree() {
     let target = Target {
         pid: std::process::id(),
         title: "Kai Test".into(),
+        exact: false,
     };
     let tree = a.tree(&target).await.unwrap();
     assert_eq!(tree.unanswered, 0);
@@ -931,13 +1188,14 @@ async fn at_spi_reads_a_windows_visible_tree() {
            button \"Save\" (disabled)\n  \
            slider \"Volume\" = 42.5"
     );
-    let sel = a.selection(&target).await.unwrap();
+    let sel = a.selection(&target).await.unwrap().texts();
     assert_eq!(sel, ["world\nagain"], "never the password field's");
     // A window whose title does not match picks by part, else errs listing the app's windows.
     let e = a
         .tree(&Target {
             pid: std::process::id(),
             title: "Third".into(),
+            exact: false,
         })
         .await
         .unwrap_err();
@@ -955,6 +1213,7 @@ async fn an_app_off_the_accessibility_bus_is_said_with_the_switch() {
     let off_bus = Target {
         pid: 1,
         title: "x".into(),
+        exact: false,
     };
     let Some(b) = a11y(false).await else { return };
     let a = atspi(&b, b.session.connect().await);
@@ -985,6 +1244,7 @@ async fn the_error_names_the_switch_that_is_on() {
     let off_bus = Target {
         pid: 1,
         title: "x".into(),
+        exact: false,
     };
     let Some(b) = a11y_switches(false, true, app_tree(), None).await else {
         return;
@@ -1004,6 +1264,7 @@ fn kai_test_target() -> Target {
     Target {
         pid: std::process::id(),
         title: "Kai Test".into(),
+        exact: false,
     }
 }
 
@@ -1076,7 +1337,7 @@ async fn an_element_managing_its_descendants_is_not_walked_and_says_so() {
             role_name(55)
         )
     );
-    let sel = a.selection(&kai_test_target()).await.unwrap();
+    let sel = a.selection(&kai_test_target()).await.unwrap().texts();
     assert_eq!(
         sel,
         ["(100000 children, not walked: the element manages its descendants itself)"]
@@ -1158,7 +1419,13 @@ async fn nothing_inside_a_password_field_is_read() {
     for secret in ["hunter2", "secret", "= 7"] {
         assert!(!lines.contains(secret), "{secret} leaked: {lines}");
     }
-    assert!(a.selection(&kai_test_target()).await.unwrap().is_empty());
+    assert!(
+        a.selection(&kai_test_target())
+            .await
+            .unwrap()
+            .texts()
+            .is_empty()
+    );
 }
 
 /// A reference to another application's element is shown as one line and never followed.
@@ -1367,6 +1634,7 @@ async fn on_plasma_the_read_tools_are_listed_and_answer() {
             baloosearch: Some(fake_baloosearch(dir.path(), 2)),
             find_limit: 100,
             a11y_concurrency: 16,
+            a11y_action_settle_ms: 100,
         },
         ..Env::inert()
     };
@@ -1501,5 +1769,8 @@ async fn without_plasma_fdo_serves_recent_files_and_accessibility() {
     );
 }
 
+mod documents;
+mod front;
 mod press;
 mod switch;
+mod whole;

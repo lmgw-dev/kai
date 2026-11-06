@@ -143,6 +143,9 @@ async fn read_offers(env: &Env) -> Vec<Offer> {
                         bus: session.clone(),
                         timeout: t,
                         concurrency: env.read.a11y_concurrency,
+                        action_settle: std::time::Duration::from_millis(
+                            env.read.a11y_action_settle_ms,
+                        ),
                         switch: env.a11y.clone(),
                     })),
                     "AT-SPI",

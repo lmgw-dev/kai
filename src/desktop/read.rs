@@ -10,6 +10,13 @@
 //!   asked for whole (the selection, the clipboard), it is that text as it is.
 //! - **`find_files`' limit** is a visible setting (`search.limit`), said in the result whenever the
 //!   index has more matches, never a hidden cap (WP13 (g)).
+//! - **Kai's browser site rules** (`super::sites`): `see_window`, `read_window` and
+//!   `read_selection` refuse a Firefox window that shows a site Kai does not reach, checked before
+//!   and after (`see_window` also one Firefox does not draw now, or whose tab in front has not
+//!   settled); `read_window` and `read_selection` leave out every page and frame they read whose
+//!   address is such a site's; `see_screen` blanks such windows grey. An answer about a Firefox
+//!   window they let through says what the check does not cover (the tab strip, a capture's
+//!   frames).
 //! - **Nothing of what they read is logged**, at any level.
 
 pub mod image;
@@ -23,7 +30,9 @@ use kai_desktop::caps::windows::Window;
 use serde::{Deserialize, Serialize};
 
 use super::resolve::{self, quoted, shown_text, window_line};
+use super::sites;
 use super::tools::Services;
+use crate::browser::shown::Reach;
 use crate::host::registry::{Args, Block, Reply};
 
 pub use kai_desktop::contract::read::AREA;
@@ -61,6 +70,10 @@ impl Default for SearchConfig {
 ///                    # otherwise; read: only around each read; never: Kai does not switch it
 /// wait_ms = 5000     # after Kai switched it on, how long a read waits for the window's app to
 ///                    # join the accessibility bus (the read goes on as soon as it joins)
+/// action_settle_ms = 100  # an element whose first read of its actions said none (Firefox does
+///                    # this for a link or a button, kai-firefox WP0 (d2): 0, then 1 about 100 ms
+///                    # later) is read again this long after, before Kai takes it for one without
+///                    # an action (ui_press, and Kai's presses in Firefox through accessibility)
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -68,6 +81,7 @@ pub struct AccessibilityConfig {
     pub concurrency: usize,
     pub switch: crate::desktop::fdo::atspi::switch::SwitchMode,
     pub wait_ms: u64,
+    pub action_settle_ms: u64,
 }
 
 impl Default for AccessibilityConfig {
@@ -76,6 +90,7 @@ impl Default for AccessibilityConfig {
             concurrency: 16,
             switch: Default::default(),
             wait_ms: 5000,
+            action_settle_ms: 100,
         }
     }
 }
@@ -106,6 +121,8 @@ pub struct ReadEnv {
     pub find_limit: usize,
     /// `accessibility.concurrency` (0: no bound).
     pub a11y_concurrency: usize,
+    /// `accessibility.action_settle_ms`.
+    pub a11y_action_settle_ms: u64,
 }
 
 impl ReadEnv {
@@ -128,6 +145,7 @@ impl ReadEnv {
             home: home.clone(),
             find_limit: search.limit,
             a11y_concurrency: accessibility.concurrency,
+            a11y_action_settle_ms: accessibility.action_settle_ms,
         }
     }
 }
@@ -154,7 +172,7 @@ pub async fn run(services: &Services, name: &str, args: &Args) -> Reply {
         "see_window" => see_window(services, args).await,
         "see_screen" => see_screen(services, args).await,
         "read_window" => read_window(services, args).await.map(Reply::text),
-        "read_selection" => read_selection(services).await.map(Reply::text),
+        "read_selection" => read_selection(services).await,
         "find_files" => find_files(services, args).await.map(Reply::text),
         "recent_files" => recent_files(services).await.map(Reply::text),
         "clipboard_get" => clipboard_get(services).await.map(Reply::text),
@@ -180,15 +198,20 @@ fn given(args: &Args, name: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// A capture's reply: its line, then the image.
-async fn image_reply(line: String, pixels: Pixels) -> Result<Reply, String> {
+/// A capture's reply: its line and `notes` (one line each), then the image.
+async fn image_reply(line: String, notes: &[String], pixels: Pixels) -> Result<Reply, String> {
     let size = format!("{}x{} pixels", pixels.width, pixels.height);
     let base64 = tokio::task::spawn_blocking(move || image::png_base64(&pixels))
         .await
         .map_err(|e| format!("Kai could not encode the capture: {e}"))??;
+    let mut text = format!("{line}, {size}");
+    for n in notes {
+        text.push('\n');
+        text.push_str(n);
+    }
     Ok(Reply {
         blocks: vec![
-            Block::Text(format!("{line}, {size}")),
+            Block::Text(text),
             Block::Image {
                 mime: "image/png".into(),
                 base64,
@@ -203,22 +226,31 @@ async fn see_window(services: &Services, args: &Args) -> Result<Reply, String> {
         .capture
         .as_ref()
         .ok_or_else(|| missing("screen capture"))?;
-    let (line, id) = match &services.windows {
+    let (line, id, checked) = match &services.windows {
         Some(w) => {
             let snap = w.snapshot().await.map_err(say)?;
             let win = resolve::window(&snap, args.text("window"))?;
-            (window_line(win), Some(win.id.clone()))
+            let checked = sites::check_capture(services, &snap, win, "see_window").await?;
+            (window_line(win), Some(win.id.clone()), checked)
         }
         // Without the window list a window is the active one or named by its id.
-        None => match given(args, "window") {
-            Some(id) if !id.eq_ignore_ascii_case(kai_desktop::contract::ACTIVE) => {
-                ("the window".to_owned(), Some(id))
+        None => {
+            sites::unlisted(services, "see_window")?;
+            match given(args, "window") {
+                Some(id) if !id.eq_ignore_ascii_case(kai_desktop::contract::ACTIVE) => {
+                    ("the window".to_owned(), Some(id), None)
+                }
+                _ => ("the active window".to_owned(), None, None),
             }
-            _ => ("the active window".to_owned(), None),
-        },
+        }
     };
     let pixels = capture.window(id.as_deref()).await.map_err(say)?;
-    image_reply(line, pixels).await
+    let mut notes = Vec::new();
+    if let Some(c) = &checked {
+        c.again(services, "see_window").await?;
+        notes.extend(c.note().map(str::to_owned));
+    }
+    image_reply(line, &notes, pixels).await
 }
 
 async fn see_screen(services: &Services, args: &Args) -> Result<Reply, String> {
@@ -227,26 +259,57 @@ async fn see_screen(services: &Services, args: &Args) -> Result<Reply, String> {
         .as_ref()
         .ok_or_else(|| missing("screen capture"))?;
     let asked = given(args, "output");
-    let output = match &services.windows {
+    let (output, placed) = match &services.windows {
         Some(w) => {
             let snap = w.snapshot().await.map_err(say)?;
-            match &asked {
+            let name = match &asked {
                 Some(q) => Some(resolve::output(&snap, q)?),
                 None => snap
                     .outputs
                     .iter()
                     .find(|o| o.active)
                     .map(|o| o.name.clone()),
-            }
+            };
+            let placed = snap
+                .outputs
+                .into_iter()
+                .find(|o| Some(&o.name) == name.as_ref());
+            (name, placed)
         }
-        None => asked,
+        None => (asked, None),
     };
-    let pixels = capture.screen(output.as_deref()).await.map_err(say)?;
+    // Kai's site rules (`sites`): what to blank, before the capture and again after it.
+    let before = match sites::blanks(services, None).await? {
+        Some(b) => Some((
+            b,
+            placed.ok_or(
+                "Kai's site rules keep some sites from Kai, and the desktop does not say where \
+                 the output is, so Kai cannot blank Firefox's windows on it; see_screen did not \
+                 run",
+            )?,
+        )),
+        None => None,
+    };
+    let mut pixels = capture.screen(output.as_deref()).await.map_err(say)?;
+    let mut notes = Vec::new();
+    if let Some((before, out)) = before {
+        let after = sites::blanks(services, Some(&before))
+            .await?
+            .unwrap_or_default();
+        let (back, done) = tokio::task::spawn_blocking(move || {
+            let done = sites::blank(&mut pixels, &out, &[before, after]);
+            (pixels, done)
+        })
+        .await
+        .map_err(|e| format!("Kai could not blank Firefox's windows out of the capture: {e}"))?;
+        pixels = back;
+        notes = sites::screen_notes(&done?);
+    }
     let line = match &output {
         Some(name) => format!("output {}", shown_text(name)),
         None => "the active output".to_owned(),
     };
-    image_reply(line, pixels).await
+    image_reply(line, &notes, pixels).await
 }
 
 /// The window `window` names and the accessibility target for it.
@@ -260,6 +323,7 @@ async fn target(services: &Services, window: Option<&str>) -> Result<(Window, Ta
     let target = Target {
         pid: win.pid,
         title: win.title.clone(),
+        exact: sites::exact(services, &win),
     };
     Ok((win, target))
 }
@@ -270,8 +334,21 @@ async fn read_window(services: &Services, args: &Args) -> Result<String, String>
         .as_ref()
         .ok_or_else(|| missing("accessibility"))?;
     let (win, target) = target(services, args.text("window")).await?;
-    let tree = access.tree(&target).await.map_err(say)?;
-    Ok(tree_lines(&win, &tree))
+    let checked = sites::check(services, &win, Reach::See, "read_window").await?;
+    let mut tree = access.tree(&target).await.map_err(say)?;
+    let left_out = sites::pages::prune(services, checked.as_ref(), &mut tree);
+    let mut text = tree_lines(&win, &tree);
+    if let Some(c) = &checked {
+        c.again(services, "read_window").await?;
+        for n in sites::pages::left_out_note(left_out)
+            .into_iter()
+            .chain(c.note().map(str::to_owned))
+        {
+            text.push('\n');
+            text.push_str(&n);
+        }
+    }
+    Ok(text)
 }
 
 /// The roles shown even without a name or text: what a model may want to press or fill.
@@ -343,21 +420,41 @@ fn element_lines(e: &Element, depth: usize, out: &mut Vec<String>) {
     }
 }
 
-async fn read_selection(services: &Services) -> Result<String, String> {
+/// The selection as it is; where a Firefox window was let through by Kai's site rules, what their
+/// check does not cover follows in a block of its own, so the selection's text stays whole.
+async fn read_selection(services: &Services) -> Result<Reply, String> {
     let access = services
         .accessibility
         .as_ref()
         .ok_or_else(|| missing("accessibility"))?;
     let (win, target) = target(services, None).await?;
-    let pieces = access.selection(&target).await.map_err(say)?;
-    let pieces: Vec<String> = pieces.into_iter().filter(|p| !p.is_empty()).collect();
-    if pieces.is_empty() {
-        return Ok(format!(
+    let checked = sites::check(services, &win, Reach::See, "read_selection").await?;
+    let mut tree = access.selection(&target).await.map_err(say)?;
+    let left_out = sites::pages::prune(services, checked.as_ref(), &mut tree);
+    let mut notes: Vec<String> = Vec::new();
+    if let Some(c) = &checked {
+        c.again(services, "read_selection").await?;
+        notes.extend(sites::pages::left_out_note(left_out));
+        notes.extend(c.note().map(str::to_owned));
+    }
+    // A page or frame left out says so in the notes, not as a piece of the selection.
+    let pieces: Vec<String> = tree
+        .texts()
+        .into_iter()
+        .filter(|p| !p.is_empty() && p != sites::pages::LEFT_OUT)
+        .collect();
+    let mut reply = if pieces.is_empty() {
+        Reply::text(format!(
             "nothing is selected in the active window ({})",
             window_line(&win)
-        ));
+        ))
+    } else {
+        Reply::text(pieces.join("\n"))
+    };
+    if !notes.is_empty() {
+        reply.blocks.push(Block::Text(notes.join("\n")));
     }
-    Ok(pieces.join("\n"))
+    Ok(reply)
 }
 
 async fn find_files(services: &Services, args: &Args) -> Result<String, String> {

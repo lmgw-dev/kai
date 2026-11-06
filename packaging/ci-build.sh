@@ -33,6 +33,18 @@ else
   echo "         read_package_registry); a *protected* variable only reaches protected branches." >&2
 fi
 
+# The settings window's "Install Kai for Firefox" opens the link compiled in from
+# KAI_FIREFOX_INSTALL_URL (a CI/CD variable: the signed XPI of the builds channel, which carries a
+# deploy token while the builds channel is private; src/browser/install.rs). Without it
+# the build succeeds and its settings say how to install the extension by hand. The value is never
+# printed.
+if [[ -n "${KAI_FIREFOX_INSTALL_URL:-}" ]]; then
+  export KAI_FIREFOX_INSTALL_URL
+else
+  echo "NOTE: KAI_FIREFOX_INSTALL_URL is not set: this build's settings have no \"Install Kai for" >&2
+  echo "      Firefox\" link and say how to install the extension by hand." >&2
+fi
+
 bash packaging/build-rpm.sh
 
 # The RPM of exactly this version, never a glob over whatever else the directory holds: a manifest

@@ -35,6 +35,12 @@ pub struct Services {
     pub input_token: Option<crate::desktop::fdo::input::TokenFile>,
     /// One input call at a time, whichever provider serves it (`input`'s module doc).
     pub input_turn: Arc<tokio::sync::Mutex<()>>,
+    /// Kai for Firefox's input spans: every input call is bracketed by them, so Firefox never
+    /// takes Kai's keys for the user's (`input`'s module doc); `None` in a test without them.
+    pub spans: Option<crate::browser::spans::Spans>,
+    /// Kai's browser site rules over the tools that capture, read or act in a window
+    /// (`super::sites`); `None` in a test without them.
+    pub sites: Option<crate::browser::shown::Shown>,
     /// How long an input call waits at its start for the confirmed window to have the focus again
     /// (`dbus.timeout_s`).
     pub focus_wait: std::time::Duration,
@@ -199,6 +205,9 @@ pub fn prepare_window(services: &Services) -> Preparer {
                 state: Arc::new(Resolved(target.id.clone())),
                 notes: Vec::new(),
                 options: Vec::new(),
+                ask: None,
+                spoken: None,
+                confirmed: false,
             })
         })
     })

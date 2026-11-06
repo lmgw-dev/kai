@@ -49,7 +49,7 @@ if [[ $reference != "$(sha256sum "$viz/engine.js" | cut -d' ' -f1)" ]]; then
     status=1
 fi
 
-node "$here/scripts/viz-adapter-check.mjs" "$lmgw/crates/lmgw-ui/assets/voice.css" || status=1
+node "$here/scripts/viz-adapter-check.mjs" "$lmgw/crates/lmgw-chat-ui/assets/voice.css" || status=1
 if [[ $status == 0 ]]; then
     echo "viz-check: engine.js and ring.js are lmgw ${pin:0:10}'s, and lmgw main has not changed them"
 fi

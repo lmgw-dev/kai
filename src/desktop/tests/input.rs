@@ -43,7 +43,12 @@ pub struct FakeInput {
     fail: Option<Failure>,
     gate: Option<Arc<tokio::sync::Semaphore>>,
     entered: Arc<std::sync::atomic::AtomicUsize>,
+    /// Runs after each unit sent, with the count sent so far (a window that changes meanwhile).
+    pub after: Arc<Mutex<Option<AfterUnit>>>,
 }
+
+/// What runs after each unit sent ([`FakeInput::after`]).
+type AfterUnit = Box<dyn Fn(usize) + Send>;
 
 impl FakeInput {
     async fn enter(&self) {
@@ -69,6 +74,7 @@ impl Input for FakeInput {
                 if let Sent::Text(t) = &mut self.sent.lock().unwrap()[at] {
                     t.push(k);
                 }
+                self.sent_one(done + 1);
             }
             self.fail.clone().map_or(Ok(()), Err)
         })
@@ -87,6 +93,7 @@ impl Input for FakeInput {
                 if let Sent::Keys(k) = &mut self.sent.lock().unwrap()[at] {
                     k.push(c.0.clone());
                 }
+                self.sent_one(done + 1);
             }
             self.fail.clone().map_or(Ok(()), Err)
         })
@@ -97,6 +104,30 @@ impl FakeInput {
     /// Nothing was typed or pressed through it.
     pub fn sent_nothing(&self) -> bool {
         self.sent.lock().unwrap().is_empty()
+    }
+
+    /// How many characters and chords went through it, over every call.
+    pub fn units(&self) -> usize {
+        self.sent
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| match s {
+                Sent::Text(t) => t.len(),
+                Sent::Keys(k) => k.len(),
+            })
+            .sum()
+    }
+
+    /// `f` runs after each unit sent from now on.
+    pub fn after(&self, f: impl Fn(usize) + Send + 'static) {
+        *self.after.lock().unwrap() = Some(Box::new(f));
+    }
+
+    fn sent_one(&self, done: usize) {
+        if let Some(f) = &*self.after.lock().unwrap() {
+            f(done);
+        }
     }
 }
 
@@ -553,6 +584,7 @@ async fn ui_press_finds_the_element_before_the_confirmation_and_presses_that_one
         role: "button".into(),
         name: "Save".into(),
         at: (":1.7".into(), "/org/a11y/atspi/accessible/12".into()),
+        documents: Vec::new(),
     };
     let access = FakeAccess {
         found: Some(save.clone()),

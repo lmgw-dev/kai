@@ -9,6 +9,7 @@ data_home := env("XDG_DATA_HOME", env("HOME") / ".local/share")
 apps := data_home / "applications"
 icons := data_home / "icons/hicolor/scalable"
 exe := justfile_directory() / "target/debug/kai"
+browser_host := justfile_directory() / "target/debug/kai-browser-host"
 
 default:
     @just --list
@@ -31,6 +32,7 @@ check:
     cargo test --workspace --doc
     scripts/viz-check.sh
     scripts/dev-grant-check.sh
+    scripts/browser-dev-check.sh
     python3 scripts/publish_github_test.py
     just ui-check
     just ui
@@ -115,6 +117,13 @@ live-check-voice clip="target/live-audio/clip.wav":
 live-check-voice-lmgw clip="target/live-audio/clip.wav" lmgw="../lmgw":
     scripts/live-check-voice-lmgw.sh "{{clip}}" "{{lmgw}}"
 
+# kai-firefox WP8b: the sidebar page in a headless Firefox, through Kai's browser server and sidebar
+# relay over the device link to a dev lmgw with an echoing mock (scripts/live-check-sidebar.sh).
+# Needs kai-firefox's page built and a headless lmgw with the Chat plane's routes.
+[doc("The Firefox sidebar against a dev lmgw: Kai's server and relay, paired; kai-firefox's page")]
+live-check-sidebar firefox="../kai-firefox" lmgw="../lmgw" headless="":
+    scripts/live-check-sidebar.sh "{{firefox}}" "{{lmgw}}" {{headless}}
+
 # WP4: the shortcuts portal up to the bind in Kai's app scope, with no dialog and nothing registered.
 [doc("Dialog-free live check of the shortcuts portal (CreateSession, ListShortcuts, the app id)")]
 live-check-shortcuts:
@@ -148,7 +157,7 @@ live-check-ring clip="target/live-audio/clip.wav":
 
 # lmgw's engine.js is read from its main checkout next to this repository.
 [doc("Regenerate src/audio/levels_reference.json from lmgw's engine.js")]
-viz-reference engine="../lmgw/crates/lmgw-ui/assets/voice/viz/engine.js":
+viz-reference engine="../lmgw/crates/lmgw-chat-ui/assets/voice/viz/engine.js":
     node scripts/viz-reference.mjs "{{engine}}" > src/audio/levels_reference.json
 
 # WP2's live check: Kai's live-test build against a dev lmgw on 127.0.0.1:8897 (build its headless
@@ -291,3 +300,50 @@ revoke-dev:
 [doc("List every Kai dev grant file: its binary gone (stale) or another entry shadowing it show")]
 grants-dev:
     scripts/dev-grant.sh list
+
+# Kai for Firefox's WP12: Kai's AT-SPI code (the pages shown only, DocURL, the actions' settle,
+# the press by a mark, a page's confirm() and prompt(), Firefox's own UI) against a headless
+# Firefox on a PRIVATE D-Bus session with its own accessibility bus (scripts/atspi-firefox.sh: a
+# private runtime folder, no display, no D-Bus activation; the session's accessibility bus is
+# never read or changed, its socket checked before and after). Firefox's profile and home in
+# target/atspi-live/, removed after.
+[doc("Kai's AT-SPI code against a headless Firefox on a private accessibility bus")]
+atspi-firefox:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    bin=$(cargo test --workspace --no-run --message-format=json 2>/dev/null | python3 -I -c 'import json, sys
+    for line in sys.stdin:
+        m = json.loads(line)
+        if m.get("reason") == "compiler-artifact" and m.get("executable") and m["profile"]["test"] and m["target"]["name"] == "kai":
+            print(m["executable"])')
+    [[ -x "$bin" ]] || { echo "no test binary"; exit 1; }
+    scripts/atspi-firefox.sh "$bin"
+
+# Kai for Firefox (kai-firefox design §4.5): Firefox starts the native-messaging host
+# dev.rootshell.kai through ~/.mozilla/native-messaging-hosts/dev.rootshell.kai.json, which these
+# point at this checkout's debug kai-browser-host. One per user: browser-dev replaces another
+# checkout's (and says whose), browser-dev-remove removes only this checkout's. Written only into an
+# existing ~/.mozilla (a Firefox on the XDG folders, WP0 (e), is not covered yet). The per-user
+# manifest is read before the RPM's system manifest (/usr/lib64/mozilla/native-messaging-hosts) and
+# shadows it, so Firefox starts this checkout's host until browser-dev-remove, which is the way back
+# to the RPM's host. Both manifests come from packaging/dev.rootshell.kai.json.in.
+# `scripts/browser-dev-check.sh` (in `check`) tests it in a scratch HOME.
+[doc("Build kai-browser-host and point Firefox's per-user native manifest (dev.rootshell.kai) at it")]
+browser-dev:
+    cargo build --workspace --bin kai-browser-host
+    scripts/browser-dev.sh install "{{browser_host}}"
+
+# kai-firefox WP10's acceptance runs (its design §6.6, §11): Eyes and Hands on the fixture site
+# through Kai's real browser server, provider and policy (the hands-and-eyes switch on, the fixture
+# site `act`, defaults otherwise), with a scripted model, the owner's answers and a speech that
+# keeps what Kai says without playing it. kai-firefox's tests/accept/launch.mjs starts the site and
+# a headless Firefox (node, Firefox 159) whose kai-browser-host is this checkout's. The report is
+# target/browser-accept/<time>/report.txt.
+[doc("kai-firefox's acceptance runs (Eyes, Hands) through Kai's real tool path, headless")]
+browser-accept firefox="../kai-firefox":
+    cargo build --workspace --bin kai-browser-host
+    KAI_FIREFOX="$(realpath '{{firefox}}')" KAI_BROWSER_HOST="{{browser_host}}" cargo test --workspace -- --ignored --nocapture browser::tests::accept::
+
+[doc("Remove the per-user native manifest browser-dev wrote (back to the RPM's host), while it names this checkout's host")]
+browser-dev-remove:
+    scripts/browser-dev.sh remove "{{browser_host}}"

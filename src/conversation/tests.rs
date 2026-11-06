@@ -485,3 +485,80 @@ fn a_dropped_request_is_asked_again_at_the_next_hello() {
     c.dropped();
     assert_eq!(c.connected(), vec![Action::Lookup]);
 }
+
+/// The settings window's Conversation choice (2026-10-19): a new folder name leaves the shared
+/// folder, forgets its remembered id (which would win any lookup) and looks the new name up at
+/// once; a folder of the new name that does not exist yet is created plain and its steps said.
+#[test]
+fn a_new_folder_name_switches_the_conversation_at_once() {
+    let mut c = Conversation::new("Kai", Some(3));
+    c.connected();
+    c.listed(Ok(vec![ready(3, "Kai", 120)]));
+    assert!(c.ready());
+    let acts = c.rename("Kai desktop", true).expect("a new name");
+    assert_eq!(
+        acts,
+        vec![
+            Action::Remember(None),
+            Action::Use(None),
+            Action::Move,
+            Action::Lookup,
+        ]
+    );
+    assert!(c.folder().is_none() && c.initial().is_none());
+    // The shared folder is still in the list; the new name has none yet: a plain one is created.
+    let acts = c.listed(Ok(vec![ready(3, "Kai", 120)]));
+    assert_eq!(acts, vec![Action::Create("Kai desktop".into())]);
+    let acts = c.created(Ok(folder(11, "Kai desktop")));
+    assert_eq!(
+        used(&acts),
+        Some(Some(Using {
+            id: 11,
+            idle: None,
+            ready: false
+        }))
+    );
+    let said = notices(&acts);
+    assert_eq!(
+        said.len(),
+        1,
+        "the owner's steps for the new folder: {acts:?}"
+    );
+    assert!(said[0].body.contains("'Kai desktop'"), "{}", said[0].body);
+    assert!(said[0].body.contains("pick its Model"), "{}", said[0].body);
+    // Readied in the dashboard: remembered, and its thread asked for.
+    let acts = c.changed(ready(11, "Kai desktop", 120));
+    assert!(acts.contains(&Action::Remember(Some(11))), "{acts:?}");
+    assert!(acts.contains(&Action::AskCurrent), "{acts:?}");
+    // And back to the shared one: its ready folder is used again at once.
+    c.rename("Kai", true);
+    let acts = c.listed(Ok(vec![
+        ready(3, "Kai", 120),
+        ready(11, "Kai desktop", 120),
+    ]));
+    assert!(acts.contains(&Action::Remember(Some(3))), "{acts:?}");
+    assert!(acts.contains(&Action::AskCurrent), "{acts:?}");
+}
+
+#[test]
+fn a_rename_with_the_feed_down_waits_for_the_next_hello_and_the_same_name_is_no_change() {
+    let mut c = Conversation::new("Kai", None);
+    assert_eq!(c.rename(" Kai ", true), None, "the same name");
+    assert_eq!(
+        c.rename("Desk", false),
+        Some(Vec::new()),
+        "nothing known, nothing to leave"
+    );
+    assert_eq!(c.connected(), vec![Action::Lookup]);
+    assert_eq!(
+        c.listed(Ok(Vec::new())),
+        vec![Action::Create("Desk".into())]
+    );
+    // A rename while the create of the old name is on its way: the new lookup replaces it.
+    assert_eq!(c.rename("Other", true), Some(vec![Action::Lookup]));
+    assert_eq!(
+        c.created(Ok(folder(4, "Desk"))),
+        Vec::new(),
+        "not waited for"
+    );
+}

@@ -1,7 +1,8 @@
 //! The configuration window's Personality page on the core (WP21b): the facts about Kai's
 //! conversation it shows in its header, and its profile-editor requests, sent to the paired lmgw
 //! through the voice's link (`crate::lmgw_link::proxy`). The request runs in a
-//! spawned task, so the core's loop is never held by it.
+//! spawned task, so the core's loop is never held by it. Its Firefox section's facts and the click
+//! that opens Kai for Firefox's link (`crate::browser::install`) are here too.
 
 use tokio::sync::oneshot;
 
@@ -20,7 +21,7 @@ pub(crate) const NOT_PAIRED: &str =
 
 impl<S: SecretStore, L: LmgwLink, A: AudioPort, V: VoiceLink> Core<S, L, A, V> {
     /// Why the page cannot reach lmgw now, in the owner's words; `None` while Kai is paired.
-    fn window_unpaired(&self) -> Option<String> {
+    pub(super) fn window_unpaired(&self) -> Option<String> {
         match &self.model.pairing {
             Pairing::Paired { .. } => None,
             Pairing::Disabled { .. } => Some(format!("Kai cannot reach lmgw: {DISABLED}")),
@@ -73,5 +74,32 @@ impl<S: SecretStore, L: LmgwLink, A: AudioPort, V: VoiceLink> Core<S, L, A, V> {
         tokio::spawn(async move {
             let _ = reply.send(answer.await);
         });
+    }
+
+    /// The Firefox section (`GET /api/browser`), or (`install`) its click: the build's link to
+    /// Kai for Firefox's XPI handed to the desktop's browser. A test build hands it to
+    /// `open_into`'s channel, a live-test build to nothing.
+    pub(super) fn window_browser(
+        &self,
+        install: bool,
+    ) -> Result<crate::browser::install::Facts, String> {
+        use crate::browser::install;
+        let link = self.firefox_install.as_deref();
+        if !install {
+            return Ok(install::look(link, self.browser_linked));
+        }
+        install::install(link, self.browser_linked, |url| {
+            #[cfg(test)]
+            if let Some(tx) = &self.opened {
+                let _ = tx.send(url.to_string());
+                return Ok(());
+            }
+            #[cfg(feature = "live-test")]
+            if crate::live_test::active() {
+                tracing::info!("live test: no browser is opened");
+                return Ok(());
+            }
+            install::open_in_browser(url)
+        })
     }
 }

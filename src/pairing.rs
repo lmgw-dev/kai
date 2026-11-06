@@ -185,6 +185,34 @@ pub fn client_text() -> String {
     }
 }
 
+/// The computer's own name, as its user chose it (`device_name` of the enrolment, which lmgw's
+/// Devices card shows beside the client text as the device's claim): the pretty hostname
+/// (`PRETTY_HOSTNAME` of `/etc/machine-info`), else the static hostname; `None` when neither can
+/// be read or both are empty.
+pub fn device_name() -> Option<String> {
+    machine_name(
+        std::fs::read_to_string("/etc/machine-info").ok().as_deref(),
+        std::fs::read_to_string("/proc/sys/kernel/hostname")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// [`device_name`] of the text of `/etc/machine-info` and of the hostname.
+fn machine_name(machine_info: Option<&str>, hostname: Option<&str>) -> Option<String> {
+    let pretty = machine_info.and_then(|t| {
+        t.lines().find_map(|l| {
+            l.strip_prefix("PRETTY_HOSTNAME=")
+                .map(|v| v.trim().trim_matches(['"', '\'']).trim().to_owned())
+        })
+    });
+    pretty.filter(|n| !n.is_empty()).or_else(|| {
+        hostname
+            .map(|h| h.trim().to_owned())
+            .filter(|h| !h.is_empty())
+    })
+}
+
 /// Enrols `key` with `link` (module doc): its public half sent with the link's token over TLS
 /// pinned to the link's `fp`, lmgw's answer checked by `lmgw-client`. `timeout` is
 /// `lmgw.timeout_s` (the connection, the answer and its body), `stagger` `lmgw.url_stagger_ms`.
@@ -204,7 +232,13 @@ pub async fn enrol(
 ) -> Result<Enrolled, PairError> {
     let spki = key.public_key().map_err(PairError::Key)?;
     let tls = Tls::enrolment(link.fp, timeout).map_err(PairError::Enrol)?;
-    let req = requests::enrol(&link.token, &spki, Some(client));
+    let name = device_name();
+    let device = requests::DeviceSelf {
+        name: name.as_deref(),
+        client: Some(client),
+        app_id: Some(APP_ID),
+    };
+    let req = requests::enrol(&link.token, &spki, device);
     let secs = timeout.as_secs();
     let attempt = |base: &str, answered: tls::Answered| {
         // Each try's client is its own, so the race sees when its connection is up (§6.3).
@@ -279,6 +313,11 @@ pub async fn enrol(
 /// the address can send one: a failed handshake to try again, which says nothing about the link. A
 /// new link is suggested, never stated. A try again sends the same key (`crate::core`'s enrolment
 /// keeps one per token), so an answer lost on the way comes back as it was.
+/// Kai's application id, the one its desktop file and the portal know it by. Declared at enrolment
+/// so lmgw's Devices card shows it and offers can be sent to Kai (a device without one receives
+/// none). It takes effect at the next pairing; a pairing made before keeps declaring none.
+pub const APP_ID: &str = "dev.rootshell.kai";
+
 const UNPROVEN: &str = "the handshake failed: the server answered with TLS's certificate_required \
      alert before it proved to be the lmgw this link pairs with, so something else may be \
      answering at that address, or the pairing link may have ended (closed on lmgw's Devices card, \

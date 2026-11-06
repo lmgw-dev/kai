@@ -617,7 +617,7 @@ impl Thread {
                 Ok(())
             }
             AecAction::Spawn { conf } => {
-                std::fs::create_dir_all(&self.s.runtime_dir)
+                crate::paths::private_dir(&self.s.runtime_dir)
                     .map_err(|e| format!("cannot create {}: {e}", self.s.runtime_dir.display()))?;
                 let path = self.s.runtime_dir.join("aec.conf");
                 std::fs::write(&path, conf)

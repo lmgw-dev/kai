@@ -15,6 +15,9 @@ pub struct ToolInfo {
     pub default_state: String,
     pub default_level: String,
     pub config_tool: bool,
+    /// The hands-and-eyes switch (`browser.hands_and_eyes`, kai-firefox design §6.4) makes its
+    /// default "allow if trusted" while it is on.
+    pub by_switch: bool,
 }
 
 /// Every tool of every area, in the contract's order.
@@ -30,6 +33,7 @@ pub fn all() -> Vec<ToolInfo> {
                 default_state: default_state(spec.ask, spec.hints.read_only).to_owned(),
                 default_level: spec.level.key().to_owned(),
                 config_tool: contract::config::is_config_tool(spec.name),
+                by_switch: contract::browser::by_switch(spec.name),
             })
         })
         .collect()

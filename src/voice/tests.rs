@@ -51,6 +51,11 @@ mod reask;
 mod ring;
 /// The screen lock (the owner's decision, 2026-10-09): Kai stops and stays idle.
 mod screen_lock;
+/// Firefox's sidebar's turns through the core (kai-firefox §8.3, K16 and K17), and its requests
+/// when Kai leaves the gateway.
+mod sidebar;
+/// Kai's speech without a model (kai-firefox §7.2, §7.3): announcements and reading aloud.
+mod speak;
 
 /// Frames between the playback head and what the fake device presents (300 ms).
 const LATENCY: u64 = 7200;
@@ -783,16 +788,22 @@ async fn another_clients_turn_silences_automatic_listening_until_it_is_done() {
     let by = |name: &str, own| By {
         name: name.into(),
         own,
+        sidebar: false,
     };
     // Kai's own turn changes nothing.
     r.feed.fact(FeedFact::TurnStarted {
+        voice: false,
         thread_id: 812,
         by: by("device 'desktop'", true),
     });
     r.feed.fact(FeedFact::TurnStarted {
+        voice: false,
         thread_id: 812,
         by: by("the dashboard", false),
     });
+    // The dashboard's turn cancelled Kai's, whose turn.done (it names no turn) comes after the
+    // dashboard's start: the dashboard's runs on (`crate::browser::sidebar::turns`).
+    r.feed.fact(FeedFact::TurnDone { thread_id: 812 });
     let m = r
         .until(|m| m.voice.notes.iter().any(|n| n.contains("the dashboard")))
         .await;
@@ -851,6 +862,7 @@ async fn kai_by_itself_never_binds_a_thread_another_clients_voice_holds() {
     let phone = By {
         name: "device 'phone'".into(),
         own: false,
+        sidebar: false,
     };
     // voice.on_at_start, and `hello`'s live part says the phone holds the thread (Kai's own entries
     // do not count).
@@ -863,6 +875,7 @@ async fn kai_by_itself_never_binds_a_thread_another_clients_voice_holds() {
                 By {
                     name: "device 'desktop'".into(),
                     own: true,
+                    sidebar: false,
                 },
             ),
         ],
@@ -896,6 +909,7 @@ async fn kai_by_itself_never_binds_a_thread_another_clients_voice_holds() {
         by: By {
             name: "the dashboard".into(),
             own: false,
+            sidebar: false,
         },
     });
     r.feed.moved(813);
@@ -1681,6 +1695,7 @@ async fn a_confirmed_re_pair_ends_the_session_bound_on_the_old_gateway() {
         by: By {
             name: "device 'phone'".into(),
             own: false,
+            sidebar: false,
         },
     });
     r.send(Command::Talk(true));
@@ -1837,6 +1852,23 @@ async fn on_at_start_opens_a_session_when_the_feed_comes_up() {
     let mut r = rig("[voice]\non_at_start = true\n").await;
     r.created(0).await;
     r.until(|m| m.voice.on).await;
+    r.quit().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_gpu_deferral_says_to_try_again_where_the_hold_says_paused() {
+    let mut r = rig("").await;
+    r.listening_on().await;
+    r.mock.emit(ServerEvent::Error(super::link::ErrorFacts {
+        kind: "server_error".into(),
+        code: Some("gpu_deferred".into()),
+        message: "the GPU is busy with the owner's other work".into(),
+    }));
+    let n = r.notice("Kai: GPU busy").await;
+    assert!(n.body.contains("try again shortly"), "{n:?}");
+    r.until(|m| m.voice.notes.iter().any(|l| l.contains("gpu_deferred")))
+        .await;
+    r.no_notice("Kai: GPU hold");
     r.quit().await;
 }
 

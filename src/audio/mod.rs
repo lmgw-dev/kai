@@ -15,6 +15,7 @@ pub mod levels;
 mod playback;
 mod pw;
 mod ring;
+pub mod wav;
 
 #[cfg(test)]
 pub(crate) mod live_tests;

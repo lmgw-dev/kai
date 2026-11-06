@@ -56,13 +56,13 @@ fn weather_body() -> Result<Body, String> {
         };
         let s = serve(vec![
             (
-                "/current_weather?lat=52.52&lon=13.405",
+                "/current_weather?lat=53.5511&lon=9.9937",
                 ok(json!({"weather": {"timestamp": "2026-10-09T14:00:00+02:00", "temperature": 17.2,
                     "icon": "partly-cloudy-day", "wind_speed_10": 9.0, "relative_humidity": 58},
-                    "sources": [{"station_name": "Berlin-Tempelhof"}]})),
+                    "sources": [{"station_name": "Hamburg-Fuhlsbüttel"}]})),
             ),
             (
-                "/weather?lat=52.52&lon=13.405&date=2026-10-09",
+                "/weather?lat=53.5511&lon=9.9937&date=2026-10-09",
                 ok(json!({"weather": [
                     {"timestamp": "2026-10-09T05:00:00+02:00", "temperature": 9.4, "precipitation": 0.0},
                     {"timestamp": "2026-10-09T15:00:00+02:00", "temperature": 18.1, "precipitation": 0.4}]})),
@@ -73,7 +73,7 @@ fn weather_body() -> Result<Body, String> {
         from.weather_base = format!("http://127.0.0.1:{}", s.port);
         from.weather
             .places
-            .insert("home".into(), "52.52,13.405".into());
+            .insert("home".into(), "53.5511,9.9937".into());
         let (_, spec) = kai_desktop::contract::find(Kind::Weather.tool()).unwrap();
         let args = Args::read(spec, json!({"place": ""}).as_object().cloned()).unwrap();
         Kind::Weather.body(&args, &from).await

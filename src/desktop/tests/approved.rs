@@ -17,6 +17,7 @@ use crate::host::registry::{Args, Block, Origin, Preparer};
 const APPROVED: Origin = Origin {
     caller: None,
     approved_in_lmgw: true,
+    approval_counted: true,
 };
 
 fn fixture(windows: FakeWindows, input: &FakeInput, access: &FakeAccess) -> Services {
@@ -86,6 +87,7 @@ async fn an_approved_call_must_name_its_window() {
             role: "button".into(),
             name: "Approve".into(),
             at: (":1.9".into(), "/org/a11y/atspi/accessible/3".into()),
+            documents: Vec::new(),
         }),
         ..Default::default()
     };

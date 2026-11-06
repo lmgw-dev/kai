@@ -16,7 +16,7 @@ import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const enginePath = resolve(
-  process.argv[2] ?? `${here}/../../lmgw/crates/lmgw-ui/assets/voice/viz/engine.js`,
+  process.argv[2] ?? `${here}/../../lmgw/crates/lmgw-chat-ui/assets/voice/viz/engine.js`,
 );
 const src = readFileSync(enginePath, "utf8");
 const { Tap, SIGNAL, BANDS, BAND_TILT } = await import(

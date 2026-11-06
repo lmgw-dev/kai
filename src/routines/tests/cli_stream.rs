@@ -3,9 +3,9 @@
 
 use super::cli::{serve, wait_for_socket};
 use super::*;
-use crate::cli::server::proc_cgroup;
 use crate::cli::{Answer, Request, Status, client};
 use crate::desktop::fdo::launch::settings::LaunchConfig;
+use crate::local_socket::proc_cgroup;
 
 async fn ask_streaming(rig: &Rig, request: Request) -> (Vec<u8>, Answer) {
     let socket = rig.home.socket();

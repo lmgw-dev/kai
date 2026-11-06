@@ -1,4 +1,4 @@
-// The ring's colours: lmgw's voice tokens (crates/lmgw-ui/assets/voice.css, `--rt-*`, mapped to
+// The ring's colours: lmgw's voice tokens (crates/lmgw-chat-ui/assets/voice.css, `--rt-*`, mapped to
 // the engine's roles as the Chat's `palette()` maps them): graphite and blue, amber for the user.
 // `bg` is never drawn (the ring is transparent) but shades the engine's derived colours.
 // `scripts/viz-adapter-check.mjs` compares these with lmgw's file.

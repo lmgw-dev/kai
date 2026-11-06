@@ -1,46 +1,82 @@
 //! The page: a rail (Tools, Desktop, Settings, Personality) and one page at a time. Every control
 //! sends one operation (`api::apply`) the moment it changes and shows Kai's answer beside it:
-//! applied, saved until the next start, or the loader's refusal in words. Personality is lmgw's
-//! profile editor (`crate::personality`); leaving it with unsaved edits asks first.
+//! applied, saved until the next start, or the loader's refusal in words. Settings is
+//! `crate::settings_page`; Personality is lmgw's profile editor (`crate::personality`); leaving it
+//! with unsaved edits asks first.
 
 use leptos::prelude::*;
 use leptos::task::spawn_local;
-use lmgw_ui_kit::widgets::{Field, Modal, ModalFooter, Section};
+use lmgw_ui_kit::widgets::{Modal, ModalFooter, Section};
 
 use crate::api;
-use crate::model::{self, Editor};
+use crate::model;
 use crate::personality::PersonalityPage;
+use crate::settings_page::SettingsPage;
 use crate::wire::{self, Effect as Applies, Entry, Request, Response, ToolInfo};
 
 /// What the page holds, shared by every component.
 #[derive(Clone, Copy)]
-struct Ctx {
-    entries: RwSignal<Vec<Entry>>,
+pub(crate) struct Ctx {
+    pub(crate) entries: RwSignal<Vec<Entry>>,
     tools: RwSignal<Vec<ToolInfo>>,
-    /// A change since the page opened applies only when Kai restarts.
-    restart: RwSignal<bool>,
+    /// The settings changed since the page opened that apply only when Kai restarts.
+    waiting: RwSignal<Vec<model::Waiting>>,
+    /// The microphones, speakers and screens Kai lists, read once for the pickers.
+    pub(crate) devices: RwSignal<Option<wire::Devices>>,
 }
 
 /// What a control says about its last operation.
 #[derive(Clone, PartialEq)]
-enum Note {
+pub(crate) enum Note {
     Ok(String),
     Err(String),
 }
 
-type NoteSignal = RwSignal<Option<Note>>;
+pub(crate) type NoteSignal = RwSignal<Option<Note>>;
+
+/// How long a "Saved" stays beside its control.
+const SAVED_FOR: std::time::Duration = std::time::Duration::from_millis(2500);
 
 /// Sends `request` and folds Kai's answer into the page.
-fn run(ctx: Ctx, request: Request, note: NoteSignal) {
+pub(crate) fn run(ctx: Ctx, request: Request, note: NoteSignal) {
+    run_saying(ctx, request, note, None);
+}
+
+/// [`run`], with `said` as the line for a change that took hold at once (instead of "Saved"); it
+/// stays until the next change.
+pub(crate) fn run_saying(ctx: Ctx, request: Request, note: NoteSignal, said: Option<String>) {
     note.set(None);
     spawn_local(async move {
         match api::apply(&request).await {
             Ok(Response::Changed { entry, effect }) => {
+                let before = ctx.entries.with_untracked(|e| {
+                    e.iter()
+                        .find(|x| x.key == entry.key)
+                        .map(|x| x.value.clone())
+                        .unwrap_or_default()
+                });
                 fold(ctx, &entry);
                 if effect == Applies::Restart {
-                    ctx.restart.set(true);
+                    ctx.waiting
+                        .update(|w| *w = model::waiting_after(std::mem::take(w), &entry, &before));
                 }
-                note.set(Some(Note::Ok(model::effect_note(effect).to_owned())));
+                match (effect, said) {
+                    (Applies::Now, Some(text)) => note.set(Some(Note::Ok(text))),
+                    _ => {
+                        let text = Note::Ok(model::effect_note(effect).to_owned());
+                        note.set(Some(text.clone()));
+                        if effect == Applies::Now {
+                            set_timeout(
+                                move || {
+                                    if note.get_untracked().as_ref() == Some(&text) {
+                                        note.set(None);
+                                    }
+                                },
+                                SAVED_FOR,
+                            );
+                        }
+                    }
+                }
             }
             Ok(Response::Unchanged { entry }) | Ok(Response::Entry { entry }) => fold(ctx, &entry),
             Ok(Response::Entries { .. }) => {}
@@ -55,7 +91,7 @@ fn fold(ctx: Ctx, entry: &Entry) {
 }
 
 #[component]
-fn NoteView(#[prop(into)] note: Signal<Option<Note>>) -> impl IntoView {
+pub(crate) fn NoteView(#[prop(into)] note: Signal<Option<Note>>) -> impl IntoView {
     move || {
         note.get().map(|n| match n {
             Note::Ok(t) => view! { <span class="note ok">{t}</span> }.into_any(),
@@ -77,9 +113,31 @@ pub fn App() -> impl IntoView {
     let ctx = Ctx {
         entries: RwSignal::new(Vec::new()),
         tools: RwSignal::new(Vec::new()),
-        restart: RwSignal::new(false),
+        waiting: RwSignal::new(Vec::new()),
+        devices: RwSignal::new(None),
     };
     provide_context(ctx);
+    spawn_local(async move {
+        // The pickers' lists; without them a picker offers only its unset choice and the current
+        // value.
+        if let Ok(d) = api::devices().await {
+            ctx.devices.set(Some(d));
+        }
+    });
+    // Lines Kai wants shown above every page (Firefox and lmgw's admin tools, kai-firefox §8.3),
+    // read at the start and again whenever Kai says they changed (its `kai-notices` event: a
+    // Firefox linked or gone, lmgw's admin level moved, the pairing ended).
+    let notices = RwSignal::new(Vec::<String>::new());
+    let read_notices = move || {
+        spawn_local(async move {
+            if let Ok(n) = api::notices().await {
+                notices.set(n.lines);
+            }
+        })
+    };
+    let changed = window_event_listener_untyped(wire::NOTICES_EVENT, move |_| read_notices());
+    on_cleanup(move || changed.remove());
+    read_notices();
     let page = RwSignal::new(Page::Tools);
     let loaded = RwSignal::new(false);
     let load_error = RwSignal::new(None::<String>);
@@ -139,6 +197,9 @@ pub fn App() -> impl IntoView {
                         "Kai's settings could not be read: " {e}
                     </div>
                 })}
+                {move || notices.get().into_iter().map(|line| view! {
+                    <div class="banner warn" role="status">{line}</div>
+                }).collect::<Vec<_>>()}
                 <Show when=move || loaded.get()>
                     <div class="page-body">
                         {move || match page.get() {
@@ -148,11 +209,7 @@ pub fn App() -> impl IntoView {
                             Page::Personality => view! { <PersonalityPage dirty=dirty/> }.into_any(),
                         }}
                     </div>
-                    <Show when=move || ctx.restart.get()>
-                        <div class="page-foot">
-                            "Some changes apply when Kai restarts: Quit from the tray, then start it again."
-                        </div>
-                    </Show>
+                    <RestartFooter/>
                 </Show>
             </main>
             <Modal open=asking title="Unsaved changes">
@@ -169,6 +226,38 @@ pub fn App() -> impl IntoView {
                 </ModalFooter>
             </Modal>
         </div>
+    }
+}
+
+/// The footer: which settings still wait for a restart, and the button that restarts Kai.
+#[component]
+fn RestartFooter() -> impl IntoView {
+    let ctx = expect_context::<Ctx>();
+    let why = RwSignal::new(None::<String>);
+    let restarting = RwSignal::new(false);
+    let restart = move |_| {
+        restarting.set(true);
+        why.set(None);
+        spawn_local(async move {
+            if let Err(e) = api::restart().await {
+                restarting.set(false);
+                why.set(Some(e));
+            }
+        });
+    };
+    view! {
+        <Show when=move || !ctx.waiting.with(|w| w.is_empty())>
+            <div class="page-foot">
+                <span class="foot-text">
+                    {move || ctx.waiting.with(|w| model::waiting_line(w))}
+                </span>
+                {move || why.get().map(|e| view! { <span class="note err" role="alert">{e}</span> })}
+                <button type="button" class="btn sm" prop:disabled=move || restarting.get()
+                    on:click=restart>
+                    {move || if restarting.get() { "Restarting…" } else { "Restart Kai now" }}
+                </button>
+            </div>
+        </Show>
     }
 }
 
@@ -245,8 +334,7 @@ fn ToolsPage() -> impl IntoView {
                 }, config_note)/>
             <span>"Offer Kai's configuration tools"</span>
             <span class="hint">
-                "(policy.config_tools) The owner and Kai's own key may then read and change this \
-                 configuration by tool call."
+                "You and Kai's own key may then read and change these settings by tool call."
             </span>
             <NoteView note=config_note/>
         </label>
@@ -324,6 +412,17 @@ fn ToolRowView(info: ToolInfo) -> impl IntoView {
     } else {
         ""
     };
+    // Firefox's hands-and-eyes switch changes the default of the tools it covers (read as the row
+    // is built: the switch is on the Settings page, and the Tools page is built again on return).
+    let default_state = if info.by_switch
+        && ctx
+            .entries
+            .with_untracked(|e| model::flag_on(e, "browser.hands_and_eyes"))
+    {
+        "allow if trusted, as Firefox's hands-and-eyes switch makes it".to_owned()
+    } else {
+        info.default_state.clone()
+    };
     view! {
         <tr class:muted=move || unlisted.get() title=why>
             <td class="tool">
@@ -338,7 +437,7 @@ fn ToolRowView(info: ToolInfo) -> impl IntoView {
                         label=format!("Who may call {}", info.name) on_pick=pick_level/>
                     <span class="cap">"When called"</span>
                     <WordSelect current=state words=&wire::STATES[..]
-                        default_label=format!("Default ({})", info.default_state)
+                        default_label=format!("Default ({default_state})")
                         label=format!("What happens when {} is called", info.name) on_pick=pick_state/>
                     <span class="cap">"Config tools"</span>
                     <label class="check-line" title="Off: tool_state_set, tool_level_set, config_set and config_unset refuse to widen this tool's state or level (toward allow, toward a wider caller); for run_command also a change of launch.terminal. Narrowing always works. Only this window or the file sets it.">
@@ -423,7 +522,7 @@ fn RemoteControlView() -> impl IntoView {
                 <p class="hint">
                     "Kai types and presses keys through the desktop's RemoteDesktop portal where                      KWin's fake input is not granted. The permission lasts until it is forgotten                      here; revoking Kai in System Settings does not end it."
                 </p>
-                <div class="ctl">
+                <div class="ctl-main">
                     <button type="button" class="btn danger"
                         prop:disabled=move || stored.get() != Some(true)
                         on:click=move |_| asking.set(true)>
@@ -475,216 +574,5 @@ fn ProviderRow(cap: String) -> impl IntoView {
             </td>
             <td class="status"><NoteView note=note/></td>
         </tr>
-    }
-}
-
-// ------------------------------------------------------------- Settings
-
-#[component]
-fn SettingsPage() -> impl IntoView {
-    let ctx = expect_context::<Ctx>();
-    let filter = RwSignal::new(String::new());
-    // Only the keys, so a changed value builds no row again; a section's keys by their table.
-    let layout = Memo::new(move |_| {
-        ctx.entries.with(|e| {
-            model::settings_sections(e, &filter.get())
-                .into_iter()
-                .map(|(s, list)| {
-                    let tables = model::by_table(&s, list)
-                        .into_iter()
-                        .map(|(t, list)| (t, list.into_iter().map(|e| e.key).collect::<Vec<_>>()))
-                        .collect::<Vec<_>>();
-                    (s, tables)
-                })
-                .collect::<Vec<_>>()
-        })
-    });
-    let sections = Memo::new(move |_| layout.get().into_iter().map(|(s, _)| s).collect::<Vec<_>>());
-    view! {
-        <PageHead title="Settings" sub="Every setting in Kai's configuration file, with the value in effect">
-            <input class="input search" type="search" placeholder="Filter by key"
-                prop:value=move || filter.get()
-                on:input=move |ev| filter.set(event_target_value(&ev))/>
-        </PageHead>
-        <div class="settings">
-            <For each=move || sections.get() key=|s| s.clone() let:section>
-                {
-                    let s = section.clone();
-                    let groups = Memo::new(move |_| {
-                        layout.get().into_iter().find(|(n, _)| *n == s).map(|(_, g)| g).unwrap_or_default()
-                    });
-                    let count = Signal::derive(move || {
-                        groups.with(|g| g.iter().map(|(_, k)| k.len()).sum::<usize>()).to_string()
-                    });
-                    let tables = Memo::new(move |_| groups.get().into_iter().map(|(t, _)| t).collect::<Vec<_>>());
-                    view! {
-                        <Section title=section.clone() count=count>
-                            <For each=move || tables.get() key=|t| t.clone() let:table>
-                                <TableRows groups=groups table=table/>
-                            </For>
-                        </Section>
-                    }
-                }
-            </For>
-            <Show when=move || sections.get().is_empty()>
-                <p class="empty">"No setting matches."</p>
-            </Show>
-        </div>
-    }
-}
-
-/// One table's rows of a section: the section's own keys as they are, a table under it (`[overlay.weather]`)
-/// under its name, so a kind's settings read together.
-#[component]
-fn TableRows(
-    groups: Memo<Vec<(Option<String>, Vec<String>)>>,
-    table: Option<String>,
-) -> impl IntoView {
-    let t = table.clone();
-    let keys = Memo::new(move |_| {
-        groups.with(|g| {
-            g.iter()
-                .find(|(x, _)| *x == t)
-                .map(|(_, k)| k.clone())
-                .unwrap_or_default()
-        })
-    });
-    let rows = move || {
-        view! {
-            <For each=move || keys.get() key=|k| k.clone() let:key>
-                <SettingRow key=key/>
-            </For>
-        }
-    };
-    match table {
-        None => rows().into_any(),
-        Some(name) => view! {
-            <div class="subsec">
-                <div class="subsec-head">{format!("[{name}]")}</div>
-                {rows()}
-            </div>
-        }
-        .into_any(),
-    }
-}
-
-#[component]
-fn SettingRow(key: String) -> impl IntoView {
-    let ctx = expect_context::<Ctx>();
-    let note: NoteSignal = RwSignal::new(None);
-    let k = key.clone();
-    let entry = Memo::new(move |_| {
-        ctx.entries
-            .with(|e| e.iter().find(|x| x.key == k).cloned())
-            .unwrap_or(Entry {
-                key: k.clone(),
-                value: serde_json::Value::Null,
-                set: false,
-                choices: Vec::new(),
-            })
-    });
-    let shown = Memo::new(move |_| model::show_value(&entry.get().value));
-    let draft = RwSignal::new(shown.get_untracked());
-    // A value that came in (our own write, or a reset) replaces what was typed.
-    Effect::new(move |_| draft.set(shown.get()));
-    let dirty = Signal::derive(move || draft.get() != shown.get());
-    let error = Signal::derive(move || match note.get() {
-        Some(Note::Err(t)) => Some(t),
-        _ => None,
-    });
-    let editor = Memo::new(move |_| model::editor(&entry.get()));
-    let set_key = key.clone();
-    let commit = move || {
-        let text = draft.get_untracked();
-        if text == shown.get_untracked() {
-            return;
-        }
-        let request = if text.trim().is_empty() {
-            Request::Unset {
-                key: set_key.clone(),
-            }
-        } else {
-            Request::Set {
-                key: set_key.clone(),
-                value: text,
-            }
-        };
-        run(ctx, request, note);
-    };
-    let flag_key = key.clone();
-    let choice_key = key.clone();
-    let reset_key = key.clone();
-    view! {
-        <Field label=key.clone() dirty=dirty error=error>
-            <div class="ctl">
-                {move || match editor.get() {
-                    Editor::ReadOnly => view! {
-                        <span class="readonly" title="Written by pairing">{shown.get()}</span>
-                    }.into_any(),
-                    Editor::Flag => {
-                        let flag_key = flag_key.clone();
-                        view! {
-                            <input type="checkbox" prop:checked=move || entry.get().value == serde_json::Value::Bool(true)
-                                on:change=move |ev| run(ctx, Request::Set {
-                                    key: flag_key.clone(),
-                                    value: event_target_checked(&ev).to_string(),
-                                }, note)/>
-                        }.into_any()
-                    }
-                    Editor::Choice => {
-                        let key = choice_key.clone();
-                        let words = entry.get_untracked().choices;
-                        view! {
-                            <select class="select" aria-label=key.clone() on:change=move |ev| {
-                                let word = event_target_value(&ev);
-                                let key = key.clone();
-                                let request = if word.is_empty() {
-                                    Request::Unset { key }
-                                } else {
-                                    Request::Set { key, value: word }
-                                };
-                                run(ctx, request, note)
-                            }>
-                                // An unset optional word (`desktop.capture`): Reset sets it back.
-                                <option value="" hidden=move || !entry.get().value.is_null()
-                                    prop:selected=move || entry.get().value.is_null()>"not set"</option>
-                                {words.into_iter().map(|w| {
-                                    let is = w.clone();
-                                    let value = w.clone();
-                                    view! {
-                                        <option value=value
-                                            prop:selected=move || entry.get().value.as_str() == Some(is.as_str())>
-                                            {w}
-                                        </option>
-                                    }
-                                }).collect_view()}
-                            </select>
-                        }.into_any()
-                    }
-                    Editor::Text => {
-                        let commit = commit.clone();
-                        view! {
-                            <input class="input" type="text" spellcheck="false"
-                                placeholder=move || if entry.get().value.is_null() { "not set" } else { "" }
-                                prop:value=move || draft.get()
-                                on:input=move |ev| draft.set(event_target_value(&ev))
-                                on:change=move |_| commit()
-                                on:keydown=move |ev| if ev.key() == "Escape" { draft.set(shown.get_untracked()) }/>
-                        }.into_any()
-                    }
-                }}
-                <Show when=move || entry.get().set>
-                    <button class="btn sm ghost" title="Remove it from the file: the default applies again"
-                        on:click={
-                            let reset_key = reset_key.clone();
-                            move |_| run(ctx, Request::Unset { key: reset_key.clone() }, note)
-                        }>"Reset"</button>
-                </Show>
-                <span class="chip" class:set=move || entry.get().set>
-                    {move || if entry.get().set { "set" } else { "default" }}
-                </span>
-                <NoteView note=Signal::derive(move || note.get().filter(|n| matches!(n, Note::Ok(_))))/>
-            </div>
-        </Field>
     }
 }

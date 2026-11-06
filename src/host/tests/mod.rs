@@ -180,6 +180,9 @@ impl Provider for TestTools {
                                 state: Arc::new(format!("plan {text}")),
                                 notes: Vec::new(),
                                 options: Vec::new(),
+                                ask: None,
+                                spoken: None,
+                                confirmed: false,
                             })
                         })
                     });
@@ -514,6 +517,8 @@ pub fn deps() -> Deps {
         screen: crate::screen_lock::ScreenLock::default(),
         a11y: crate::desktop::fdo::atspi::switch::A11ySwitch::inert(),
         jobs: crate::jobs::Jobs::default(),
+        browser: crate::browser::Links::new(Changes::new().0),
+        state_dir: None,
     }
 }
 

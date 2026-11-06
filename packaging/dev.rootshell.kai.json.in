@@ -1,0 +1,7 @@
+{
+  "name": "dev.rootshell.kai",
+  "description": "@DESCRIPTION@",
+  "path": "@HOST@",
+  "type": "stdio",
+  "allowed_extensions": ["kai-firefox@rootshell.dev"]
+}

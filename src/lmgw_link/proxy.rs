@@ -12,6 +12,9 @@
 //!   for lmgw's answer, `window.proxy_timeout_s` for the whole exchange; each refusal names its key.
 //!   Kai's own refusals are in lmgw's error shape (`{code, message}`), so the kit shows them as it
 //!   shows lmgw's.
+//!
+//! Firefox's sidebar (kai-firefox design §8.2) goes through the same device link with the same
+//! bounds and refusals, plus streams and byte bodies ([`relay`]).
 
 use std::time::Duration;
 
@@ -77,8 +80,13 @@ impl Limits {
 
     /// The core's check of the page's request: `None` when it may go.
     pub fn refuse_request(&self, forward: &Forward) -> Option<Proxied> {
+        self.refuse_body(forward.body.len())
+    }
+
+    /// The check of a request body of `n` bytes: `None` when it may go.
+    pub fn refuse_body(&self, n: usize) -> Option<Proxied> {
         let max = self.max_bytes()?;
-        let n = forward.body.len() as u64;
+        let n = n as u64;
         (n > max).then(|| {
             Proxied::refused(
                 413,
@@ -90,6 +98,25 @@ impl Limits {
                 ),
             )
         })
+    }
+
+    /// `work` within `window.proxy_timeout_s` (0: no bound); past it, the 504 naming the key.
+    async fn bounded<T>(
+        &self,
+        work: impl std::future::Future<Output = Result<T, Proxied>>,
+    ) -> Result<T, Proxied> {
+        match self.timeout_s {
+            0 => work.await,
+            s => tokio::time::timeout(Duration::from_secs(s), work)
+                .await
+                .unwrap_or_else(|_| {
+                    Err(Proxied::refused(
+                        504,
+                        "timeout",
+                        &format!("lmgw did not answer within {s} s (window.proxy_timeout_s)"),
+                    ))
+                }),
+        }
     }
 }
 
@@ -119,18 +146,10 @@ pub async fn send(creds: &Credentials, forward: Forward, limits: Limits) -> Prox
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(forward.body),
     };
-    let exchange = exchange(rb, limits);
-    let answer = match limits.timeout_s {
-        0 => exchange.await,
-        s => match tokio::time::timeout(Duration::from_secs(s), exchange).await {
-            Ok(a) => a,
-            Err(_) => Proxied::refused(
-                504,
-                "timeout",
-                &format!("lmgw did not answer within {s} s (window.proxy_timeout_s)"),
-            ),
-        },
-    };
+    let answer = limits
+        .bounded(exchange(rb, limits))
+        .await
+        .unwrap_or_else(|refused| refused);
     tracing::debug!(
         path = %forward.path.split('?').next().unwrap_or_default(),
         status = answer.status,
@@ -139,19 +158,31 @@ pub async fn send(creds: &Credentials, forward: Forward, limits: Limits) -> Prox
     answer
 }
 
-async fn exchange(rb: reqwest::RequestBuilder, limits: Limits) -> Proxied {
-    let mut resp = match rb.send().await {
-        Ok(r) => r,
-        Err(e) => {
-            return Proxied::refused(502, "lmgw_unreachable", &super::tls::unreachable(&e));
-        }
-    };
+async fn exchange(rb: reqwest::RequestBuilder, limits: Limits) -> Result<Proxied, Proxied> {
+    let resp = rb.send().await.map_err(|e| unreachable(&e))?;
     let status = resp.status().as_u16();
     let mime = mime_of(
         resp.headers()
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok()),
     );
+    let body = read_bounded(resp, limits).await?;
+    Ok(Proxied { status, mime, body })
+}
+
+/// lmgw could not be reached (a refused or failed connection, a TLS refusal), in its words.
+fn unreachable(e: &reqwest::Error) -> Proxied {
+    Proxied::refused(502, "lmgw_unreachable", &super::tls::unreachable(e))
+}
+
+/// lmgw's answer stopped before its end.
+fn broke_off(e: &reqwest::Error) -> String {
+    format!("lmgw's answer broke off: {}", describe(e))
+}
+
+/// `resp`'s whole body, refused (502 `answer_too_large`, naming `window.proxy_max_mb`) as soon as
+/// it is known to be over the bound: by its `content-length`, else as it arrives.
+async fn read_bounded(mut resp: reqwest::Response, limits: Limits) -> Result<Vec<u8>, Proxied> {
     let max = limits.max_bytes();
     let too_big = |n: u64| {
         Proxied::refused(
@@ -167,7 +198,7 @@ async fn exchange(rb: reqwest::RequestBuilder, limits: Limits) -> Proxied {
     if let (Some(max), Some(n)) = (max, resp.content_length())
         && n > max
     {
-        return too_big(n);
+        return Err(too_big(n));
     }
     let mut body = Vec::new();
     loop {
@@ -175,22 +206,17 @@ async fn exchange(rb: reqwest::RequestBuilder, limits: Limits) -> Proxied {
             Ok(Some(chunk)) => {
                 let n = (body.len() + chunk.len()) as u64;
                 if max.is_some_and(|m| n > m) {
-                    return too_big(n);
+                    return Err(too_big(n));
                 }
                 body.extend_from_slice(&chunk);
             }
-            Ok(None) => break,
-            Err(e) => {
-                return Proxied::refused(
-                    502,
-                    "lmgw_broke_off",
-                    &format!("lmgw's answer broke off: {}", describe(&e)),
-                );
-            }
+            Ok(None) => return Ok(body),
+            Err(e) => return Err(Proxied::refused(502, "lmgw_broke_off", &broke_off(&e))),
         }
     }
-    Proxied { status, mime, body }
 }
+
+pub mod relay;
 
 #[cfg(test)]
 mod tests;

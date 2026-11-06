@@ -73,6 +73,9 @@ pub fn prepare_open(services: &Services) -> Preparer {
                 state: Arc::new(o),
                 notes: Vec::new(),
                 options: Vec::new(),
+                ask: None,
+                spoken: None,
+                confirmed: false,
             })
         })
     })

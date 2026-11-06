@@ -78,6 +78,7 @@ async fn kais_own_windows_are_never_acted_on() {
                 role: "button".into(),
                 name: "Allow".into(),
                 at: (":1.9".into(), "/org/a11y/atspi/accessible/3".into()),
+                documents: Vec::new(),
             }),
             ..Default::default()
         };

@@ -19,7 +19,20 @@
 //!   Windows capability's facts: the app is the one registered from the window's process
 //!   (`GetConnectionUnixProcessID` of its bus name), and the window among its top-level children is
 //!   the one named like the window's title (exactly, else the app's only one, else by a part of the
-//!   title). Two windows of one title cannot be told apart: that is an error, never a guess.
+//!   title; exactly only where the target asks it, as Kai's browser site rules do for Firefox's
+//!   windows). Two windows of one title cannot be told apart: that is an error, never a guess.
+//! - **Documents:** an element below the window with the Document interface (a web page, a
+//!   frame's page) carries the address it shows (`GetAttributeValue("DocURL")`, Firefox's
+//!   attribute), in either walk and for `ui_press`'s element, so Kai's browser site rules judge
+//!   the pages actually read or pressed in. The address is empty where the call fails and where
+//!   Firefox gives none, which it does for `data:` and `blob:` documents (kai-firefox WP0 (d2)):
+//!   Kai's rules give an empty address the strictest rule.
+//! - **Only the documents shown** (kai-firefox WP12, from WP0 (d2)): Firefox keeps every tab's
+//!   page in the tree, and a background tab's page carries `VISIBLE` like the page in front; only
+//!   the page in front carries `SHOWING`. A document directly below a window's own UI (a tab's
+//!   page, a page's dialog) is therefore walked, read and pressed in only while it is `SHOWING`;
+//!   the documents inside it (its frames) are walked as the rest of the page is, scrolled away or
+//!   not. A press checks again, right before it, that the page is still shown.
 //! - **The walk:** every visible element (state `VISIBLE`; hidden menus and pages are left out),
 //!   each element's calls side by side, every call bounded by `dbus.timeout_s`. An element that does
 //!   not answer is counted and said; nothing is cut. At most `accessibility.concurrency` calls are
@@ -40,21 +53,19 @@
 //! *Built against the documented interfaces (at-spi2-core's `xml/`) and fakes on private buses;
 //! a real session's trees are checked by `spikes/p3/owner-checks.sh a` (WP13 (a)).*
 
-use std::collections::HashSet;
 use std::path::Path;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use futures_util::StreamExt;
 use futures_util::future::join_all;
 use kai_desktop::caps::accessibility::{
-    Accessibility, Element, Found, Pressed, Query, Target, Tree,
+    Accessibility, Found, How, Marked, Pressed, Query, Target, Tree,
 };
 use kai_desktop::caps::{Failure, Fut};
-use tokio::sync::Semaphore;
 use zbus::zvariant::OwnedObjectPath;
 
+use self::walk::{Mode, Place, Walk};
 use crate::desktop::{call, property};
 use crate::host::registry::SessionBus;
 
@@ -64,6 +75,7 @@ const ROOT: &str = "/org/a11y/atspi/accessible/root";
 const ACCESSIBLE: &str = "org.a11y.atspi.Accessible";
 const TEXT: &str = "org.a11y.atspi.Text";
 const VALUE: &str = "org.a11y.atspi.Value";
+const DOCUMENT: &str = "org.a11y.atspi.Document";
 
 /// AT-SPI's state bits (`AtspiStateType`).
 mod state {
@@ -75,6 +87,7 @@ mod state {
     pub const FOCUSED: u32 = 12;
     pub const PRESSED: u32 = 20;
     pub const SELECTED: u32 = 23;
+    pub const SHOWING: u32 = 25;
     pub const VISIBLE: u32 = 30;
     pub const MANAGES_DESCENDANTS: u32 = 31;
 }
@@ -231,6 +244,9 @@ pub struct Atspi {
     pub timeout: Duration,
     /// `accessibility.concurrency`: calls in flight at once in one walk (0: no bound).
     pub concurrency: usize,
+    /// `accessibility.action_settle_ms`: how long a press waits before it reads an element's
+    /// actions again, where the first read said none ([`press`]'s module doc).
+    pub action_settle: Duration,
     /// Kai's accessibility switch (`None`: Kai switches nothing, the providers' tests).
     pub switch: Option<switch::A11ySwitch>,
 }
@@ -251,57 +267,17 @@ impl From<(String, OwnedObjectPath)> for Node {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Mode {
-    /// Names, texts, values and states.
-    Read,
-    /// The selected texts only.
-    Selection,
-}
-
-/// One walk's shared state: the elements seen (a tree that loops is walked once) and those that
-/// did not answer.
-struct Walk {
-    seen: Mutex<HashSet<Node>>,
-    unanswered: AtomicUsize,
-    /// The window's app: only its nodes are walked.
-    app: String,
-    /// The calls in flight (module doc).
-    permits: Semaphore,
-}
-
-impl Walk {
-    fn new(app: String, concurrency: usize) -> Self {
-        Self {
-            seen: Mutex::default(),
-            unanswered: AtomicUsize::new(0),
-            app,
-            permits: Semaphore::new(if concurrency == 0 {
-                Semaphore::MAX_PERMITS
-            } else {
-                concurrency.min(Semaphore::MAX_PERMITS)
-            }),
-        }
-    }
-
-    /// `f` once a permit is free; the permit is held for that one call only (never across the
-    /// recursion into children).
-    async fn bounded<F: std::future::Future>(&self, f: F) -> F::Output {
-        let _permit = self.permits.acquire().await.expect("never closed");
-        f.await
-    }
-}
-
-/// The note of an element the walk did not enter.
-const FOREIGN: &str = "(element of another application, not read)";
-
 /// What an app off the bus may need besides the switch (WP13 (a): Electron and Chromium were absent
 /// from the bus with accessibility on).
 const ELECTRON: &str =
     "Electron and Chromium apps join only when started with --force-renderer-accessibility";
 
+#[cfg(test)]
+mod live_tests;
 mod press;
 pub mod switch;
+mod walk;
+mod whole;
 
 impl Accessibility for Atspi {
     fn tree<'a>(&'a self, target: &'a Target) -> Fut<'a, Tree> {
@@ -310,7 +286,7 @@ impl Accessibility for Atspi {
             let window = self.window(&bus, target).await?;
             let walk = Walk::new(window.dest.clone(), self.concurrency);
             let root = self
-                .element(&bus, window, true, false, Mode::Read, &walk)
+                .element(&bus, window, Place::Root, false, Mode::Read, &walk)
                 .await
                 .ok_or_else(|| Failure::Failed("the window did not answer over AT-SPI".into()))?;
             Ok(Tree {
@@ -328,32 +304,46 @@ impl Accessibility for Atspi {
         Box::pin(self.held(self.press_found(found)))
     }
 
-    fn selection<'a>(&'a self, target: &'a Target) -> Fut<'a, Vec<String>> {
+    fn app_tree<'a>(&'a self, pid: u32, how: How) -> Fut<'a, Tree> {
+        Box::pin(self.held(self.app_tree_of(pid, how)))
+    }
+
+    fn subtree<'a>(&'a self, at: &'a (String, String), how: How) -> Fut<'a, Tree> {
+        Box::pin(self.held(self.subtree_of(at, how)))
+    }
+
+    fn found_at<'a>(&'a self, at: &'a (String, String)) -> Fut<'a, Found> {
+        Box::pin(self.held(self.found_at_of(at)))
+    }
+
+    fn find_marked<'a>(
+        &'a self,
+        page: &'a (String, String),
+        name: &'a str,
+        value: &'a str,
+    ) -> Fut<'a, Marked> {
+        Box::pin(self.held(self.find_marked_in(page, name, value)))
+    }
+
+    fn set_text<'a>(&'a self, found: &'a Found, text: &'a str) -> Fut<'a, ()> {
+        Box::pin(self.held(self.set_text_of(found, text)))
+    }
+
+    fn selection<'a>(&'a self, target: &'a Target) -> Fut<'a, Tree> {
         Box::pin(self.held(async move {
             let bus = self.a11y_bus().await?;
             let window = self.window(&bus, target).await?;
             let walk = Walk::new(window.dest.clone(), self.concurrency);
+            // What was not walked is part of the answer (its notes), never silently missing.
             let root = self
-                .element(&bus, window, true, false, Mode::Selection, &walk)
+                .element(&bus, window, Place::Root, false, Mode::Selection, &walk)
                 .await
                 .ok_or_else(|| Failure::Failed("the window did not answer over AT-SPI".into()))?;
-            // What was not walked is part of the answer, never silently missing.
-            let mut out = Vec::new();
-            collect_texts(&root, &mut out);
-            Ok(out)
+            Ok(Tree {
+                root,
+                unanswered: walk.unanswered.load(Ordering::Relaxed),
+            })
         }))
-    }
-}
-
-fn collect_texts(e: &Element, out: &mut Vec<String>) {
-    if !e.text.is_empty() {
-        out.push(e.text.clone());
-    }
-    if !e.note.is_empty() {
-        out.push(e.note.clone());
-    }
-    for c in &e.children {
-        collect_texts(c, out);
     }
 }
 
@@ -596,20 +586,20 @@ impl Atspi {
             .fold(0u64, |acc, (i, w)| acc | (u64::from(*w) << (32 * i))))
     }
 
-    /// The window `target` among its app's top-level elements (module doc).
-    async fn window(&self, bus: &zbus::Connection, target: &Target) -> Result<Node, Failure> {
-        let mut found = self.apps_of(bus, target.pid).await?;
+    /// The apps on the bus registered from process `pid`, waited for where Kai switched
+    /// accessibility on just now (module doc); none is a refusal that says why.
+    async fn apps(&self, bus: &zbus::Connection, pid: u32) -> Result<Vec<Node>, Failure> {
+        let mut found = self.apps_of(bus, pid).await?;
         if found.is_empty()
             && let Some(deadline) = self
                 .switch
                 .as_ref()
                 .and_then(switch::A11ySwitch::registration_deadline)
         {
-            found = self.wait_for_app(bus, target.pid, deadline).await?;
+            found = self.wait_for_app(bus, pid, deadline).await?;
         }
-        let mine: Vec<&Node> = found.iter().collect();
-        if mine.is_empty() {
-            if flatpak(Path::new("/proc"), target.pid) {
+        if found.is_empty() {
+            if flatpak(Path::new("/proc"), pid) {
                 return Err(Failure::Refused(
                     "the window's app runs in a Flatpak sandbox: its accessibility connection \
                      goes through xdg-dbus-proxy, which shows the proxy's process instead of \
@@ -622,8 +612,14 @@ impl Atspi {
                 self.switches().await
             )));
         }
+        Ok(found)
+    }
+
+    /// The window `target` among its app's top-level elements (module doc).
+    async fn window(&self, bus: &zbus::Connection, target: &Target) -> Result<Node, Failure> {
+        let found = self.apps(bus, target.pid).await?;
         let mut windows: Vec<(Node, String, u64)> = Vec::new();
-        for app in mine {
+        for app in &found {
             for w in self.children(bus, app).await? {
                 let (name, states) = tokio::join!(self.name(bus, &w), self.states(bus, &w));
                 if let (Ok(name), Ok(states)) = (name, states) {
@@ -631,216 +627,22 @@ impl Atspi {
                 }
             }
         }
-        pick(windows, &target.title)
+        pick(windows, &target.title, target.exact)
     }
 
-    /// One element and, unless it is hidden, its children (module doc). `in_password`: an
-    /// ancestor is a password field, so nothing here is read.
-    fn element<'a>(
-        &'a self,
-        bus: &'a zbus::Connection,
-        node: Node,
-        root: bool,
-        in_password: bool,
-        mode: Mode,
-        walk: &'a Walk,
-    ) -> futures_util::future::BoxFuture<'a, Option<Element>> {
-        Box::pin(async move {
-            if node.dest != walk.app {
-                return Some(Element {
-                    note: FOREIGN.into(),
-                    ..Default::default()
-                });
-            }
-            if !walk
-                .seen
-                .lock()
-                .expect("never poisoned")
-                .insert(node.clone())
-            {
-                return None;
-            }
-            let t = self.timeout;
-            let role = walk.bounded(call::<_, u32>(
-                bus,
-                &node.dest,
-                &node.path,
-                ACCESSIBLE,
-                "GetRole",
-                &(),
-                t,
-            ));
-            let ifaces = walk.bounded(call::<_, Vec<String>>(
-                bus,
-                &node.dest,
-                &node.path,
-                ACCESSIBLE,
-                "GetInterfaces",
-                &(),
-                t,
-            ));
-            let (role, name, states, ifaces) = tokio::join!(
-                role,
-                walk.bounded(self.name(bus, &node)),
-                walk.bounded(self.states(bus, &node)),
-                ifaces,
-            );
-            let (Ok(role), Ok(name), Ok(states), Ok(ifaces)) = (role, name, states, ifaces) else {
-                walk.unanswered.fetch_add(1, Ordering::Relaxed);
-                return None;
-            };
-            let has = |bit: u32| states & (1u64 << bit) != 0;
-            if !root && !has(state::VISIBLE) {
-                return None;
-            }
-            // Nothing in a password field's subtree is read.
-            let password = in_password || role == PASSWORD_TEXT;
-            let texts = ifaces.iter().any(|i| i == TEXT) && !password;
-            let mut e = Element {
-                role: role_name(role),
-                ..Default::default()
-            };
-            match mode {
-                Mode::Read => {
-                    e.name = name;
-                    if texts {
-                        match walk.bounded(self.text(bus, &node, 0, -1)).await {
-                            Ok(t) => e.text = t,
-                            Err(_) => {
-                                walk.unanswered.fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
-                    }
-                    if !password && ifaces.iter().any(|i| i == VALUE) {
-                        e.value = walk
-                            .bounded(property(
-                                bus,
-                                &node.dest,
-                                &node.path,
-                                VALUE,
-                                "CurrentValue",
-                                t,
-                            ))
-                            .await
-                            .ok();
-                    }
-                    for (bit, word) in [
-                        (state::FOCUSED, "focused"),
-                        (state::CHECKED, "checked"),
-                        (state::SELECTED, "selected"),
-                        (state::PRESSED, "pressed"),
-                    ] {
-                        if has(bit) {
-                            e.states.push(word);
-                        }
-                    }
-                    if has(state::EXPANDABLE) {
-                        if has(state::EXPANDED) {
-                            e.states.push("expanded");
-                        } else if has(state::COLLAPSED) {
-                            e.states.push("collapsed");
-                        }
-                    }
-                    if CONTROL_ROLES.contains(&role) && !has(state::ENABLED) {
-                        e.states.push("disabled");
-                    }
-                }
-                Mode::Selection => {
-                    if texts {
-                        match walk.bounded(self.selected(bus, &node)).await {
-                            Ok(s) => e.text = s.join("\n"),
-                            Err(_) => {
-                                walk.unanswered.fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
-                    }
-                }
-            }
-            if has(state::MANAGES_DESCENDANTS) {
-                // Asking such an element for its children can make the app build them all.
-                let count = walk
-                    .bounded(property::<i32>(
-                        bus,
-                        &node.dest,
-                        &node.path,
-                        ACCESSIBLE,
-                        "ChildCount",
-                        t,
-                    ))
-                    .await;
-                e.note = match count {
-                    Ok(n) => format!(
-                        "({n} children, not walked: the element manages its descendants itself)"
-                    ),
-                    Err(_) => "(children not walked: the element manages its descendants \
-                               itself, and its child count did not answer)"
-                        .into(),
-                };
-                return Some(e);
-            }
-            let Ok(kids) = walk.bounded(self.children(bus, &node)).await else {
-                walk.unanswered.fetch_add(1, Ordering::Relaxed);
-                return Some(e);
-            };
-            e.children = join_all(
-                kids.into_iter()
-                    .map(|k| self.element(bus, k, false, password, mode, walk)),
-            )
-            .await
-            .into_iter()
-            .flatten()
-            .collect();
-            Some(e)
-        })
-    }
-
-    async fn text(
-        &self,
-        bus: &zbus::Connection,
-        n: &Node,
-        start: i32,
-        end: i32,
-    ) -> Result<String, Failure> {
-        call(
+    /// The address the document `n` shows (module doc); empty when it does not say.
+    async fn doc_url(&self, bus: &zbus::Connection, n: &Node) -> String {
+        call::<_, String>(
             bus,
             &n.dest,
             &n.path,
-            TEXT,
-            "GetText",
-            &(start, end),
+            DOCUMENT,
+            "GetAttributeValue",
+            &("DocURL",),
             self.timeout,
         )
         .await
-    }
-
-    async fn selected(&self, bus: &zbus::Connection, n: &Node) -> Result<Vec<String>, Failure> {
-        let count: i32 = call(
-            bus,
-            &n.dest,
-            &n.path,
-            TEXT,
-            "GetNSelections",
-            &(),
-            self.timeout,
-        )
-        .await?;
-        let mut out = Vec::new();
-        for i in 0..count.max(0) {
-            let (start, end): (i32, i32) = call(
-                bus,
-                &n.dest,
-                &n.path,
-                TEXT,
-                "GetSelection",
-                &(i,),
-                self.timeout,
-            )
-            .await?;
-            if end > start {
-                out.push(self.text(bus, n, start, end).await?);
-            }
-        }
-        Ok(out)
+        .unwrap_or_default()
     }
 }
 
@@ -875,11 +677,13 @@ pub(crate) fn flatpak(proc: &Path, pid: u32) -> bool {
         .exists()
 }
 
-/// The window named `title` among an app's top-level elements (module doc).
-fn pick(windows: Vec<(Node, String, u64)>, title: &str) -> Result<Node, Failure> {
+/// The window named `title` among an app's top-level elements (module doc); only by its whole
+/// name where `only_exact`.
+fn pick(windows: Vec<(Node, String, u64)>, title: &str, only_exact: bool) -> Result<Node, Failure> {
     let exact: Vec<&(Node, String, u64)> = windows.iter().filter(|w| w.1 == title).collect();
     let chosen = match exact.len() {
         1 => Some(exact[0]),
+        0 if only_exact => None,
         0 => {
             let visible: Vec<&(Node, String, u64)> = windows
                 .iter()
@@ -975,7 +779,7 @@ mod tests {
 
     #[test]
     fn the_window_is_picked_by_its_title_never_guessed() {
-        let got = |ws, t| pick(ws, t).map(|n| n.path);
+        let got = |ws, t| pick(ws, t, false).map(|n| n.path);
         assert_eq!(
             got(vec![w("/a", "Notes", true), w("/b", "Kai", true)], "Kai"),
             Ok("/b".into())
@@ -1001,6 +805,26 @@ mod tests {
             "none of the app's windows on the accessibility bus is that window; they are: \"A\", \
              \"B\""
         );
+        // Exactly only (Kai's browser site rules on Firefox's windows): no fallback is taken.
+        let exact = |ws, t| pick(ws, t, true).map(|n| n.path);
+        assert_eq!(
+            exact(vec![w("/a", "Notes", true), w("/b", "Kai", true)], "Kai"),
+            Ok("/b".into())
+        );
+        for (ws, t) in [
+            (vec![w("/a", "Notes", true), w("/b", "x", false)], "Other"),
+            (
+                vec![w("/a", "Notes", true), w("/b", "Draft", true)],
+                "Draft — Editor",
+            ),
+            (
+                vec![w("/a", "Inbox — Mozilla Firefox", true)],
+                "Inbox — Mozilla Firefox <2>",
+            ),
+        ] {
+            let e = exact(ws, t).unwrap_err().to_string();
+            assert!(e.starts_with("none of the app's windows"), "{t}: {e}");
+        }
         // An app registered without a tree (Firefox does this, WP13 (a)).
         let e = got(Vec::new(), "Mozilla Firefox").unwrap_err();
         assert_eq!(

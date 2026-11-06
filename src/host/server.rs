@@ -306,15 +306,18 @@ impl Shared {
         // confirmed-by-default tools included, but switching a routine on, whose dialog shows the
         // routine and offers to grant what it asks).
         let approver = approver.filter(|_| super::policy::approval_applies(spec, &args));
+        let (decision, approval_counted) = {
+            let policy = self.policy.read().expect("never poisoned");
+            (
+                policy.decide_call(spec, &args, caller, approver),
+                approver.is_some_and(|a| policy.approval_counts(caller, a)),
+            )
+        };
         let origin = Origin {
             approved_in_lmgw: approver.is_some(),
+            approval_counted,
             caller: Some(caller.clone()),
         };
-        let decision = self
-            .policy
-            .read()
-            .expect("never poisoned")
-            .decide_call(spec, &args, caller, approver);
         if let Decision::Deny(why) = &decision {
             tracing::info!(tool, caller = %caller.describe(), %why, "host: denied (K15)");
             return Err(Stop::Refused(why.clone()));
@@ -327,7 +330,7 @@ impl Shared {
         };
         // What the tool resolves first (`open`'s application), shown in the dialog and run as
         // shown; its refusal asks nobody.
-        let prepared = match &entry.prepare {
+        let mut prepared = match &entry.prepare {
             None => None,
             Some(prepare) => {
                 tokio::select! {
@@ -350,6 +353,13 @@ impl Shared {
                 }
             }
         };
+        // The tool's own reason to ask (`Prepared::ask`: the browser's focus rule) turns a call
+        // the policy would run unasked into a confirmed one; it never lets one through.
+        let tool_asks = prepared.as_ref().and_then(|p| p.ask);
+        let decision = match (decision, tool_asks) {
+            (Decision::Allow, Some(why)) => Decision::Confirm { why },
+            (d, _) => d,
+        };
         match decision {
             Decision::Deny(_) => unreachable!("refused above"),
             Decision::Allow => {}
@@ -363,14 +373,19 @@ impl Shared {
                 if let Some(p) = &prepared {
                     lines.extend(p.lines.iter().cloned());
                 }
-                // The tool's own boxes first, "always allow" last (next to the buttons).
-                let always = self.always_option(spec, &args, caller);
+                // The tool's own boxes first, "always allow" last (next to the buttons); none where
+                // the tool asks of its own accord, which no policy state would spare.
+                let always = if tool_asks.is_some() {
+                    None
+                } else {
+                    self.always_option(spec, &args, caller)
+                };
                 let options = prepared
                     .iter()
                     .flat_map(|p| p.options.iter().cloned())
                     .chain(always.clone())
                     .collect();
-                self.confirmer.ask(ConfirmRequest {
+                let request = ConfirmRequest {
                     tool: self.shown_name(tool),
                     description: spec.description.to_owned(),
                     caller: caller.describe(),
@@ -383,7 +398,17 @@ impl Shared {
                         .map(|p| p.notes.clone())
                         .unwrap_or_default(),
                     reply,
-                });
+                };
+                // A call of Kai's own may be answered by voice too, as K17 lets only Kai's own
+                // calls be (`crate::approvals::asked`).
+                match prepared
+                    .as_ref()
+                    .and_then(|p| p.spoken.clone())
+                    .filter(|_| *caller == super::policy::Caller::Own)
+                {
+                    Some(words) => self.confirmer.ask_spoken(request, words),
+                    None => self.confirmer.ask(request),
+                }
                 // Dropping `answer` (any arm but the first) closes the dialog.
                 let answered = tokio::select! {
                     a = answer => a.ok(),
@@ -401,6 +426,9 @@ impl Shared {
                 match answered {
                     Some(true) => {
                         tracing::info!(tool, "host: the owner allowed the call");
+                        if let Some(p) = prepared.as_mut() {
+                            p.confirmed = true;
+                        }
                         if always.is_some_and(|o| o.is_ticked())
                             && let Some(core) = self.core.get()
                         {

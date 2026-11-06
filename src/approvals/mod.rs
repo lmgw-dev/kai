@@ -47,11 +47,19 @@
 //! meanwhile. A call an ended session showed is Kai's own only through the conversation's thread.
 //! A press of the talk key records the answer only when the card shows such a call and the card
 //! said it armed for it ([`card::CardEvent::Armed`]); any other press is the talk key's ordinary
-//! press. The recording must hold speech (`approvals.speech_dbfs`, `approvals.speech_ms`), goes
-//! through `…/transcribe` of the call's thread, and its words are matched against `approvals.yes`
-//! and `approvals.no` ([`words`]). An answer in neither list keeps the card and says "say yes or
-//! no, or click". Calls of other threads (a phone's turn, the dashboard's) show on the card and
+//! press. The recording starts at the press, with no pre-roll, and what the microphone hears while
+//! Kai speaks and `browser.speech_echo_guard_ms` after is silence in it (kai-firefox WP10b's
+//! review, M1: the end of a reply asking "yes or no?" is no answer). The recording must hold
+//! speech (`approvals.speech_dbfs`, `approvals.speech_ms`), goes through `…/transcribe` of the
+//! call's thread, and its words are matched against `approvals.yes` and `approvals.no`
+//! ([`words`]). An answer in neither list keeps the card and says "say yes or no, or click". Calls of other threads (a phone's turn, the dashboard's) show on the card and
 //! are answered there; they hold back no audio and leave the talk key as it is.
+//!
+//! **Kai's own questions** ([`asked`], kai-firefox WP10b): the questions Kai's own dialog asks
+//! about a call of Kai's own (the browser's focus rule, its commit guard) are spoken, one at a
+//! time, and answered the same way, through the talk key once the question was spoken; the dialog
+//! shows as before. With a card's call of Kai's own and a question both answerable, a press answers
+//! the one that became answerable last (the card's arming, the question's speech ending).
 //!
 //! **K15 (PD4's hand-over).** A thread call approved here reaches Kai's own tools with
 //! `_meta["lmgw/approval"]` naming Kai's device as approver, a trusted approver: Kai's dialog
@@ -59,6 +67,7 @@
 //! in lmgw names its window, so the card's arguments show the target; a draft),
 //! only `routine_enable` switching a routine on asks again. Calls with no F keep the dialog.
 
+pub mod asked;
 pub mod card;
 pub mod keyboard;
 pub mod overlay;
@@ -195,6 +204,10 @@ pub enum Done {
 pub enum Wake {
     Card(CardEvent),
     Done(Op, Done),
+    /// What became of the spoken form of one of Kai's own questions, by its tag ([`asked`]).
+    Said(u64, crate::voice::speak::Said),
+    /// One of Kai's own questions is over ([`asked`]).
+    AskOver(String),
 }
 
 /// What the voice carries out for the approvals (it holds the session and the link).
@@ -220,6 +233,11 @@ pub enum Act {
     },
     /// The thread's waiting calls, read again (`GET /chat/api/threads/{id}`).
     Reread { thread_id: i64 },
+    /// Kai says `words` about its own question `id` ([`asked`]: "say yes or no").
+    Speak {
+        id: String,
+        words: crate::voice::speak::Words,
+    },
 }
 
 /// Who the card says asked, by thread: the starter of its last turn, as the feed names authors.
@@ -227,6 +245,9 @@ pub enum Act {
 struct Asker {
     name: String,
     own: bool,
+    /// A turn Kai relayed for Firefox's sidebar (kai-firefox §8.3): its calls are not Kai's own
+    /// (K17), even in the conversation's thread.
+    sidebar: bool,
 }
 
 /// A thread's calls read again: what lmgw said to the answer that asked for it (none: a resync).
@@ -280,12 +301,25 @@ pub struct Approvals {
     /// The screen is locked (`crate::screen_lock`): the card is hidden, its calls stay waiting, no
     /// answer is taken.
     locked: bool,
+    /// Kai's own questions ([`asked`]), oldest first.
+    asks: Vec<asked::Waiting>,
+    ask_tags: u64,
+    /// Counts what became answerable by voice (the card's arming, a question's speech ending), so
+    /// a press answers the latest ([`Self::voice_target`]).
+    arms: u64,
+    /// The count at the card's last arming.
+    card_armed_at: u64,
+    said_tx: crate::voice::speak::Replies,
+    said_rx: mpsc::UnboundedReceiver<(u64, crate::voice::speak::Said)>,
+    /// Each question's end, by its id.
+    overs: FuturesUnordered<Pending<String>>,
 }
 
 impl Approvals {
     /// `sink` carries the card's commands to the GTK side ([`overlay::send`] in Kai).
     pub fn new(s: ApprovalSettings, sink: Sink) -> Self {
         let (events_tx, events_rx) = mpsc::unbounded_channel();
+        let (said_tx, said_rx) = mpsc::unbounded_channel();
         Self {
             s,
             calls: Vec::new(),
@@ -309,6 +343,13 @@ impl Approvals {
             decided_here: HashSet::new(),
             creates: 0,
             locked: false,
+            asks: Vec::new(),
+            ask_tags: 0,
+            arms: 0,
+            card_armed_at: 0,
+            said_tx,
+            said_rx,
+            overs: FuturesUnordered::new(),
         }
     }
 
@@ -354,6 +395,8 @@ impl Approvals {
         tokio::select! {
             Some(e) = self.events_rx.recv() => Wake::Card(e),
             Some((op, done)) = self.ops.next(), if !self.ops.is_empty() => Wake::Done(op, done),
+            Some((tag, said)) = self.said_rx.recv() => Wake::Said(tag, said),
+            Some(id) = self.overs.next(), if !self.overs.is_empty() => Wake::AskOver(id),
         }
     }
 
@@ -400,20 +443,33 @@ impl Approvals {
     /// committed before then would be taken as that response (or, with words, decline the call).
     pub fn gates_audio(&self) -> bool {
         let lost = self.lost_threads();
-        self.calls.iter().any(|c| {
-            self.mine(c)
-                && (!self.in_flight(c) || self.awaits_response(c))
-                && !lost.contains(&c.thread_id)
-        })
+        self.asks_wait()
+            || self.calls.iter().any(|c| {
+                self.mine(c)
+                    && (!self.in_flight(c) || self.awaits_response(c))
+                    && !lost.contains(&c.thread_id)
+            })
     }
 
     /// A press of the talk key now records the spoken answer (K17): the card shows a call of Kai's
     /// own and said it armed for it.
     pub fn voice_answers(&self) -> bool {
-        !self.locked
-            && self
-                .current()
-                .is_some_and(|c| self.mine(c) && self.armed.as_deref() == Some(c.id.as_str()))
+        !self.locked && self.voice_target().is_some()
+    }
+
+    /// What a press of the talk key answers now: of the card's call of Kai's own it armed for and
+    /// Kai's own question once it was spoken ([`asked`]), the one that became answerable last (a
+    /// card's call not armed yet holds back no question).
+    fn voice_target(&self) -> Option<String> {
+        let card = self
+            .current()
+            .filter(|c| self.mine(c) && self.armed.as_deref() == Some(c.id.as_str()))
+            .map(|c| (self.card_armed_at, c.id.as_str()));
+        [card, self.ask_armed()]
+            .into_iter()
+            .flatten()
+            .max_by_key(|(at, _)| *at)
+            .map(|(_, id)| id.to_owned())
     }
 
     /// Session `no` showed a call that waits, or carried verdicts lmgw has not taken yet: the
@@ -440,6 +496,13 @@ impl Approvals {
                 tool_name(c),
                 self.place(c.thread_id)
             ));
+        }
+        if self.current().is_none_or(|c| !self.mine(c)) && self.asks_wait() {
+            return Some(
+                "Kai asks before it acts: answer in its dialog, or hold the talk key and say yes \
+                 or no"
+                    .into(),
+            );
         }
         let c = self.current()?;
         if self.locked {
@@ -605,15 +668,23 @@ impl Approvals {
         }
     }
 
-    /// The feed's `turn.started`: who started the thread's last turn (the card's "asked by").
-    pub fn turn_started(&mut self, thread_id: i64, name: &str, own: bool) {
-        self.asked_by.insert(
+    /// The feed's `turn.started`: who started the thread's last turn (the card's "asked by"), and
+    /// whether it is a turn of Firefox's sidebar's (`crate::browser::sidebar::turns`).
+    pub fn turn_started(&mut self, thread_id: i64, name: &str, own: bool, sidebar: bool) {
+        let was = self.asked_by.insert(
             thread_id,
             Asker {
                 name: name.to_owned(),
                 own,
+                sidebar,
             },
         );
+        // Whether its calls are Kai's own may have changed.
+        if was.is_some_and(|a| a.sidebar) != sidebar
+            && self.calls.iter().any(|c| c.thread_id == thread_id)
+        {
+            self.sync();
+        }
     }
 
     /// A thread's title as the feed shows it now.
@@ -761,6 +832,8 @@ impl Approvals {
             Wake::Card(CardEvent::Armed { call }) => {
                 if self.current().is_some_and(|c| c.id == call) {
                     tracing::debug!(call = %call, "approvals: the card armed");
+                    self.arms += 1;
+                    self.card_armed_at = self.arms;
                     self.armed = Some(call);
                 }
                 Vec::new()
@@ -784,6 +857,11 @@ impl Approvals {
                 self.reread_answered(thread_id, r);
                 Vec::new()
             }
+            Wake::Said(tag, said) => {
+                self.ask_said(tag, said);
+                Vec::new()
+            }
+            Wake::AskOver(id) => self.ask_over(&id),
             Wake::Done(op, done) => {
                 tracing::warn!(
                     ?op,
@@ -1098,22 +1176,25 @@ impl Approvals {
 
     // ------------------------------------------------------------- the spoken answer (K17)
 
-    /// The talk key went down while [`Self::voice_answers`]: the answer is recorded, starting
-    /// with `preroll` (what the microphone heard just before). `false` when nothing records (the
-    /// card does not ask for the voice now, or the last answer is still being transcribed).
-    pub fn press(&mut self, preroll: Vec<i16>) -> bool {
+    /// The talk key went down while [`Self::voice_answers`]: the answer is recorded from now on,
+    /// with no pre-roll (module doc: what the microphone heard before the press may be Kai's own
+    /// voice). `false` when nothing records (the card does not ask for the voice now, or the last
+    /// answer is still being transcribed).
+    pub fn press(&mut self) -> bool {
         if self.hearing.is_some() {
             tracing::info!(
                 "approvals: the last spoken answer is still being heard; the press waits"
             );
             return false;
         }
-        if !self.voice_answers() {
+        if self.locked {
             return false;
         }
-        let call = self.current().map(|c| c.id.clone()).expect("checked");
+        let Some(call) = self.voice_target() else {
+            return false;
+        };
         tracing::info!(call = %call, "approvals: recording the spoken answer (K17)");
-        self.recording = Some((call, preroll));
+        self.recording = Some((call, Vec::new()));
         self.sync();
         true
     }
@@ -1131,17 +1212,30 @@ impl Approvals {
         let Some((call, samples)) = self.recording.take() else {
             return Vec::new();
         };
-        let Some(c) = self.calls.iter().find(|c| c.id == call) else {
+        let ask = self.is_ask(&call);
+        let thread = match self.calls.iter().find(|c| c.id == call) {
+            Some(c) => Some(c.thread_id),
+            None if ask => self.ask_thread(),
+            None => None,
+        };
+        let Some(thread_id) = thread else {
             self.sync();
+            if ask {
+                tracing::warn!(question = %call, "approvals: Kai has no thread of its own to hear the answer in");
+                return self.ask_not_heard(&call);
+            }
             return Vec::new();
         };
-        let thread_id = c.thread_id;
         let ms = samples.len() as u64 * 1000 / crate::audio::RATE as u64;
         let speech = words::speech_ms(&samples, self.s.speech_dbfs);
         if speech < self.s.speech_ms {
             // ASR makes words of near silence ("Okay.", "Ja."): a recording with no speech in it
             // is no answer.
             tracing::info!(call = %call, ms, speech_ms = speech, "approvals: the spoken answer holds no speech; not sent");
+            if ask {
+                self.sync();
+                return self.ask_not_heard(&call);
+            }
             self.note = Some((
                 call,
                 format!(
@@ -1177,6 +1271,9 @@ impl Approvals {
         r: Result<String, Refusal>,
         session: Option<(i64, u64)>,
     ) -> Vec<Act> {
+        if self.is_ask(call) {
+            return self.ask_heard(call, r);
+        }
         if self.hearing.as_deref() == Some(call) {
             self.hearing = None;
         }
@@ -1217,9 +1314,12 @@ impl Approvals {
     // ------------------------------------------------------------- the card
 
     /// A call of Kai's own: one the live bound session showed (not an ended one's), or one in
-    /// its conversation's thread.
+    /// its conversation's thread, unless the thread's last turn is Firefox's sidebar's
+    /// (kai-firefox §8.3: answered on the card or in the sidebar, never by voice).
     fn mine(&self, c: &Call) -> bool {
-        c.in_session.is_some_and(|n| Some(n) == self.live) || self.own.contains(&c.thread_id)
+        c.in_session.is_some_and(|n| Some(n) == self.live)
+            || (self.own.contains(&c.thread_id)
+                && !self.asked_by.get(&c.thread_id).is_some_and(|a| a.sidebar))
     }
 
     /// The call's verdict is on its way.
@@ -1363,6 +1463,7 @@ impl Approvals {
             format!("call {n} of {} this reply waits on", siblings.len())
         });
         let who = match self.asked_by.get(&c.thread_id) {
+            Some(a) if a.sidebar => a.name.clone(),
             Some(a) if a.own => "Kai's voice session".to_owned(),
             Some(a) => card::asker(&a.name),
             None if c.in_session.is_some() => "Kai's voice session".to_owned(),

@@ -98,6 +98,7 @@ async fn find(a: &Atspi, query: &str) -> Result<Element, Failure> {
         &Target {
             pid: std::process::id(),
             title: "Kai Test".into(),
+            exact: false,
         },
         &Query::parse(query).unwrap(),
     )
@@ -120,6 +121,7 @@ async fn ui_press_picks_one_element_and_runs_its_preferred_action() {
         bus: SessionBus::connected(b.session.connect().await, T),
         timeout: Duration::from_millis(400),
         concurrency: 16,
+        action_settle: std::time::Duration::from_millis(100),
         switch: None,
     };
     let took = |done: &Done| std::mem::take(&mut *done.lock().unwrap());
@@ -187,6 +189,7 @@ async fn a_press_whose_handler_never_returns_counts_as_made() {
         bus: SessionBus::connected(b.session.connect().await, T),
         timeout: Duration::from_millis(400),
         concurrency: 16,
+        action_settle: std::time::Duration::from_millis(100),
         switch: None,
     };
     let started = std::time::Instant::now();
@@ -211,6 +214,7 @@ async fn a_found_element_that_is_gone_or_changed_is_not_pressed() {
         bus: SessionBus::connected(b.session.connect().await, T),
         timeout: Duration::from_millis(400),
         concurrency: 16,
+        action_settle: std::time::Duration::from_millis(100),
         switch: None,
     };
     let found = find(&a, "button \"Save\"").await.unwrap();

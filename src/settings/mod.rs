@@ -11,7 +11,9 @@
 //! its serialization ([`tree`]) and a write is accepted only if the whole file, as it would then
 //! be, loads again ([`Config::parse`]: the loader's rules and the loader's message). So a section
 //! another work package adds needs nothing here, except that its structs derive `Serialize` (the
-//! compiler says so).
+//! compiler says so) and that each of its keys has a [`catalog`] entry: its label, help line,
+//! section, unit and control for the window (the catalog's tests fail for a key without one; the
+//! owner's rule of 2026-10-19, no setting is shown by its raw key).
 //!
 //! **The write** is §2's: [`crate::config::edit_text`] changes only the value (the file's comments
 //! and spacing stay) and [`crate::config::write_atomically`] puts it in place atomically and
@@ -23,7 +25,14 @@
 //!
 //! **Effects.** `policy.*` takes effect at once ([`Effect::Now`]: the core builds the policy again
 //! and the host lists the tools again, with `list_changed` when they changed), and so does
-//! `delegate.screenshots` (the host lists again, `crate::delegate::screenshots`). Every other key is
+//! `delegate.screenshots` (the host lists again, `crate::delegate::screenshots`) and
+//! `conversation.folder_name` (the core forgets the remembered folder and looks the new name up),
+//! `browser.peer_scopes` (read again at each connection to `browser.sock`), and the browser's
+//! policy (`browser.hands_and_eyes`, `browser.act_in_background`, `browser.sites.*`,
+//! `browser.point_ms`, `browser.pdf_timeout_s`, `browser.pdf_text_max_mb`, `browser.pdf_memory_max_mb`,
+//! `browser.commit_guard`, `browser.guard_words`, `browser.guard_window_ms`,
+//! `browser.input_settle_ms`, `browser.see_settle_ms`, `browser.trusted_press`: the core builds the
+//! policy again). Every other key is
 //! read when Kai starts ([`Effect::Restart`]); the tray's live switches keep their own path.
 //!
 //! **The routines (WP20):** their switches are `routines.enabled.<name>`, written only by the
@@ -45,6 +54,8 @@ use crate::config::{self, Config, ConfigError};
 use crate::desktop::settings::Choice;
 use crate::host::settings::{LevelSetting, ToolState};
 
+pub mod catalog;
+#[cfg(test)]
 mod choices;
 pub mod tools;
 mod tree;
@@ -108,10 +119,9 @@ pub struct Entry {
     pub value: Value,
     /// The file has the key; otherwise the value is the default.
     pub set: bool,
-    /// The words a fixed-word setting takes (an enum's, `overlay.weather.position`'s nine anchors),
-    /// read off its type ([`choices`]); empty for every other setting.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub choices: Vec<String>,
+    /// What the window shows of it: its label, help line, section, unit and control
+    /// ([`catalog`]; a choice's words are its type's, checked by the catalog's tests).
+    pub meta: catalog::Meta,
 }
 
 /// When a change takes hold.
@@ -154,17 +164,44 @@ pub struct Outcome {
 /// for an invalid value, otherwise a sentence naming the key.
 #[derive(Debug, Clone, PartialEq, thiserror::Error, Serialize, Deserialize)]
 #[error("{0}")]
-pub struct Refusal(pub String);
+#[serde(transparent)]
+pub struct Refusal(
+    pub String,
+    /// What the loader found wrong, for the window to word; not on the wire.
+    #[serde(skip)]
+    pub Option<catalog::Invalid>,
+);
+
+impl Refusal {
+    /// A refusal that is only its text.
+    pub fn plain(why: impl Into<String>) -> Self {
+        Refusal(why.into(), None)
+    }
+}
 
 impl From<ConfigError> for Refusal {
     fn from(e: ConfigError) -> Self {
-        Refusal(e.to_string())
+        let invalid = match &e {
+            ConfigError::Invalid {
+                key, value, rule, ..
+            } => Some(catalog::Invalid {
+                key: (*key).to_owned(),
+                value: value.clone(),
+                rule: rule.clone(),
+            }),
+            _ => None,
+        };
+        Refusal(e.to_string(), invalid)
     }
 }
 
 fn refuse<T>(why: impl Into<String>) -> Result<T, Refusal> {
-    Err(Refusal(why.into()))
+    Err(Refusal::plain(why))
 }
+
+/// The Kai conversation's folder name: a change switches the conversation at once (the core looks
+/// the folder of the new name up, `Conversation::rename`).
+pub const CONVERSATION_NAME_KEY: &str = "conversation.folder_name";
 
 /// Keys Kai's own flows write; setting them by hand would unpair or misdirect it (`lmgw.url`: a
 /// pairing from before TLS, which the next pairing removes).
@@ -339,7 +376,8 @@ fn set_word(
     word: &impl Serialize,
     source: Source,
 ) -> Result<Outcome, Refusal> {
-    let Value::String(word) = serde_json::to_value(word).map_err(|e| Refusal(e.to_string()))?
+    let Value::String(word) =
+        serde_json::to_value(word).map_err(|e| Refusal::plain(e.to_string()))?
     else {
         return refuse(format!("{key}: not a word"));
     };
@@ -462,12 +500,16 @@ fn changed(file: &Path, key: &str, config: Config) -> Result<Outcome, Refusal> {
         key: key.to_owned(),
         value: Value::Null,
         set: false,
-        choices: Vec::new(),
+        meta: catalog::meta_or_plain(key),
     });
     let effect = if key.starts_with("policy.")
         || routine_switch(key)
         || key == crate::routines::settings::RUN_TIMEOUT_KEY
         || key == crate::delegate::settings::SCREENSHOTS_KEY
+        || key == CONVERSATION_NAME_KEY
+        // Read at each request of the window's Personality page and of Firefox's sidebar.
+        || key.starts_with("window.proxy_")
+        || crate::browser::settings::takes_effect_now(key)
     {
         Effect::Now
     } else {

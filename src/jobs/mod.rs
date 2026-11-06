@@ -313,6 +313,8 @@ struct Inner {
     keep: Mutex<Duration>,
     /// The label lmgw lists Kai's tools under now (`hello.hosts_label`).
     label: Mutex<Option<String>>,
+    /// Kai's voice runs its continuation for jobs' results now ([`Jobs::continuing`]).
+    continuing: std::sync::atomic::AtomicBool,
 }
 
 /// The job table (module doc). Cloning shares it.
@@ -328,6 +330,7 @@ impl Default for Jobs {
             sending: Mutex::new(Vec::new()),
             keep: Mutex::new(KEEP_ENDED_DEFAULT),
             label: Mutex::new(None),
+            continuing: std::sync::atomic::AtomicBool::new(false),
         }))
     }
 }
@@ -389,6 +392,22 @@ impl Jobs {
     /// The label lmgw lists Kai's tools under now (the feed's `hello`).
     pub fn set_label(&self, label: Option<String>) {
         *locked(&self.0.label) = label;
+    }
+
+    /// Kai's voice runs its continuation for jobs' results now (`crate::voice::jobs`: the
+    /// `response.create` it sends in its conversation, `kai_job_<n>`, until that response ended or
+    /// was refused). Its calls come as Kai's own (`Caller::Own`), but what the model answers there
+    /// is tool output, not a turn of the owner's: the browser's focus rule takes none of their
+    /// moves for the owner's own (kai-firefox WP10b's review, M3).
+    pub fn continuing(&self) -> bool {
+        self.0.continuing.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The voice says whether its continuation runs ([`Jobs::continuing`]).
+    pub fn set_continuing(&self, on: bool) {
+        self.0
+            .continuing
+            .store(on, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Changes of the table (the tray, the tests).

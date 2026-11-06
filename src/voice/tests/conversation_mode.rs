@@ -236,10 +236,12 @@ async fn another_principals_turn_still_holds_it_back() {
     r.rings();
     let thread = r.mock.with(|s| s.thread.id);
     r.feed.fact(FeedFact::TurnStarted {
+        voice: false,
         thread_id: thread,
         by: By {
             name: "key:script".into(),
             own: false,
+            sidebar: false,
         },
     });
     sleep(Duration::from_secs(1)).await;

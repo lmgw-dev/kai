@@ -28,6 +28,7 @@ fn link(url: &str) -> RealtimeLink {
             timeout: Duration::from_secs(2),
             keepalive: Duration::from_secs(15),
             send_queue: Duration::from_secs(30),
+            speech_timeout: Duration::from_secs(60),
         },
     )
 }
@@ -716,6 +717,7 @@ async fn the_outgoing_queue_is_bounded_for_audio_only() {
             timeout: Duration::from_secs(2),
             keepalive: Duration::from_secs(15),
             send_queue: Duration::from_secs(1),
+            speech_timeout: Duration::from_secs(60),
         },
     );
     let (tx, mut events) = mpsc::unbounded_channel();
@@ -760,6 +762,7 @@ async fn a_dead_socket_is_found_by_the_keep_alive() {
         timeout: Duration::from_secs(2),
         keepalive: Duration::from_millis(200),
         send_queue: Duration::from_secs(30),
+        speech_timeout: Duration::from_secs(60),
     };
     // A peer that reads: pongs go back, the session stays.
     let (l, url) = listener().await;
@@ -859,4 +862,169 @@ fn a_threads_waiting_calls_read_from_its_messages() {
         read_pending_approvals(404, r#"{"code":"not_found","message":"no thread"}"#).unwrap_err();
     assert_eq!(e.code, "not_found");
     assert!(read_pending_approvals(200, "{}").unwrap().is_empty());
+}
+
+/// What lmgw's `POST /v1/audio/speech` answers for an audio row: the row's own WAV passed on as
+/// it came (`proxy/audio/speech.rs`), audio.cpp's canonical 44-byte header with both sizes, PCM16
+/// mono at the row's rate (`audio/rates.rs`: Supertonic 44.1 kHz, Pocket TTS 24 kHz), served
+/// `audio/wav`.
+async fn answer_wav(s: &mut Stream, wav: &[u8]) {
+    let head = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: audio/wav\r\ncontent-length: {}\r\n\
+         connection: close\r\n\r\n",
+        wav.len()
+    );
+    s.write_all(head.as_bytes()).await.unwrap();
+    s.write_all(wav).await.unwrap();
+}
+
+/// kai-firefox §7.2: one sentence's speech is lmgw's own speech JSON (`model`, `input`, `voice`,
+/// `instructions`, `response_format: "wav"`, and a seed only where Kai kept one; never a
+/// `language`), and lmgw's answer, a 44.1 kHz row's WAV, plays as 24 kHz mono of the same length.
+#[tokio::test]
+async fn a_speech_is_lmgws_own_shape_and_its_wav_plays_at_24k() {
+    let (l, url) = listener().await;
+    let mut link = link(&url);
+    let voice = SpeechVoice {
+        model: "supertonic".into(),
+        voice: Some("F1".into()),
+        instructions: Some("calm".into()),
+        seed: Some(7),
+    };
+    let pending = link.speech(&voice, "We left at dawn.");
+    let server = tokio::spawn(async move {
+        let (mut s, _) = l.accept().await.unwrap();
+        let req = read_request(&mut s).await;
+        let wav = crate::audio::wav::wav16(&[1200; 44_100], 44_100, 1);
+        answer_wav(&mut s, &wav).await;
+        req
+    });
+    let pcm = pending.await.unwrap();
+    assert_eq!(
+        pcm.len(),
+        24_000,
+        "a second at 44.1 kHz is a second at 24 kHz"
+    );
+    assert!(pcm[100..23_900].iter().all(|s| (*s - 1200).abs() <= 1));
+    let (head, body) = server.await.unwrap();
+    assert!(head.starts_with("POST /v1/audio/speech HTTP/1.1"), "{head}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap(),
+        json!({"model": "supertonic", "input": "We left at dawn.", "response_format": "wav",
+               "voice": "F1", "instructions": "calm", "seed": 7})
+    );
+    // Without a voice, a style or a seed: none of them sent.
+    let plain = speech_request(
+        &SpeechVoice {
+            model: "openai/tts-1".into(),
+            ..Default::default()
+        },
+        "Hi.",
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&plain.body.unwrap()).unwrap(),
+        json!({"model": "openai/tts-1", "input": "Hi.", "response_format": "wav"})
+    );
+}
+
+/// `browser.speech_timeout_s` bounds each sentence's speech; lmgw's refusal keeps its status and
+/// code (a 4xx is that text's alone).
+#[tokio::test]
+async fn a_speech_is_bounded_and_a_refusal_keeps_its_status() {
+    let (l, url) = listener().await;
+    let mut link = link_with(
+        &url,
+        RealtimeSettings {
+            timeout: Duration::from_secs(2),
+            keepalive: Duration::from_secs(15),
+            send_queue: Duration::from_secs(30),
+            speech_timeout: Duration::from_secs(1),
+        },
+    );
+    let voice = SpeechVoice {
+        model: "kai-tts".into(),
+        ..Default::default()
+    };
+    let pending = link.speech(&voice, "One.");
+    let refused = link.speech(&voice, "🙂");
+    let _server = tokio::spawn(async move {
+        // The two come on two connections in either order: the emoji's is refused, the other
+        // never answered.
+        let mut kept = Vec::new();
+        for _ in 0..2 {
+            let (mut s, _) = l.accept().await.unwrap();
+            let (_, body) = read_request(&mut s).await;
+            if body.contains('🙂') {
+                answer(
+                    &mut s,
+                    "422 Unprocessable Entity",
+                    r#"{"error":{"code":"empty_input","message":"nothing left to say"}}"#,
+                )
+                .await;
+            }
+            kept.push(s);
+        }
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    });
+    let (e, r) = tokio::join!(pending, refused);
+    let e = e.unwrap_err();
+    assert_eq!(e.status, 0);
+    assert!(
+        e.message.contains("within 1 s (browser.speech_timeout_s)"),
+        "{e}"
+    );
+    let r = r.unwrap_err();
+    assert_eq!((r.status, r.code.as_deref()), (422, Some("empty_input")));
+}
+
+/// Kai's voice from the thread (`voice_resolved`): the seed kept only for a text-to-speech alias
+/// served on this machine whose fallback is too (lmgw sends none to a cloud route), and Kai's
+/// words in its reply language, German for German, English otherwise.
+#[test]
+fn kais_voice_keeps_the_seed_only_where_lmgw_would_send_one() {
+    let thread = |tts: Value, reply: Value| {
+        json!({"thread": {"id": 812, "voice_resolved": {
+            "tts": tts, "voice": {"name": null, "inherits": "alba"},
+            "speech_style": {"text": " calm ", "source": "thread"},
+            "reply_language": {"value": reply, "source": "thread"}, "seed": 7}}})
+        .to_string()
+    };
+    let local = read_kai_voice(
+        200,
+        &thread(json!({"alias": "kai-tts", "local": true}), json!("de")),
+    )
+    .unwrap();
+    assert_eq!(
+        local.voice,
+        SpeechVoice {
+            model: "kai-tts".into(),
+            voice: Some("alba".into()),
+            instructions: Some("calm".into()),
+            seed: Some(7),
+        }
+    );
+    assert_eq!(local.lang, crate::voice::speak::Lang::De);
+    let cloud = read_kai_voice(
+        200,
+        &thread(json!({"alias": "openai/tts", "local": false}), json!("fr")),
+    )
+    .unwrap();
+    assert_eq!(
+        (cloud.voice.seed, cloud.lang),
+        (None, crate::voice::speak::Lang::En)
+    );
+    let falls_back = read_kai_voice(
+        200,
+        &thread(
+            json!({"alias": "kai-tts", "local": true,
+                   "fallback": {"alias": "openai/tts", "local": false}}),
+            Value::Null,
+        ),
+    )
+    .unwrap();
+    assert_eq!(falls_back.voice.seed, None, "its cloud fallback may answer");
+    let unknown = read_kai_voice(200, &thread(json!({"alias": "x"}), Value::Null)).unwrap();
+    assert_eq!(unknown.voice.seed, None, "where lmgw does not say");
+    let none = read_kai_voice(200, &thread(json!({"alias": null}), Value::Null)).unwrap_err();
+    assert_eq!(none.code, "no_tts");
 }

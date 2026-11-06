@@ -47,6 +47,20 @@ export KAI_UPDATE_MANIFEST_URL="$PUBLIC_MANIFEST_URL"
 export KAI_UPDATE_PUBLIC_FEED=1
 unset KAI_UPDATE_DEPLOY_TOKEN
 
+# The link the settings window's "Install Kai for Firefox" opens (src/browser/install.rs) comes
+# from the workflow's repository variable KAI_FIREFOX_INSTALL_URL: the signed XPI of the public
+# releases channel. A public artifact never carries a secret, so a link with credentials in it (a
+# private channel's deploy token) stops the build. Unset, the settings say how to install by hand.
+if [[ -n "${KAI_FIREFOX_INSTALL_URL:-}" ]]; then
+  if [[ ! "$KAI_FIREFOX_INSTALL_URL" =~ ^https:// || "$KAI_FIREFOX_INSTALL_URL" =~ ^https://[^/]*@ ]]; then
+    echo "KAI_FIREFOX_INSTALL_URL must be a plain https link with no credentials in a public build" >&2
+    exit 1
+  fi
+  export KAI_FIREFOX_INSTALL_URL
+else
+  unset KAI_FIREFOX_INSTALL_URL
+fi
+
 bash packaging/build-rpm.sh
 
 # The RPM of exactly this version, never a glob over whatever else the directory holds: a manifest

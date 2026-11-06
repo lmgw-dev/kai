@@ -71,14 +71,17 @@
 //! # overlays (§10.1), documented with their types in `crate::widgets::settings`
 //!
 //! [weather]               # overlay_weather's saved places (`crate::widgets::weather`)
-//! places = { home = "52.52,13.405" }   # name = "latitude,longitude"
+//! places = { home = "53.5511,9.9937" }   # name = "latitude,longitude"
 //!
 //! [conversation]          # the Kai conversation (§4)
 //! folder_name = "Kai"     # the Chat folder Kai looks up by name (and creates, plain, when none
 //!                         # exists); names repeat: the ongoing one with the lowest id wins
 //! folder_id = 12          # the folder Kai found: written once it found an ongoing one, removed
-//!                         # when lmgw no longer has it or Kai pairs with another gateway; set by
-//!                         # hand it picks the folder (used while it is an ongoing conversation)
+//!                         # when lmgw no longer has it, Kai pairs with another gateway or a running
+//!                         # Kai's operation changes folder_name; set by hand it picks the folder
+//!                         # (used while it is an ongoing conversation), whatever its name. So a hand
+//!                         # edit of folder_name while Kai is stopped is overridden by the id at the
+//!                         # next start: remove folder_id with it
 //!
 //! [voice]                 # the voice session (§5)
 //! on_at_start = false     # K4: listening is off at login; true opens a session at start
@@ -115,23 +118,27 @@
 //!                         # two reads of an answer (the manifest, the RPM's download); no bound
 //!                         # on a download as a whole
 //!
-//! [window]                # the configuration window (WP21b): its Personality page's requests to lmgw
-//! proxy_max_mb = 64       # the most a request of the page, or lmgw's answer to one, may be (lmgw's
-//!                         # own max_body_mb default); 0: no bound
-//! proxy_timeout_s = 0     # how long lmgw may take to answer one; 0: no bound of Kai's own (lmgw's
-//!                         # own timeouts apply)
+//! [window]                # the requests Kai forwards to lmgw: the configuration window's Personality
+//!                         # page (WP21b) and Firefox's sidebar (kai-firefox §8.2)
+//! proxy_max_mb = 64       # the most a request, or lmgw's answer that Kai takes whole, may be (lmgw's
+//!                         # own max_body_mb default); a streamed answer is not held and has no such
+//!                         # bound; 0: no bound
+//! proxy_timeout_s = 0     # how long lmgw may take to answer one, a streamed answer only until its
+//!                         # head; 0: no bound of Kai's own (lmgw's own timeouts apply)
 //! ```
 //!
 //! `[host]` and `[policy]`, the hosted MCP server's link and K15's policy, are documented with
 //! their types in `crate::host::settings`; `[desktop]`, the provider per capability (K23), in
 //! `crate::desktop::settings`; `[search]`, `find_files`' limit, and `[accessibility]`, the
-//! walk's concurrency and Kai's accessibility switch (`switch`, `wait_ms`), in
+//! walk's concurrency, Kai's accessibility switch (`switch`, `wait_ms`) and a press's wait for
+//! actions not ready yet (`action_settle_ms`), in
 //! `crate::desktop::read`; `[launch]`, what bounds `run_command` (WP16a), in
 //! `crate::desktop::fdo::launch::settings`; `[delegate]`, the delegates' aliases (K25), in
 //! `crate::delegate::settings`; `[routines]`, the routines' switches and `routine_create`'s alias
 //! (K28), in `crate::routines::settings`; `[approvals]`, the approval card and the spoken answer's
 //! phrases (WP19), in `crate::approvals::settings`; `[jobs]`, when a job's result is spoken (WP18),
-//! in `crate::jobs::settings`.
+//! in `crate::jobs::settings`; `[browser]`, which Firefox may link to Kai (kai-firefox's WP1), in
+//! `crate::browser::settings`.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -169,6 +176,7 @@ pub struct Config {
     pub approvals: crate::approvals::settings::ApprovalsConfig,
     pub jobs: crate::jobs::settings::JobsConfig,
     pub window: WindowConfig,
+    pub browser: crate::browser::settings::BrowserConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -528,14 +536,16 @@ impl UpdateConfig {
     }
 }
 
-/// The configuration window (WP21b): what bounds its Personality page's requests to lmgw, which
-/// Kai's scheme handler forwards with the device key (`crate::settings::window::profiles`).
+/// What bounds the requests Kai forwards to lmgw with the device key: the configuration window's
+/// Personality page (WP21b, `crate::settings::window::profiles`) and Firefox's sidebar (kai-firefox
+/// §8.2, `crate::browser::sidebar`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct WindowConfig {
-    /// The most a request of the page, or lmgw's answer to one, may be, in MB; 0: no bound.
+    /// The most a request, or lmgw's answer that Kai takes whole, may be, in MB; a streamed answer
+    /// has no such bound; 0: no bound.
     pub proxy_max_mb: u64,
-    /// How long lmgw may take to answer one, in seconds; 0: no bound.
+    /// How long lmgw may take to answer one (a streamed one: its head), in seconds; 0: no bound.
     pub proxy_timeout_s: u64,
 }
 
@@ -731,6 +741,7 @@ impl Config {
             self.approvals.validate(),
             crate::widgets::settings::validate(&self.overlay),
             self.weather.validate(),
+            self.browser.validate(),
         ] {
             checked.map_err(|(key, value, rule)| ConfigError::Invalid {
                 path: path.to_owned(),

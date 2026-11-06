@@ -3,14 +3,12 @@
 //! The log names the operation, the tool or alias and the caller, never an argument, a prompt or
 //! an answer.
 
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::fs::{FileTypeExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use kai_desktop::contract::Kind;
 use serde_json::{Map, Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::net::UnixStream;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
@@ -39,19 +37,11 @@ pub struct Backend {
     pub scopes: LiveScopes,
 }
 
-/// `/proc/<pid>/cgroup`.
-pub fn proc_cgroup(pid: i32) -> Option<String> {
-    std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()
-}
-
 /// The caller a process in the cgroup `text` is (module doc of `crate::cli`): `routine:<name>` only
 /// in a routine scope Kai started and whose run has not ended (`scopes`), any other `cli`.
 pub fn caller_of(text: &str, scopes: &LiveScopes) -> Caller {
     let prefix = crate::routines::unit_prefix();
-    for line in text.lines() {
-        let Some(path) = line.splitn(3, ':').nth(2) else {
-            continue;
-        };
+    for path in crate::local_socket::cgroup_paths(text) {
         for part in path.split('/') {
             if let Some((name, random)) = part
                 .strip_prefix(&prefix)
@@ -73,102 +63,9 @@ pub fn caller_of(text: &str, scopes: &LiveScopes) -> Caller {
     Caller::Named(Named::cli())
 }
 
-/// The peer of `stream` as a process: a pidfd from `SO_PEERPIDFD` (Linux 6.5 and later), or `None`
-/// on a kernel without it.
-fn peer_pidfd(stream: &UnixStream) -> Option<OwnedFd> {
-    let mut fd: libc::c_int = -1;
-    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-    // SAFETY: SO_PEERPIDFD writes one int (a new file descriptor) to the pointer, which lives on
-    // this frame, and its length to `len`.
-    let r = unsafe {
-        libc::getsockopt(
-            stream.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERPIDFD,
-            (&raw mut fd).cast(),
-            &raw mut len,
-        )
-    };
-    // SAFETY: on success the kernel made `fd` for us; nothing else owns it.
-    (r == 0 && fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd) })
-}
-
-/// The pid a pidfd names now (`Pid:` in its fdinfo); `None` once the process is gone.
-fn pidfd_pid(pidfd: &OwnedFd) -> Option<i32> {
-    let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", pidfd.as_raw_fd())).ok()?;
-    info.lines()
-        .find_map(|l| l.strip_prefix("Pid:"))
-        .and_then(|p| p.trim().parse::<i32>().ok())
-        .filter(|p| *p > 0)
-}
-
-/// The process of `pidfd` has not exited (a pidfd polls readable once it has).
-fn pidfd_alive(pidfd: &OwnedFd) -> bool {
-    let mut p = libc::pollfd {
-        fd: pidfd.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    // SAFETY: one pollfd on this frame, no wait.
-    let r = unsafe { libc::poll(&raw mut p, 1, 0) };
-    r == 0
-}
-
-/// The peer's cgroup file, read for the process that connected (module doc of `crate::cli`). With a
-/// pidfd the read is bound to that process: its pid is read from the pidfd, the cgroup file, then
-/// the pidfd says the process is still there, so the pid was not another's. Without one (an older
-/// kernel) it is `SO_PEERCRED`'s pid, which a process that exits at once could hand to another in
-/// the moment before the read; `None`: unknown (the caller `cli`).
-fn peer_cgroup(
-    stream: &UnixStream,
-    cred_pid: Option<i32>,
-    cgroup_of: fn(i32) -> Option<String>,
-) -> Option<String> {
-    match peer_pidfd(stream) {
-        Some(pidfd) => {
-            let pid = pidfd_pid(&pidfd)?;
-            let text = cgroup_of(pid)?;
-            pidfd_alive(&pidfd).then_some(text)
-        }
-        None => cred_pid.and_then(cgroup_of),
-    }
-}
-
-/// Removes the socket when the server ends (Kai quits).
-struct Socket(PathBuf);
-
-impl Drop for Socket {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
-
-/// The socket at `path`: its folder made (0700 when Kai makes it), an old socket of an earlier Kai
-/// removed (one Kai runs per session), mode 0600.
-pub fn bind(path: &Path) -> std::io::Result<UnixListener> {
-    if let Some(parent) = path.parent()
-        && !parent.exists()
-    {
-        std::fs::create_dir_all(parent)?;
-        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
-    }
-    if let Ok(m) = std::fs::symlink_metadata(path) {
-        if !m.file_type().is_socket() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::AlreadyExists,
-                "something that is not a socket is in its place",
-            ));
-        }
-        std::fs::remove_file(path)?;
-    }
-    let listener = UnixListener::bind(path)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    Ok(listener)
-}
-
 /// Serves the CLI at `path` until Kai's runtime ends.
 pub async fn serve(path: PathBuf, backend: Backend) {
-    let listener = match bind(&path) {
+    let listener = match crate::local_socket::bind(&path) {
         Ok(l) => l,
         Err(e) => {
             tracing::error!(
@@ -178,7 +75,7 @@ pub async fn serve(path: PathBuf, backend: Backend) {
             return;
         }
     };
-    let _socket = Socket(path.clone());
+    let _socket = crate::local_socket::Unlink(path.clone());
     tracing::info!(socket = %path.display(), "cli: serving kai tool and kai model");
     loop {
         match listener.accept().await {
@@ -219,7 +116,7 @@ pub async fn connection(stream: UnixStream, backend: Backend) {
     };
     // SAFETY: getuid cannot fail.
     let me = unsafe { libc::getuid() };
-    let caller = peer_cgroup(&stream, cred.pid(), backend.cgroup_of)
+    let caller = crate::local_socket::peer_read(&stream, cred.pid(), backend.cgroup_of)
         .map(|c| caller_of(&c, &backend.scopes))
         .unwrap_or_else(|| Caller::Named(Named::cli()));
     let (rd, mut wr) = stream.into_split();
@@ -503,37 +400,5 @@ async fn model(backend: &Backend, alias: &str, prompt: &str, cancel: Cancellatio
             a
         }
         Err(e) => Answer::failed(e),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The peer's pidfd names the process that connected and says whether it is still there.
-    #[tokio::test]
-    async fn the_peer_is_read_through_its_pidfd() {
-        let (a, _b) = UnixStream::pair().unwrap();
-        let Some(pidfd) = peer_pidfd(&a) else {
-            eprintln!("skipped: this kernel has no SO_PEERPIDFD (Linux 6.5)");
-            return;
-        };
-        assert_eq!(pidfd_pid(&pidfd), Some(std::process::id() as i32));
-        assert!(pidfd_alive(&pidfd));
-        let cgroup = |pid: i32| Some(format!("cgroup of {pid}"));
-        assert_eq!(
-            peer_cgroup(&a, None, cgroup),
-            Some(format!("cgroup of {}", std::process::id()))
-        );
-        // A process that is gone: its pidfd says so.
-        let mut child = std::process::Command::new("true").spawn().unwrap();
-        // SAFETY: pidfd_open on our own child's pid, which is not reaped until `wait`.
-        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id() as libc::pid_t, 0) };
-        assert!(fd >= 0);
-        // SAFETY: the syscall made the descriptor for us.
-        let fd = unsafe { OwnedFd::from_raw_fd(fd as i32) };
-        child.wait().unwrap();
-        assert!(!pidfd_alive(&fd));
-        assert_eq!(pidfd_pid(&fd), None);
     }
 }

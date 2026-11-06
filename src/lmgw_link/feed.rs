@@ -521,6 +521,7 @@ impl Translate {
         By {
             own: self.own.as_deref() == Some(name.as_str()),
             name,
+            sidebar: false,
         }
     }
 
@@ -532,7 +533,7 @@ impl Translate {
                 .collect(),
             turns: turns
                 .into_iter()
-                .map(|t| (t.thread_id, self.by(t.by)))
+                .map(|t| (t.thread_id, self.by(t.by), t.voice))
                 .collect(),
         })
     }
@@ -606,12 +607,13 @@ impl Translate {
                 ])
             }
             FeedEvent::Hold(h) => {
-                tracing::info!(active = h.active, fallback = ?h.fallback_alias, "lmgw link: hold");
+                tracing::info!(active = h.active, "lmgw link: hold");
                 Step::Events(vec![LinkEvent::Hold { active: h.active }])
             }
             FeedEvent::TurnStarted(t) => fact(FeedFact::TurnStarted {
                 thread_id: t.thread_id,
                 by: self.by(t.by),
+                voice: t.voice,
             }),
             FeedEvent::TurnDone(t) => fact(FeedFact::TurnDone {
                 thread_id: t.thread_id,

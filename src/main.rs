@@ -11,6 +11,7 @@
 mod approvals;
 mod audio;
 mod autostart;
+mod browser;
 mod cli;
 mod config;
 mod conversation;
@@ -25,6 +26,7 @@ mod launch;
 #[cfg(feature = "live-test")]
 mod live_test;
 mod lmgw_link;
+mod local_socket;
 mod logging;
 mod notify;
 mod nvidia;
@@ -173,7 +175,8 @@ fn main() -> ExitCode {
 }
 
 /// The hosted server (WP8): its providers, K15's policy from the configuration, the GTK dialog for
-/// its confirmations. The `[policy]` settings that name no tool come with it, for the tooltip.
+/// its confirmations. The `[policy]` settings that name no tool come with it, for the tooltip, and
+/// Kai for Firefox's links, which `browser.sock` fills and the host lists tools by.
 fn hosted_server(
     config: &Config,
     cmds: mpsc::UnboundedSender<Command>,
@@ -181,8 +184,15 @@ fn hosted_server(
     bus: host::registry::SessionBus,
     screen: screen_lock::ScreenLock,
     a11y: desktop::fdo::atspi::switch::A11ySwitch,
-) -> (host::HostLink, Vec<String>) {
+    state_dir: Option<std::path::PathBuf>,
+) -> (
+    host::HostLink,
+    Vec<String>,
+    browser::Links,
+    host::policy::SharedPolicy,
+) {
     let (changes, changed) = host::registry::Changes::new();
+    let browser = browser::Links::new(changes.clone());
     let (creds_tx, creds) = watch::channel(None);
     let deps = host::registry::Deps {
         cmds,
@@ -190,27 +200,30 @@ fn hosted_server(
         bus,
         config: Arc::new(config.clone()),
         creds,
-        policy: Arc::new(std::sync::RwLock::new(host::policy::Policy::new(
-            &config.policy,
-        ))),
+        policy: Arc::new(std::sync::RwLock::new(host::policy::Policy::of(config))),
         changes,
         screen,
         a11y,
         jobs: jobs::Jobs::default(),
+        browser: browser.clone(),
+        state_dir,
     };
     let link = host::HostLink::new(
         host::link::LinkSettings::from_config(config),
         deps.policy.clone(),
         host::registry::providers(&deps),
         changed,
-        Arc::new(host::confirm::Dialog(ui)),
+        Arc::new(approvals::asked::VoiceConfirmer::to_core(
+            Arc::new(host::confirm::Dialog(ui)),
+            deps.cmds.clone(),
+        )),
         creds_tx,
         deps.screen.clone(),
         deps.jobs.clone(),
     );
     link.set_core(deps.cmds.clone());
     let notes = link.unknown_policy_names();
-    (link, notes)
+    (link, notes, browser, deps.policy)
 }
 
 /// `kai --tool-list <label>`: the tool list this build offers with this configuration's policy,
@@ -227,13 +240,14 @@ fn tool_list(label: &str) -> ExitCode {
         }
     };
     // `[policy]` settings that name no tool are logged by the host as it is built.
-    let (host, _) = hosted_server(
+    let (host, _, _, _) = hosted_server(
         &config,
         mpsc::unbounded_channel().0,
         async_channel::unbounded().0,
         host::registry::SessionBus::lazy(config.dbus.timeout()),
         screen_lock::ScreenLock::default(),
         desktop::fdo::atspi::switch::A11ySwitch::inert(),
+        None,
     );
     println!("{}", host.tool_list_json(label));
     ExitCode::SUCCESS
@@ -487,7 +501,16 @@ fn run(link_on_stdin: bool, nvidia: nvidia::Decision) -> ExitCode {
         }
     }
     let update_config = config.update.clone();
+    let browser_scopes = config.browser.peer_scopes.clone();
     let runtime_dir = paths.runtime_dir.clone();
+    // Kai's runtime folder is private (0700): made so, or tightened when an older Kai made it with
+    // the umask's mode. Its sockets, the echo-cancel child's configuration and a download live there.
+    if let Err(e) = paths::private_dir(&runtime_dir) {
+        tracing::warn!(
+            "cannot make Kai's runtime folder {} private (mode 0700): {e}",
+            runtime_dir.display()
+        );
+    }
     let config_file = paths.config_file.clone();
     // The owner's rules of 2026-10-09: Kai is not active on a locked screen
     // (`screen_lock`), and Kai's accessibility switch (`desktop::fdo::atspi::switch`), whose
@@ -504,13 +527,14 @@ fn run(link_on_stdin: bool, nvidia: nvidia::Decision) -> ExitCode {
         let a11y = a11y.clone();
         async move { a11y.recover().await }
     });
-    let (hosted, policy_notes) = hosted_server(
+    let (hosted, policy_notes, browser_links, host_policy) = hosted_server(
         &config,
         cmd_tx.clone(),
         ui_tx.clone(),
         host::registry::SessionBus::connected(bus.clone(), dbus_timeout),
         screen.clone(),
         a11y.clone(),
+        Some(paths.state_dir.clone()),
     );
     let mut core = Core::new(
         config,
@@ -543,11 +567,47 @@ fn run(link_on_stdin: bool, nvidia: nvidia::Decision) -> ExitCode {
                 exe_dir: exe.parent().map(Path::to_path_buf),
                 scopes: routines::LiveScopes::default(),
             },
-            config_file,
+            config_file: config_file.clone(),
             settings: routines::Settings::Core(cmd_tx.clone()),
         },
         socket,
         dbus_timeout,
+    ));
+    // The warning of kai-firefox design §8.3 follows how many Firefox extensions are linked.
+    rt.spawn(browser::warning::forward(
+        browser_links.linked(),
+        cmd_tx.clone(),
+    ));
+    // Kai for Firefox's socket (kai-firefox design §4.4), its peer scopes read again at each
+    // connection; the sidebar's requests go to the core, which sends them over the device link.
+    let sidebar: browser::sidebar::Proxy = {
+        let cmds = cmd_tx.clone();
+        std::sync::Arc::new(move |relay| {
+            if let Err(mpsc::error::SendError(Command::Sidebar(r))) =
+                cmds.send(Command::Sidebar(Box::new(relay)))
+            {
+                r.reply.refuse(503, "kai_quitting", "Kai is quitting");
+            }
+        })
+    };
+    rt.spawn(browser::server::serve(
+        paths::browser_socket(&runtime_dir),
+        browser::server::Server {
+            links: browser_links,
+            config_file: Some(config_file),
+            scopes: browser_scopes,
+            peer_of: browser::peer::proc_peer,
+            sidebar: Some(sidebar),
+            // The sidebar's site strip and "Attach this page" ask the rules the tools apply.
+            sites: Some(std::sync::Arc::new(move || {
+                host_policy
+                    .read()
+                    .expect("never poisoned")
+                    .browser()
+                    .sites
+                    .clone()
+            })),
+        },
     ));
     // K26's jobs (WP18): the host's table, for the core's tools, the voice and the tray.
     let jobs = hosted.jobs();

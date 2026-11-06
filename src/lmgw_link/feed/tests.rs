@@ -21,7 +21,7 @@ fn hello(name: &str, keepalive_s: u32) -> String {
     let h = json!({"epoch": "e1", "cursor": "e1:4:aa", "keepalive_s": keepalive_s,
         "retention_days": 7, "principal": {"kind": "device", "name": name},
         "hosts_label": "kai", "self_admin": "read_only",
-        "hold": {"active": false, "fallback_alias": null},
+        "hold": {"active": false},
         "voice": [{"thread_id": 812, "by": "device 'phone'"}],
         "turns": [{"thread_id": 812, "by": format!("device '{name}'"), "voice": true}]});
     format!("event: hello\ndata: {h}\n\n")
@@ -200,6 +200,7 @@ fn by(name: &str, own: bool) -> By {
     By {
         name: name.into(),
         own,
+        sidebar: false,
     }
 }
 
@@ -237,20 +238,20 @@ async fn hello_names_the_device_marks_kais_own_and_a_drop_resumes_with_the_curso
         next(&mut r.events).await,
         LinkEvent::Fact(FeedFact::Live {
             voice: vec![(812, by("device 'phone'", false))],
-            turns: vec![(812, by("device 'desktop'", true))],
+            turns: vec![(812, by("device 'desktop'", true), true)],
         }),
         "Kai's own turn is marked own"
     );
     s.write_all(
         b"id: e1:9:bb\nevent: turn.started\ndata: {\"thread_id\":812,\"by\":\"the dashboard\",\
-          \"voice\":false}\n\n: keep-alive\n\nevent: hold\ndata: {\"active\":true,\
-          \"fallback_alias\":null}\n\n",
+          \"voice\":false}\n\n: keep-alive\n\nevent: hold\ndata: {\"active\":true}\n\n",
     )
     .await
     .unwrap();
     assert_eq!(
         next(&mut r.events).await,
         LinkEvent::Fact(FeedFact::TurnStarted {
+            voice: false,
             thread_id: 812,
             by: by("the dashboard", false)
         })
@@ -743,7 +744,7 @@ fn state_resync_turns_voice_and_folder_current() {
     };
     assert_eq!(evs.len(), 2);
     // A `state` says the device's admin-tools level as it is now (lmgw sends one after every move).
-    let state = json!({"self_admin": "full", "hold": {"active": true, "fallback_alias": "cloud/x"},
+    let state = json!({"self_admin": "full", "hold": {"active": true},
         "voice": [], "turns": [{"thread_id": 5, "by": "device 'desktop'", "voice": false}],
         "reason": null});
     assert_eq!(
@@ -753,7 +754,7 @@ fn state_resync_turns_voice_and_folder_current() {
             LinkEvent::AdminTools(AdminLevel::Full),
             LinkEvent::Fact(FeedFact::Live {
                 voice: vec![],
-                turns: vec![(5, by("device 'desktop'", true))]
+                turns: vec![(5, by("device 'desktop'", true), false)]
             })
         ])
     );
@@ -1120,7 +1121,7 @@ async fn an_unreadable_event_reloads_as_for_resync_and_an_unknown_one_is_skipped
     s.write_all(
         b"id: e1:5:cc\nevent: thread.pinned\ndata: {\"thread_id\":5}\n\n\
           id: e1:6:dd\nevent: thread.updated\ndata: [1]\n\n\
-          event: hold\ndata: {\"active\":true,\"fallback_alias\":null}\n\n",
+          event: hold\ndata: {\"active\":true}\n\n",
     )
     .await
     .unwrap();

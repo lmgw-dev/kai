@@ -473,10 +473,41 @@ fn the_operations_are_serde() {
         },
     )
     .unwrap();
+    let mut wire = serde_json::to_value(&out.response).unwrap();
+    let meta = wire["entry"]
+        .as_object_mut()
+        .unwrap()
+        .remove("meta")
+        .unwrap();
     assert_eq!(
-        serde_json::to_value(&out.response).unwrap(),
+        wire,
         json!({"kind": "entry", "entry": {"key": "voice.grace_s", "value": 30, "set": true}})
     );
+    assert_eq!(
+        meta,
+        json!({
+            "section": "voice",
+            "section_label": "Voice",
+            "label": "Keep a hold-to-talk session open",
+            "help": "With listening off, a session you opened by holding the key closes this \
+                     long after the reply.",
+            "unit": "s",
+            "control": {"kind": "number", "min": 0},
+            "advanced": false,
+            "order": meta["order"],
+            "default": 30,
+        })
+    );
+}
+
+/// The words a choice entry offers (empty for any other control).
+fn words(e: &Entry) -> Vec<String> {
+    match &e.meta.control {
+        catalog::Control::Choice { options, .. } => {
+            options.iter().map(|o| o.word.clone()).collect()
+        }
+        _ => Vec::new(),
+    }
 }
 
 /// A fixed-word setting carries the words its type takes; any other carries none.
@@ -489,7 +520,9 @@ fn an_anchor_key_carries_the_nine_positions_and_a_text_key_none() {
         .map(|(_, w)| *w)
         .collect();
     assert_eq!(weather.value, json!("top-right"));
-    assert_eq!(weather.choices, positions);
+    assert_eq!(words(&weather), positions);
+    assert_eq!(weather.meta.label, "Position");
+    assert_eq!(weather.meta.group.as_deref(), Some("Weather card"));
     // A number, a text, an unset text and an unset number take any value of their type.
     for key in [
         "voice.grace_s",
@@ -499,20 +532,22 @@ fn an_anchor_key_carries_the_nine_positions_and_a_text_key_none() {
         "overlay.ring_over_fullscreen",
         "launch.terminal",
     ] {
-        assert_eq!(entry(&file, key).choices, Vec::<String>::new(), "{key}");
+        assert_eq!(words(&entry(&file, key)), Vec::<String>::new(), "{key}");
     }
     // An unset optional enum has its words too, and a map's entry has its value type's.
     assert_eq!(
-        entry(&file, "desktop.capture").choices,
+        words(&entry(&file, "desktop.capture")),
         ["plasma", "fdo", "none"]
     );
     set(&file, "policy.tools.run_command", "allow").unwrap();
     assert_eq!(
-        entry(&file, "policy.tools.run_command").choices,
+        words(&entry(&file, "policy.tools.run_command")),
         ["allow", "allow_trusted", "confirm", "deny", "off"]
     );
-    // On the wire only where there are words.
+    // On the wire as the catalog's words, a label and a unit.
     let wire = serde_json::to_value(entry(&file, "voice.grace_s")).unwrap();
+    assert_eq!(wire["meta"]["unit"], json!("s"), "{wire}");
+    assert_eq!(wire["meta"]["control"]["kind"], json!("number"), "{wire}");
     assert!(wire.get("choices").is_none(), "{wire}");
 }
 
@@ -527,12 +562,13 @@ fn every_enum_key_has_its_words_and_set_takes_each() {
     else {
         panic!("not a list");
     };
-    let with: Vec<&Entry> = entries.iter().filter(|e| !e.choices.is_empty()).collect();
+    let with: Vec<&Entry> = entries.iter().filter(|e| !words(e).is_empty()).collect();
     let keys: Vec<&str> = with.iter().map(|e| e.key.as_str()).collect();
     let mut expected = vec![
         "accessibility.switch",
         "approvals.anchor",
         "audio.echo_mode",
+        "browser.trusted_press",
         "delegate.screenshots",
         "overlay.app.position",
         "overlay.emote.position",
@@ -553,7 +589,7 @@ fn every_enum_key_has_its_words_and_set_takes_each() {
     expected.sort_unstable();
     assert_eq!(sorted, expected);
     for e in with {
-        for word in &e.choices {
+        for word in &words(e) {
             let out = set(&file, &e.key, word);
             assert!(out.is_ok(), "{} = {word}: {out:?}", e.key);
             assert_eq!(entry(&file, &e.key).value, json!(word), "{}", e.key);

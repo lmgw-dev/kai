@@ -1,4 +1,4 @@
-# Public releases, one per pushed tag v<X.Y.Z>. Development happens on a private GitLab;
+# Public releases, one per pushed tag v<X.Y.Z>. Development happens in a private repository;
 # scripts/publish-github.sh brings it here as one squashed commit per publish, and with --tag puts
 # the tag on that public commit. A push to main alone only runs ci.yml.
 #
@@ -112,6 +112,12 @@ jobs:
       # A dispatch checks out the tag's own scripts, which read the ref from GITHUB_REF*, GITHUB_SHA
       # (those of a tag push): state them for the tag being built (GITHUB_ENV cannot set GITHUB_*).
       - name: Build the RPM and latest.json
+        env:
+          # The link the settings window's "Install Kai for Firefox" opens: the public releases
+          # channel's signed XPI, a repository variable (Settings, Secrets and variables, Actions,
+          # Variables) the owner sets. Unset or empty, the build has no link and its settings say
+          # how to install by hand. packaging/gh-build.sh refuses a link with credentials in it.
+          KAI_FIREFOX_INSTALL_URL: ${{ vars.KAI_FIREFOX_INSTALL_URL }}
         run: |
           GITHUB_SHA="$(git rev-parse HEAD)"
           export GITHUB_SHA GITHUB_REF_TYPE=tag GITHUB_REF_NAME="$KAI_RELEASE_TAG" \

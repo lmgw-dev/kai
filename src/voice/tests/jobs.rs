@@ -64,9 +64,11 @@ impl Rig {
         let by = By {
             name: "the dashboard".into(),
             own: false,
+            sidebar: false,
         };
         self.feed.fact(if running {
             FeedFact::TurnStarted {
+                voice: false,
                 thread_id: thread,
                 by,
             }
@@ -88,13 +90,18 @@ async fn a_result_in_the_bound_session_is_spoken_after_the_quiet_wait() {
     r.feed.fact(FeedFact::TaskDone(done(812, 41)));
     sleep(QUIET - Duration::from_millis(200)).await;
     assert!(job_creates(&r, 0).is_empty(), "not before jobs.quiet_ms");
+    assert!(!r.jobs.continuing());
     r.until_mock("the job's create", |m| {
         m.socket(0, |s| s.tagged.iter().any(|t| t.starts_with("kai_job_")))
     })
     .await;
+    // While the continuation runs the job table says so: its calls are no turn of the owner's
+    // (kai-firefox WP10b's review, M3).
+    assert!(r.jobs.continuing());
     r.until(|m| m.voice.shown == VoiceShown::Speaking).await;
     r.until(|m| m.voice.shown == VoiceShown::Quiet).await;
     sleep(Duration::from_secs(10)).await;
+    assert!(!r.jobs.continuing(), "its response ended");
     assert_eq!(job_creates(&r, 0), ["kai_job_1"]);
     r.mock.socket(0, |s| {
         assert_eq!(s.count("response.create"), 1, "{:?}", s.kinds);
@@ -612,6 +619,7 @@ async fn another_thread_or_a_held_one_is_notified() {
         by: By {
             name: "the phone".into(),
             own: false,
+            sidebar: false,
         },
     });
     r.feed.fact(FeedFact::TaskDone(done(812, 52)));

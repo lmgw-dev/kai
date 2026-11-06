@@ -3,7 +3,9 @@
 
 use gloo_net::http::Request;
 
-use crate::wire::{self, Conversation, Refused, RemoteControl, ToolInfo};
+use crate::wire::{
+    self, Browser, Conversation, Devices, Notices, Refused, RemoteControl, ToolInfo,
+};
 
 /// A failed call's text for the owner: the refusal's own sentence, else what went wrong.
 fn failure(status: u16, body: &str) -> String {
@@ -37,6 +39,21 @@ pub async fn apply(request: &wire::Request) -> Result<wire::Response, String> {
 /// `GET /api/tools`: the tools the contract has.
 pub async fn tools() -> Result<Vec<ToolInfo>, String> {
     let response = Request::get("/api/tools")
+        .send()
+        .await
+        .map_err(|e| format!("Kai did not answer: {e}"))?;
+    let status = response.status();
+    let text = response.text().await.map_err(|e| e.to_string())?;
+    if status == 200 {
+        serde_json::from_str(&text).map_err(|e| format!("an answer the page does not read: {e}"))
+    } else {
+        Err(failure(status, &text))
+    }
+}
+
+/// `GET /api/notices`: the lines the window shows above its pages.
+pub async fn notices() -> Result<Notices, String> {
+    let response = Request::get("/api/notices")
         .send()
         .await
         .map_err(|e| format!("Kai did not answer: {e}"))?;
@@ -88,5 +105,65 @@ pub async fn remote_control(forget: bool) -> Result<RemoteControl, String> {
         serde_json::from_str(&text).map_err(|e| format!("an answer the page does not read: {e}"))
     } else {
         Err(failure(status, &text))
+    }
+}
+
+/// `GET /api/browser`, or (`install`) `POST /api/browser/install`: what the Firefox section shows,
+/// or the click that opens the extension's link in the browser.
+pub async fn browser(install: bool) -> Result<Browser, String> {
+    let request = if install {
+        // text/plain and no body: a simple request, as `apply`'s.
+        Request::post("/api/browser/install")
+            .header("Content-Type", "text/plain")
+            .body("")
+            .map_err(|e| e.to_string())?
+    } else {
+        Request::get("/api/browser")
+            .build()
+            .map_err(|e| e.to_string())?
+    };
+    let response = request
+        .send()
+        .await
+        .map_err(|e| format!("Kai did not answer: {e}"))?;
+    let status = response.status();
+    let text = response.text().await.map_err(|e| e.to_string())?;
+    if status == 200 {
+        serde_json::from_str(&text).map_err(|e| format!("an answer the page does not read: {e}"))
+    } else {
+        Err(failure(status, &text))
+    }
+}
+
+/// `GET /api/devices`: the microphones, speakers and screens Kai can list, for the pickers.
+pub async fn devices() -> Result<Devices, String> {
+    let response = Request::get("/api/devices")
+        .send()
+        .await
+        .map_err(|e| format!("Kai did not answer: {e}"))?;
+    let status = response.status();
+    let text = response.text().await.map_err(|e| e.to_string())?;
+    if status == 200 {
+        serde_json::from_str(&text).map_err(|e| format!("an answer the page does not read: {e}"))
+    } else {
+        Err(failure(status, &text))
+    }
+}
+
+/// `POST /api/restart`: "Restart Kai now". Kai quits as at Quit and starts again; this window
+/// goes with it.
+pub async fn restart() -> Result<(), String> {
+    let response = Request::post("/api/restart")
+        .header("Content-Type", "text/plain")
+        .body("")
+        .map_err(|e| e.to_string())?
+        .send()
+        .await
+        .map_err(|e| format!("Kai did not answer: {e}"))?;
+    let status = response.status();
+    if status == 200 {
+        Ok(())
+    } else {
+        Err(failure(status, &response.text().await.unwrap_or_default()))
     }
 }

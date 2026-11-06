@@ -12,6 +12,7 @@ mod own_windows;
 mod probe;
 pub(crate) mod read;
 mod script;
+mod sites;
 
 pub(crate) use bus::temp_dir;
 
@@ -23,19 +24,43 @@ use kai_desktop::caps::launch::{Launch, Opening, Ran, RunBounds, Started};
 use kai_desktop::caps::media::{Control, Media, Playback, Player};
 use kai_desktop::caps::notify::{Asked, Dnd, Notify};
 use kai_desktop::caps::session::{Battery, Charge, Features, Lock, NightLight, Session};
-use kai_desktop::caps::windows::{Action, Done, Output, Snapshot, Window, Windows};
+use kai_desktop::caps::windows::{Action, Done, Output, Placement, Snapshot, Window, Windows};
 use kai_desktop::caps::{Failure, Fut};
 
 use super::tools::Services;
 use crate::host::registry::Entry;
 
 /// Windows from a fixed snapshot; the actions it was asked for are recorded; `fail` answers every
-/// call with that failure.
+/// call with that failure. `placed` answers `Windows::placed` (none: the trait's refusal), and
+/// how often it was asked is counted. `live`, once a test sets it, is the snapshot from then on
+/// (a window that changes while a tool runs). `effects` are the compositor's running effects.
 #[derive(Clone, Default)]
 pub struct FakeWindows {
     pub snap: Snapshot,
     pub acts: Arc<Mutex<Vec<(String, Action)>>>,
     pub fail: Option<Failure>,
+    pub placed: Option<Placement>,
+    pub placed_asked: Arc<std::sync::atomic::AtomicUsize>,
+    pub live: Arc<Mutex<Option<Snapshot>>>,
+    pub effects: Arc<Mutex<Vec<String>>>,
+}
+
+impl FakeWindows {
+    /// The snapshot now: `live` once set, else `snap`.
+    pub fn now(&self) -> Snapshot {
+        self.live
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| self.snap.clone())
+    }
+
+    /// Changes the snapshot from now on.
+    pub fn change(&self, f: impl FnOnce(&mut Snapshot)) {
+        let mut s = self.now();
+        f(&mut s);
+        *self.live.lock().unwrap() = Some(s);
+    }
 }
 
 impl Windows for FakeWindows {
@@ -43,7 +68,16 @@ impl Windows for FakeWindows {
         Box::pin(async move {
             match &self.fail {
                 Some(f) => Err(f.clone()),
-                None => Ok(self.snap.clone()),
+                None => Ok(self.now()),
+            }
+        })
+    }
+
+    fn effects(&self) -> Fut<'_, Vec<String>> {
+        Box::pin(async move {
+            match &self.fail {
+                Some(f) => Err(f.clone()),
+                None => Ok(self.effects.lock().unwrap().clone()),
             }
         })
     }
@@ -58,6 +92,20 @@ impl Windows for FakeWindows {
                 Action::ToggleMaximize => "maximized".to_owned(),
                 _ => "done".to_owned(),
             })
+        })
+    }
+
+    fn placed(&self) -> Fut<'_, Placement> {
+        Box::pin(async move {
+            self.placed_asked
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match (&self.fail, &self.placed) {
+                (Some(f), _) => Err(f.clone()),
+                (None, Some(p)) => Ok(p.clone()),
+                (None, None) => Err(Failure::Refused(
+                    "the desktop does not say where its windows are".into(),
+                )),
+            }
         })
     }
 }

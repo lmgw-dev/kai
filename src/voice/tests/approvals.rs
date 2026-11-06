@@ -61,7 +61,7 @@ impl Card {
     }
 
     /// A click on the card (as the GTK side sends it once armed).
-    fn click(&mut self, approve: bool) {
+    pub(super) fn click(&mut self, approve: bool) {
         let Some(Some((m, events))) = self.now() else {
             panic!("no card shown")
         };
@@ -250,10 +250,12 @@ async fn a_feed_call_is_answered_on_the_card_through_the_route() {
     let mut card = Card::default();
     let r = rig("").await;
     r.feed.fact(FeedFact::TurnStarted {
+        voice: false,
         thread_id: 5,
         by: By {
             name: "device 'phone'".into(),
             own: false,
+            sidebar: false,
         },
     });
     r.feed
@@ -590,5 +592,200 @@ async fn the_gate_holds_until_the_verdicts_response_was_created() {
         status: "completed".into(),
         reason: None,
     });
+    r.quit().await;
+}
+
+/// kai-firefox WP10b: one of Kai's own questions (`Command::Ask`) is spoken in Kai's voice while
+/// its call waits, holds back the session's audio, and the talk key answers it once it was spoken,
+/// through `…/transcribe` of Kai's own thread: "Ja." is a yes. A press while it is spoken only
+/// stops it; the question's end lets the audio flow again. The card shows nothing of it.
+#[tokio::test(start_paused = true)]
+async fn kais_own_question_is_spoken_and_the_talk_key_answers_it() {
+    let _ = test_cards();
+    let mut card = Card::default();
+    let mut r = rig("").await;
+    r.listening_on().await;
+    sleep(Duration::from_millis(300)).await;
+    let (answer, mut answered) = tokio::sync::oneshot::channel();
+    let over = tokio_util::sync::CancellationToken::new();
+    r.send(Command::Ask(Box::new(crate::approvals::asked::Ask {
+        id: "kai_ask_1".into(),
+        words: crate::voice::speak::Words::new(
+            "May Kai press the link? Yes or no? The page calls the link: Order now",
+            "Darf Kai den Link drücken? Ja oder nein? Die Seite nennt den Link: Order now",
+        ),
+        answer,
+        over: over.clone(),
+    })));
+    // Spoken without the quiet moment's hold-off: the question waits for nothing but itself.
+    r.until_mock("the question's speech", |m| {
+        m.with(|s| s.speeches.iter().any(|(_, t)| t == "Yes or no?"))
+    })
+    .await;
+    let speeches: Vec<String> = r
+        .mock
+        .with(|s| s.speeches.iter().map(|(_, t)| t.clone()).collect());
+    assert!(
+        speeches.starts_with(&[
+            "May Kai press the link?".to_owned(),
+            "Yes or no?".to_owned()
+        ]),
+        "one request per sentence, Kai's words first: {speeches:?}"
+    );
+    let appended = r.mock.socket(0, |s| s.appended);
+    // 70 characters at the mock's 20 ms each: spoken to its end within 3 s.
+    sleep(Duration::from_secs(3)).await;
+    assert!(
+        r.mock.with(|s| s
+            .speeches
+            .iter()
+            .any(|(_, t)| t.starts_with("The page calls"))),
+        "the page's text last"
+    );
+    assert_eq!(
+        r.mock.socket(0, |s| s.appended),
+        appended,
+        "no audio to the session while Kai's question waits"
+    );
+    // Spoken to its end: the talk key answers it.
+    r.send(Command::Talk(true));
+    sleep(Duration::from_millis(600)).await;
+    r.send(Command::Talk(false));
+    let yes = tokio::time::timeout(Duration::from_secs(10), &mut answered)
+        .await
+        .expect("an answer");
+    assert_eq!(yes, Ok(true));
+    let (thread, _) = r.mock.with(|s| s.transcribed[0]);
+    assert_eq!(thread, 812, "in Kai's own thread");
+    assert!(
+        r.mock.with(|s| s.approvals_sent.is_empty()),
+        "no approval of lmgw's"
+    );
+    assert!(card.now().is_none_or(|c| c.is_none()), "no card");
+    // The asker ends it: the audio flows again.
+    over.cancel();
+    sleep(Duration::from_millis(300)).await;
+    let now = r.mock.socket(0, |s| s.appended);
+    sleep(Duration::from_millis(300)).await;
+    assert!(r.mock.socket(0, |s| s.appended) > now);
+    r.quit().await;
+}
+
+/// One of Kai's own questions as the core's `Command::Ask` hands it over: its answer and its end.
+fn kais_question(
+    r: &Rig,
+    id: &str,
+    en: &str,
+) -> (
+    tokio::sync::oneshot::Receiver<bool>,
+    tokio_util::sync::CancellationToken,
+) {
+    let (answer, answered) = tokio::sync::oneshot::channel();
+    let over = tokio_util::sync::CancellationToken::new();
+    r.send(Command::Ask(Box::new(crate::approvals::asked::Ask {
+        id: id.into(),
+        words: crate::voice::speak::Words::new(en, en),
+        answer,
+        over: over.clone(),
+    })));
+    (answered, over)
+}
+
+/// kai-firefox WP10b's review (M2): two of Kai's own questions wait: the first is spoken, the
+/// second only once the first is over, and the talk key answers the one heard.
+#[tokio::test(start_paused = true)]
+async fn two_of_kais_questions_are_spoken_one_at_a_time() {
+    let _ = test_cards();
+    let mut r = rig("").await;
+    r.listening_on().await;
+    sleep(Duration::from_millis(300)).await;
+    let (mut first, first_over) = kais_question(&r, "kai_ask_1", "First question? Yes or no?");
+    let (mut second, _second_over) = kais_question(&r, "kai_ask_2", "Second question? Yes or no?");
+    sleep(Duration::from_secs(3)).await;
+    let spoken = |r: &Rig, t: &str| r.mock.with(|s| s.speeches.iter().any(|(_, x)| x == t));
+    assert!(spoken(&r, "First question?"));
+    assert!(!spoken(&r, "Second question?"), "it waits for the first");
+    // The talk key answers the first: yes ("Ja.", the mock's transcript).
+    r.send(Command::Talk(true));
+    sleep(Duration::from_millis(700)).await;
+    r.send(Command::Talk(false));
+    let yes = tokio::time::timeout(Duration::from_secs(10), &mut first)
+        .await
+        .expect("an answer");
+    assert_eq!(yes, Ok(true));
+    assert!(second.try_recv().is_err());
+    // Its asker ends it: the second is spoken now, and the next press answers it.
+    first_over.cancel();
+    r.until_mock("the second question", |m| {
+        m.with(|s| s.speeches.iter().any(|(_, x)| x == "Second question?"))
+    })
+    .await;
+    sleep(Duration::from_secs(3)).await;
+    r.send(Command::Talk(true));
+    sleep(Duration::from_millis(700)).await;
+    r.send(Command::Talk(false));
+    let yes = tokio::time::timeout(Duration::from_secs(10), &mut second)
+        .await
+        .expect("an answer");
+    assert_eq!(yes, Ok(true));
+    r.quit().await;
+}
+
+/// kai-firefox WP10b's review (M1): the spoken answer hears nothing of Kai's own voice. The press
+/// that answers stops what Kai says ("say yes or no" here), and what the microphone hears in its
+/// echo's guard after is silence in the answer: a short hold then holds no speech, and nothing is
+/// transcribed. The answer has no pre-roll: a later hold's recording is the hold alone.
+#[tokio::test(start_paused = true)]
+async fn kais_own_voice_is_never_the_spoken_answer() {
+    let _ = test_cards();
+    let mut r = rig("").await;
+    r.listening_on().await;
+    sleep(Duration::from_millis(300)).await;
+    let (mut answered, _over) =
+        kais_question(&r, "kai_ask_1", "May Kai press the link? Yes or no?");
+    sleep(Duration::from_secs(3)).await;
+    // Neither yes nor no: Kai says so, and asks again.
+    r.mock.with(|s| s.transcripts = vec![Ok("maybe".into())]);
+    r.send(Command::Talk(true));
+    sleep(Duration::from_millis(700)).await;
+    r.send(Command::Talk(false));
+    r.until_mock("Kai's word that it heard neither", |m| {
+        m.with(|s| {
+            s.speeches
+                .iter()
+                .any(|(_, x)| x == "Kai heard neither yes nor no.")
+        })
+    })
+    .await;
+    // While it plays, the owner presses to answer: it stops, and a short hold is all echo guard.
+    sleep(Duration::from_millis(200)).await;
+    r.send(Command::Talk(true));
+    sleep(Duration::from_millis(400)).await;
+    r.send(Command::Talk(false));
+    r.until_mock("Kai's word that it heard no answer", |m| {
+        m.with(|s| s.speeches.iter().any(|(_, x)| x == "Kai heard no answer."))
+    })
+    .await;
+    assert_eq!(
+        r.mock.with(|s| s.transcribed.len()),
+        1,
+        "the hold over Kai's own voice was not transcribed"
+    );
+    assert!(answered.try_recv().is_err());
+    // A hold well after Kai spoke: the hold alone, no pre-roll before the press.
+    sleep(Duration::from_secs(4)).await;
+    r.send(Command::Talk(true));
+    sleep(Duration::from_millis(700)).await;
+    r.send(Command::Talk(false));
+    let yes = tokio::time::timeout(Duration::from_secs(10), &mut answered)
+        .await
+        .expect("an answer");
+    assert_eq!(yes, Ok(true));
+    let (_, wav) = r.mock.with(|s| s.transcribed[1]);
+    let ms = (wav - 44) / 2 * 1000 / 24_000;
+    assert!(
+        (650..=760).contains(&ms),
+        "{ms} ms recorded for a hold of 700 ms: no pre-roll"
+    );
     r.quit().await;
 }

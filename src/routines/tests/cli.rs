@@ -7,8 +7,9 @@ use std::os::unix::fs::PermissionsExt;
 use serde_json::Value;
 
 use super::*;
-use crate::cli::server::{Backend, caller_of, proc_cgroup};
+use crate::cli::server::{Backend, caller_of};
 use crate::cli::{Answer, Request, Status, client};
+use crate::local_socket::proc_cgroup;
 
 const BACKUP_SCOPE: &str = "app-dev.rootshell.kai.routine.backup-4d2a91c.scope";
 

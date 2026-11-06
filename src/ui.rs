@@ -46,6 +46,12 @@ pub enum UiCmd {
     WithdrawConfirm(u64),
     /// The configuration window (WP21b): opened, or brought to the front when it is open.
     ShowSettings,
+    /// The lines above the configuration window's pages changed (`GET /api/notices`): an open
+    /// window reads them again.
+    NoticesChanged,
+    /// The number of Firefox extensions linked to Kai changed: an open window reads
+    /// `GET /api/browser` again (the Firefox section's "connected now").
+    BrowserChanged,
     /// For the ring overlay.
     Overlay(OverlayCmd),
     /// Ask the owner about a hosted tool's call (PD4).
@@ -143,6 +149,16 @@ pub fn run(
                 UiCmd::ConfirmPair(req) => show_confirm_dialog(&confirm, &cmds, req),
                 UiCmd::WithdrawConfirm(id) => withdraw(&confirm, Some(id)),
                 UiCmd::ShowSettings => show_settings(&settings, &cmds),
+                UiCmd::NoticesChanged => {
+                    if let Some(w) = settings.borrow().as_ref() {
+                        w.notices_changed();
+                    }
+                }
+                UiCmd::BrowserChanged => {
+                    if let Some(w) = settings.borrow().as_ref() {
+                        w.browser_changed();
+                    }
+                }
                 UiCmd::Overlay(cmd) => overlay.send(cmd),
                 UiCmd::ConfirmTool(req) => show_tool_dialog(req),
                 UiCmd::Widgets(cmd) => widgets.send(cmd),

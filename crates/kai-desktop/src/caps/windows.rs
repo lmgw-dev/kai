@@ -51,6 +51,48 @@ pub struct Snapshot {
     pub activity: String,
 }
 
+/// A window and where the compositor draws it ([`Windows::placed`]).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Placed {
+    /// Its facts as a snapshot names them (`output` may be empty, `active` unset).
+    pub window: Window,
+    /// Its frame (title bar and borders included, its shadow not) in the compositor's logical
+    /// coordinates, as [`Output`]'s are: x, y, width, height. `None` where the compositor has not
+    /// said it.
+    pub frame: Option<(i32, i32, u32, u32)>,
+}
+
+/// Every window the compositor draws, and where ([`Windows::placed`]).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Placement {
+    /// Topmost first, the windows a task bar leaves out included (Firefox's Picture-in-Picture).
+    pub windows: Vec<Placed>,
+    /// The current virtual desktop's name: a window on others only is not drawn.
+    pub desktop: String,
+}
+
+/// `w` may be on the screen now while `desktop` is the current virtual desktop: not minimized, and
+/// on every desktop or on the current one (or the current one has no name). Activities are not
+/// told apart, so a window of another activity counts as drawn.
+pub fn drawn_on(desktop: &str, w: &Window) -> bool {
+    !w.minimized
+        && (w.desktops.is_empty() || desktop.is_empty() || w.desktops.iter().any(|d| d == desktop))
+}
+
+impl Placement {
+    /// `w` may be on the screen now ([`drawn_on`]).
+    pub fn drawn(&self, w: &Window) -> bool {
+        drawn_on(&self.desktop, w)
+    }
+}
+
+impl Snapshot {
+    /// `w` may be on the screen now ([`drawn_on`]).
+    pub fn drawn(&self, w: &Window) -> bool {
+        drawn_on(&self.desktop, w)
+    }
+}
+
 /// A quick-tile position (`window_tile`'s `side`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Side {
@@ -153,6 +195,30 @@ pub trait Windows: Send + Sync {
     /// Runs `action` on the window `id` (a [`Window::id`] from a snapshot). A window that closed
     /// meanwhile is [`super::Failure::Refused`].
     fn act<'a>(&'a self, id: &'a str, action: &'a Action) -> Fut<'a, Done>;
+
+    /// Every window the compositor draws with its frame, those a task bar leaves out included:
+    /// `see_screen` blanks by it what Kai's browser site rules keep from Kai (Kai's
+    /// `crate::browser::shown`). A provider that cannot say where its windows are answers
+    /// [`super::Failure::Refused`] (this default).
+    fn placed(&self) -> Fut<'_, Placement> {
+        Box::pin(async {
+            Err(super::Failure::Refused(
+                "the desktop does not say where its windows are".into(),
+            ))
+        })
+    }
+
+    /// The compositor's effects that are running now, by name (on Plasma KWin's `activeEffects`:
+    /// an effect counts while it paints, such as the Overview or a window's minimize animation),
+    /// so `see_screen` can tell that windows may be drawn away from their frames. A provider that
+    /// cannot say answers [`super::Failure::Refused`] (this default).
+    fn effects(&self) -> Fut<'_, Vec<String>> {
+        Box::pin(async {
+            Err(super::Failure::Refused(
+                "the desktop does not say which of its effects are running".into(),
+            ))
+        })
+    }
 }
 
 #[cfg(test)]

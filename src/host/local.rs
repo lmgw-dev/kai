@@ -131,6 +131,39 @@ impl Local {
         approver: Option<&Caller>,
         bounds: LocalBounds,
     ) -> Reply {
+        self.dispatched(entry, raw, caller, approver, bounds, None)
+            .await
+    }
+
+    /// The tests' way to a call bounded as lmgw bounds one: its deadline `timeout` from now
+    /// (`lmgw/timeout_ms`, the MCP row's), the rest as [`Local::call`] (kai-firefox WP10's
+    /// acceptance runs).
+    #[cfg(test)]
+    pub async fn call_timed(
+        &self,
+        entry: &Entry,
+        raw: Option<Map<String, Value>>,
+        caller: &Caller,
+        timeout: std::time::Duration,
+    ) -> Reply {
+        let bounds = LocalBounds {
+            cancel: CancellationToken::new(),
+            room: None,
+            out: None,
+        };
+        self.dispatched(entry, raw, caller, None, bounds, Some(timeout))
+            .await
+    }
+
+    async fn dispatched(
+        &self,
+        entry: &Entry,
+        raw: Option<Map<String, Value>>,
+        caller: &Caller,
+        approver: Option<&Caller>,
+        bounds: LocalBounds,
+        timeout: Option<std::time::Duration>,
+    ) -> Reply {
         let LocalBounds { cancel, room, out } = bounds;
         let Some(s) = self.shared() else {
             return Reply::error("Kai's tool host is gone (Kai is quitting)");
@@ -153,8 +186,8 @@ impl Local {
         };
         let bounds = Bounds {
             cancel,
-            deadline: None,
-            timeout_ms: None,
+            deadline: timeout.map(|t| tokio::time::Instant::now() + t),
+            timeout_ms: timeout.map(|t| t.as_millis() as u64),
             room,
             room_says,
             out,

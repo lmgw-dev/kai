@@ -7,11 +7,17 @@
 //! the page's files, `GET /api/tools`, and `POST /api/apply`, which is [`super::Request`] in and
 //! [`super::Response`] out, run by the core (`Command::Setting`) like the owner tools' calls, so
 //! the core's copy of the configuration and the host's policy follow every change. The Personality
-//! page adds `GET /api/conversation` (`Command::WindowConversation`) and lmgw's profile editor's
+//! page adds `GET /api/conversation` (`Command::WindowConversation`), every page `GET /api/notices`
+//! (`Command::WindowNotices`: lines above the pages, such as kai-firefox's warning about web pages
+//! and lmgw's admin tools; read again on the `kai-notices` event Kai sends the page when they
+//! change, `UiCmd::NoticesChanged`), and lmgw's profile editor's
 //! requests under `/lmgw/` ([`profiles`]), which the core sends to the paired lmgw with the device
 //! key (`Command::WindowProxy`), so the page holds no key and opens no connection. The Desktop page
 //! shows and forgets the RemoteDesktop portal's stored permission ([`remote`],
-//! `Command::WindowRemoteControl`). [`route`]
+//! `Command::WindowRemoteControl`). The Firefox section reads `GET /api/browser` (whether this build
+//! has a link to Kai for Firefox's extension and whether one is linked now, read again on the
+//! `kai-browser` event, `UiCmd::BrowserChanged`) and `POST /api/browser/install` opens that link
+//! (`Command::WindowBrowser`, `crate::browser::install`). [`route`]
 //! decides what a request gets and refuses every other origin; the view itself may not navigate
 //! away, open a window, ask for a permission or show WebKit's context menu. Kai opens no network
 //! listener.
@@ -38,6 +44,7 @@ use self::route::{Answer, HOST, Incoming, Routed, SCHEME};
 use crate::core::Command;
 
 pub mod assets;
+pub mod devices;
 pub mod profiles;
 pub mod remote;
 pub mod route;
@@ -93,9 +100,13 @@ pub fn next_scale(current: f64, step: i32) -> f64 {
 /// The open window. Dropping it destroys the window, its view and the context.
 pub struct SettingsWindow {
     window: gtk::Window,
-    #[cfg_attr(not(test), allow(dead_code))]
     view: WebView,
 }
+
+/// The event the page reads its notices again on ([`SettingsWindow::notices_changed`]).
+pub const NOTICES_EVENT: &str = "kai-notices";
+/// The event the page reads `GET /api/browser` again on ([`SettingsWindow::browser_changed`]).
+pub const BROWSER_EVENT: &str = "kai-browser";
 
 impl SettingsWindow {
     /// Creates, loads and shows the window; `on_closed` runs once when it is gone (the owner closed
@@ -185,6 +196,32 @@ impl SettingsWindow {
     /// Brings an open window to the front.
     pub fn present(&self) {
         self.window.present();
+    }
+
+    /// Tells the page that its notices changed: it reads `GET /api/notices` again. A page that is
+    /// still loading reads them when it starts.
+    pub fn notices_changed(&self) {
+        self.tell_page(NOTICES_EVENT);
+    }
+
+    /// Tells the page that the Firefox extensions linked to Kai changed: it reads `GET
+    /// /api/browser` again.
+    pub fn browser_changed(&self) {
+        self.tell_page(BROWSER_EVENT);
+    }
+
+    fn tell_page(&self, event: &'static str) {
+        self.view.evaluate_javascript(
+            &format!("window.dispatchEvent(new Event('{event}'))"),
+            None,
+            None,
+            None::<&gio::Cancellable>,
+            move |r| {
+                if let Err(e) = r {
+                    tracing::debug!("the settings page did not take the {event} event: {e}");
+                }
+            },
+        );
     }
 }
 
@@ -329,6 +366,56 @@ async fn handle(request: &URISchemeRequest, cmds: &mpsc::UnboundedSender<Command
                 Ok(Err(why)) => Answer::refused(500, &why),
                 Err(_) => Answer::refused(503, "Kai is quitting"),
             }
+        }
+        Routed::Browser { install } => {
+            let (reply, rx) = oneshot::channel();
+            if cmds
+                .send(Command::WindowBrowser { install, reply })
+                .is_err()
+            {
+                return Answer::refused(503, "Kai is quitting");
+            }
+            match rx.await {
+                Ok(Ok(facts)) => Answer::json(&facts),
+                Ok(Err(why)) => Answer::refused(422, &why),
+                Err(_) => Answer::refused(503, "Kai is quitting"),
+            }
+        }
+        Routed::Notices => {
+            let (reply, rx) = oneshot::channel();
+            if cmds.send(Command::WindowNotices { reply }).is_err() {
+                return Answer::refused(503, "Kai is quitting");
+            }
+            match rx.await {
+                Ok(lines) => Answer::json(&serde_json::json!({ "lines": lines })),
+                Err(_) => Answer::refused(503, "Kai is quitting"),
+            }
+        }
+        Routed::Devices => {
+            let (reply, rx) = oneshot::channel();
+            if cmds.send(Command::WindowDevices { reply }).is_err() {
+                return Answer::refused(503, "Kai is quitting");
+            }
+            let Ok(devices) = rx.await else {
+                return Answer::refused(503, "Kai is quitting");
+            };
+            // The screens come from the compositor over a Wayland connection of their own,
+            // blocking for a few ms: off the GTK thread, one query at a time. Unreadable: none.
+            let screens = match crate::overlay::outputs::Query::start() {
+                Some(query) => gio::spawn_blocking(move || query.run())
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .unwrap_or_default(),
+                None => Vec::new(),
+            };
+            Answer::json(&devices.with_screens(&screens))
+        }
+        Routed::Restart => {
+            if cmds.send(Command::Restart).is_err() {
+                return Answer::refused(503, "Kai is quitting");
+            }
+            Answer::json(&serde_json::json!({ "restarting": true }))
         }
         Routed::Proxy(forward) => {
             use crate::lmgw_link::proxy::Proxied;

@@ -56,11 +56,11 @@ use crate::secret::MemoryStore;
 use crate::tray::model::{Link, Pairing, TrayModel, VoiceShown};
 use crate::voice::VoiceMode;
 
-pub(super) const URL: &str = "http://127.0.0.1:8897";
+pub(crate) const URL: &str = "http://127.0.0.1:8897";
 pub(super) const ASR_TEXT: &str =
     "Wie wird das Wetter morgen in Berlin? Und was ziehe ich am besten an?";
 
-pub(super) fn env(name: &str) -> String {
+pub(crate) fn env(name: &str) -> String {
     std::env::var(name)
         .unwrap_or_else(|_| panic!("{name} (set by scripts/live-check-voice-lmgw.sh)"))
 }
@@ -68,17 +68,17 @@ pub(super) fn env(name: &str) -> String {
 // ------------------------------------------------------------------------ the dev lmgw
 
 /// The dev lmgw: started and stopped through the script's launcher; its owner bearer.
-pub(super) struct Lmgw {
+pub(crate) struct Lmgw {
     run: String,
     log: PathBuf,
     pid_file: PathBuf,
     child: Option<tokio::process::Child>,
-    pub(super) token: String,
+    pub(crate) token: String,
     http: reqwest::Client,
 }
 
 impl Lmgw {
-    pub(super) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             run: env("KAI_LIVE_LMGW_RUN"),
             log: PathBuf::from(env("KAI_LIVE_LMGW_LOG")),
@@ -90,7 +90,7 @@ impl Lmgw {
     }
 
     /// Starts it and waits until it answers; returns how long that took.
-    pub(super) async fn start(&mut self) -> Duration {
+    pub(crate) async fn start(&mut self) -> Duration {
         let t0 = Instant::now();
         let mut child = tokio::process::Command::new("bash")
             .arg(&self.run)
@@ -151,14 +151,14 @@ impl Lmgw {
         })
     }
 
-    pub(super) async fn stop(&mut self) -> String {
+    pub(crate) async fn stop(&mut self) -> String {
         if self.child.is_none() {
             return "was not running".into();
         }
         self.interrupt().await.unwrap()
     }
 
-    pub(super) async fn call(
+    pub(crate) async fn call(
         &self,
         method: &str,
         path: &str,
@@ -181,7 +181,7 @@ impl Lmgw {
     }
 
     /// As the owner (the dashboard); a JSON answer.
-    pub(super) async fn owner(&self, method: &str, path: &str, body: Option<Value>) -> Value {
+    pub(crate) async fn owner(&self, method: &str, path: &str, body: Option<Value>) -> Value {
         let (status, text) = self.call(method, path, body, &self.token).await;
         assert!(
             (200..300).contains(&status),
@@ -190,7 +190,7 @@ impl Lmgw {
         serde_json::from_str(&text).unwrap_or(Value::String(text))
     }
 
-    pub(super) async fn op(&self, name: &str, body: Value) -> Value {
+    pub(crate) async fn op(&self, name: &str, body: Value) -> Value {
         let v = self
             .owner("POST", &format!("/api/op/{name}"), Some(body))
             .await;
@@ -199,7 +199,7 @@ impl Lmgw {
     }
 
     /// A thread's messages as the owner reads them: (id, role, content, voice).
-    pub(super) async fn messages(&self, thread: i64) -> Vec<(i64, String, String, Value)> {
+    pub(crate) async fn messages(&self, thread: i64) -> Vec<(i64, String, String, Value)> {
         let v = self
             .owner("GET", &format!("/chat/api/threads/{thread}"), None)
             .await;
@@ -239,9 +239,9 @@ async fn set_up(lmgw: &Lmgw) -> (i64, LiveDevice) {
 }
 
 /// A device of the dev lmgw, paired over its device link: what Kai keeps, and its credentials.
-pub(super) struct LiveDevice {
+pub(crate) struct LiveDevice {
     pub(super) enrolled: crate::pairing::Enrolled,
-    pub(super) creds: Credentials,
+    pub(crate) creds: Credentials,
 }
 
 impl LiveDevice {
@@ -295,7 +295,7 @@ impl LiveDevice {
 /// pairing link for this computer from `key_create` (`extra`: more of the device's policy), Kai's
 /// own enrolment with it, then the owner's Confirm with the code the device shows
 /// (`device_confirm {id, confirm_code}`).
-pub(super) async fn device(lmgw: &Lmgw, name: &str, extra: Value) -> LiveDevice {
+pub(crate) async fn device(lmgw: &Lmgw, name: &str, extra: Value) -> LiveDevice {
     let listening = |status: &Value| status["devices"]["listener"]["state"] == "listening";
     if !listening(&lmgw.owner("GET", "/api/status", None).await) {
         lmgw.op("settings_set", json!({"devices": {"listener": true}}))
@@ -365,7 +365,7 @@ pub(super) async fn set_up_mocks(lmgw: &Lmgw) {
     let up = lmgw
         .op(
             "upstream_set",
-            json!({"action": "create", "name": "mock-audio", "protocol": "openai",
+            json!({"action": "create", "name": "mock-audio", "protocol": "openai_compatible",
                 "kind": "audio_cpp", "base_url": format!("http://127.0.0.1:{audio}/v1")}),
         )
         .await["id"]

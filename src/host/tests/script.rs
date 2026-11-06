@@ -256,6 +256,33 @@ fn every_hosted_tool_keeps_the_contract() {
     // tests' desktop provider probes nothing, so they come from a desktop that has them all.
     entries.extend(crate::desktop::tests::full_entries());
     entries.extend(crate::delegate::tests::full_entries());
+    // The browser's tools are listed only while a Firefox that serves their operations is linked
+    // (kai-firefox design D3): here one that serves every operation they use, the switch on.
+    let d = deps();
+    let every_op: Vec<String> = kai_desktop::contract::browser::AREA
+        .tools
+        .iter()
+        .filter_map(|t| match crate::browser::tools::route(t.name) {
+            crate::browser::tools::Route::Built { ops, .. } => Some(ops),
+            crate::browser::tools::Route::NotYet => None,
+        })
+        .flatten()
+        .map(|op| (*op).to_owned())
+        .collect();
+    let firefox = crate::browser::links::LinkInfo {
+        id: 1,
+        profile: "c0ffee".into(),
+        ext_version: "0.1.0".into(),
+        firefox: "159.0".into(),
+        protocol: 1,
+        ops: every_op,
+        firefox_pid: None,
+    };
+    let spans = crate::browser::spans::Spans::of(&d);
+    let desktop = crate::desktop::provider(&d, spans.clone());
+    entries.extend(
+        crate::browser::provider::provider(&d, desktop, spans).entries_for(&[firefox], true),
+    );
     assert!(entries.len() >= 5, "the core's and the test tools at least");
     for e in &entries {
         let spec = e.spec;
@@ -299,8 +326,17 @@ fn every_hosted_tool_keeps_the_contract() {
             );
         }
     }
-    // Every contract area's tools have a provider in this build.
-    for spec in kai_desktop::contract::tools() {
+    // Every contract area's tools have a provider in this build, but the browser's that their work
+    // packages have not built yet (`crate::browser::tools::Route::NotYet`: never listed), and those
+    // listed only with the desktop's accessibility, which the tests' desktop does not offer
+    // (`crate::browser::tests::chrome` lists them with it).
+    for spec in kai_desktop::contract::tools().filter(|t| {
+        (!matches!(
+            crate::browser::tools::route(t.name),
+            crate::browser::tools::Route::NotYet
+        ) && !crate::browser::provider::needs_access(t.name))
+            || kai_desktop::contract::find(t.name).is_some_and(|(a, _)| a.name != "browser")
+    }) {
         assert!(
             entries.iter().any(|e| e.spec.name == spec.name),
             "{} has no provider",

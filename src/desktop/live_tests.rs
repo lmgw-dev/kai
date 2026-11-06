@@ -112,7 +112,7 @@ fn env() -> Env {
     }
 }
 
-async fn desktop() -> (Vec<Entry>, String) {
+async fn desktop() -> (Vec<Entry>, String, DesktopTools) {
     let d = DesktopTools::new(env(), DesktopConfig::default(), Changes::new().0, false);
     d.probe_now().await;
     let chosen = d.chosen();
@@ -129,7 +129,32 @@ async fn desktop() -> (Vec<Entry>, String) {
         "{}",
         windows.note
     );
-    (d.entries(), windows.note.clone())
+    (d.entries(), windows.note.clone(), d)
+}
+
+/// `Windows::placed` (`see_screen`'s blanking under Kai's browser site rules) against KWin's own
+/// view: the window titled `title` with a frame that holds KWin's and is at most two logical
+/// pixels wider on each side (`plasma::windows::widened`, either path), and the current desktop
+/// named.
+async fn placed_matches_kwin(d: &DesktopTools, script: &KwinScript, title: &str) {
+    let windows = d.services().unwrap().windows.unwrap();
+    let p = windows.placed().await.unwrap();
+    let w = p
+        .windows
+        .iter()
+        .find(|w| w.window.title == title)
+        .unwrap_or_else(|| panic!("{title} is not placed: {p:?}"));
+    let v = kwin_view(script, title).await;
+    let k = |key: &str| v[key].as_f64().unwrap();
+    let (x, y, width, height) = (k("x"), k("y"), k("width"), k("height"));
+    let f = w.frame.unwrap_or_else(|| panic!("no frame; KWin says {v}"));
+    let (fx0, fy0) = (f64::from(f.0), f64::from(f.1));
+    let (fx1, fy1) = (fx0 + f64::from(f.2), fy0 + f64::from(f.3));
+    for margin in [x - fx0, y - fy0, fx1 - (x + width), fy1 - (y + height)] {
+        assert!((0.0..=2.0).contains(&margin), "{f:?}; KWin says {v}");
+    }
+    assert!(!p.desktop.is_empty() && p.drawn(&w.window), "{p:?}");
+    println!("  placed: {title} at {f:?} (KWin: {v}) on {}", p.desktop);
 }
 
 async fn tool(entries: &[Entry], name: &str, args: Value) -> (String, bool) {
@@ -236,8 +261,9 @@ async fn until_kwin(script: &KwinScript, title: &str, what: &str, ok: impl Fn(&V
     }
 }
 
-async fn exercise(entries: &[Entry], script: &KwinScript, run: &str) {
+async fn exercise(d: &DesktopTools, entries: &[Entry], script: &KwinScript, run: &str) {
     println!("== {run}");
+    placed_matches_kwin(d, script, "Kai Live One").await;
     let names: Vec<&str> = entries
         .iter()
         .filter(|e| e.area == "windows")
@@ -394,9 +420,9 @@ async fn live_windows_in_nested_kwin() {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
-    let (entries, note) = desktop().await;
+    let (entries, note, d) = desktop().await;
     assert!(note.contains("is not granted"), "{note}");
-    exercise(&entries, &script, "KWin scripting (no grant)").await;
+    exercise(&d, &entries, &script, "KWin scripting (no grant)").await;
 
     // The grant: a .desktop naming this binary, written while KWin runs.
     let exe = std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
@@ -429,9 +455,9 @@ async fn live_windows_in_nested_kwin() {
         "granted {} ms after the .desktop was written",
         written.elapsed().as_millis()
     );
-    let (entries, note) = desktop().await;
+    let (entries, note, d) = desktop().await;
     assert!(note.starts_with("the window management protocol"), "{note}");
-    exercise(&entries, &script, "the window management protocol").await;
+    exercise(&d, &entries, &script, "the window management protocol").await;
     let (_, err) = tool(&entries, "window_close", json!({"window": "Live Three"})).await;
     assert!(!err);
     let end = Instant::now() + Duration::from_secs(5);

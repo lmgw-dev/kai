@@ -107,7 +107,9 @@ The approved proposal:
     - Android later uses the same path for its phone tools.
 18. **App-scoped memory lives in Kai**, keyed by the app id from window management, with
     embeddings from lmgw's `/v1/embeddings`. **Browser integration** is a native-messaging helper
-    that forwards to a Kai socket.
+    that forwards to a Kai socket. *Changed 2026-11-03:* the browser integration is designed in its
+    own repository, `kai-firefox` (`docs/design/2026-11-03-kai-firefox-design.md`): Firefox only, the
+    extension depends on Kai, and its sidebar is a full lmgw Chat through Kai's proxy.
 19. **Android later.**
     - Audio over WebSocket first; OpenAI's WebRTC transport (`/v1/realtime/calls`) only if mobile
       jitter hurts.
@@ -183,7 +185,7 @@ Rulings of 2026-10-09 (the lock, conversation mode's timeout, accessibility):
     end, at the lock and at Kai's exit. The wait for the apps is no guessed sleep but the
     registry's events, bounded by a visible setting. K33.
 
-## Taken in this draft
+## Design decision
 
 **K1. The RAM call: the ring has its own web process. Agent widgets share a second one as related
 views. Every view is destroyed when hidden** (§9.4, §10.1; the ring's view changed 2026-10-08, see
@@ -635,23 +637,23 @@ and 3):
     default the owner can widen;
   - a fourth per-tool state, `off`: the tool is not listed (K22's `list_changed` when it changes).
     The configuration shows the states as on (`allow`), ask (`confirm`), deny and off.
-  - *Taken in this draft, 2026-10-09:* a fifth, `allow_trusted` ("allow
+  - *Design decision, 2026-10-09:* a fifth, `allow_trusted` ("allow
     if trusted"): unasked for trusted callers, confirmed for the others (unless a trusted approver
     approved), the read-only default made settable for any tool. It is how the owner grants a
     routine what its `routine.toml` asks (K28).
-- *As built in WP8 per PD4, 2026-10-09 (taken in this draft):* a trusted
+- *As built in WP8 per PD4, 2026-10-09 (design decision):* a trusted
   approval in the thread (F, `lmgw/approval`) is the confirmation for confirmed-by-default tools
   too, so there is no second dialog; this resolves the older wording above, "asked for every caller
   unless set to `allow`". *Changed by WP19's review, 2026-10-09:* not for K24's
   confirmed-by-default tools: their dialog names the window or element the call acts on, which no
   approver in the thread saw, so it asks after any approval unless the tool is set to `allow`.
-  *Restored after WP19's second review, 2026-10-09 (taken in this draft):* a trusted approval decides K24's confirmed-by-default tools again, as WP8 built it: a
+  *Restored after WP19's second review, 2026-10-09 (design decision):* a trusted approval decides K24's confirmed-by-default tools again, as WP8 built it: a
   remote approval with nobody at the desk would otherwise time out on Kai's dialog, and since
   ff1b9e8 a call approved in lmgw must name its window (`type_text`, `key_press`, `ui_press` and
   every window action refuse an omitted or `active` one), so the approver saw the target in the
   arguments. Only `routine_enable` switching a routine on still asks after F
   (`policy::approval_applies`).
-- *WP19, 2026-10-09 (taken in this draft):* an approval whose approver
+- *WP19, 2026-10-09 (design decision):* an approval whose approver
   (`by`) is the call's own caller is no approval, unless that caller is the owner, the gateway or
   Kai's own key; the call is then decided as if nobody had approved it. It compares principals: an
   approver holding a second principal's key can still approve its own call through it (WP19's
@@ -687,7 +689,7 @@ answered on the overlay and hold back nothing of Kai's voice.
 view's calls run as `app:<server>`, a `policy.trusted_callers` entry like any caller's, and
 `policy.tools` applies to the server's tools by their exposed name (WP12's note).
 
-*Changed after review, 2026-10-09 (taken in this draft):* the skip covers
+*Changed after review, 2026-10-09 (design decision):* the skip covers
 only tools the server marks `destructiveHint: false`. A destructive one (MCP's default for a tool
 that is not read-only) still asks a trusted app unless `policy.tools.<server>__<tool> = "allow"`.
 While any Kai confirmation is open, every MCP Apps view is click-through and gives way to Kai's
@@ -910,7 +912,7 @@ parameters.
 *Why:* the model recognizes the intent in any phrasing and language, which no fixed phrase does;
 an override for one session adds no mode to the configuration or the tray.
 
-*As built, WP9, 2026-10-09 (taken in this draft; `src/voice/conversation_mode.rs`):*
+*As built, WP9, 2026-10-09 (design decision; `src/voice/conversation_mode.rs`):*
 - The tool call only asks: the mode takes effect at the first quiet point after the current reply
   (nothing open, nothing playing, no held key), and only then the server's turn detection is
   switched on.
@@ -982,7 +984,7 @@ folder holds now, so it is exactly as trustworthy as everything that can write i
 program of the user, another routine's script, `run_command`, an agent). `routine:<name>`
 identifies which routine called, not its content.
 
-*Taken in this draft, 2026-10-09:* because the folder can
+*Design decision, 2026-10-09:* because the folder can
 change after the switch-on, `routine.toml` is no source of permissions beyond Kai's default for a
 routine. It can declare defaults up to confirm and the owner's level (`policy = "always"`, `level =
 "own"` or `"owner"` are honoured); anything wider (unasked runs for trusted callers through `policy =
@@ -1010,6 +1012,10 @@ asked to run unasked is not confirmed again (the owner's act); one that changes 
   §16 Q18).
 - It follows lmgw's native-feel rules: the KWin frame, desktop fonts, the KDE header palette, the
   interface scale.
+- *The owner's rule (2026-10-19):* no setting ships as a raw text field labelled with its
+  config key. The window shows every setting in the words of Kai's
+  settings catalog (WP21's as-built note of 2026-10-19): a label, a help line, its section, its
+  unit and a control of its kind. The key is at most a tooltip. A key without words fails a test.
 - A System Settings entry (KCM) may come later as a thin launcher.
 
 *Why:* no second UI stack; extensions share construction.
@@ -1025,7 +1031,7 @@ asked to run unasked is not confirmed again (the owner's act); one that changes 
   switched on); the owner permits it per tool with `policy.widen_by_tools.<tool>` (trust:
   `policy.widen_trust_by_tools`), which only the settings window or the file can set. Narrowing
   always passes. The risk is judged by the user, tool by tool, not by Kai (WP21a's as-built).
-  *Taken in this draft, 2026-10-09 (review fixes):* an unset entry counts as the default Kai
+  *Design decision, 2026-10-09 (review fixes):* an unset entry counts as the default Kai
   really applies (a routine's from its loaded spec, K28's capped defaults); a name Kai offers no
   tool for is judged conservatively (any entry but `deny` or `off`, and taking an entry away, is a
   widening); a key whose value Kai runs as a command, `launch.terminal`, is `run_command`'s power:
@@ -1263,8 +1269,8 @@ was silent, the builder's decisions, marked *draft*):
   threads are exempt (`config/settings.rs:238-250`).
 - **A text send cancels the thread's live turn**, whichever window or device sent it
   (`web/chat_live.rs:17-27`, `:189-215`).
-- **The visualisation contract** (chat-voice §10) and `crates/lmgw-ui/assets/voice/viz/engine.js`
-  and `ring.js`.
+- **The visualisation contract** (chat-voice §10) and `crates/lmgw-chat-ui/assets/voice/viz/engine.js`
+  and `ring.js` (in `lmgw-ui` until lmgw's chat-plane WP3b moved the Chat into a crate of its own).
   - The ring paints an opaque background (`ring.js:28`, `:72`).
   - The engine renders calm (15 fps) only when idle with both taps quiet (`engine.js:426-430`).
 - **The GPU hold** answers 503 with `gpu_hold` (`error.rs:427`). A fallback that answered is named
@@ -1840,6 +1846,28 @@ for lmgw's feed after a 4004 is gone.
     lmgw", with Open in lmgw.
   - Kai retries when `folder.updated` arrives. A `current` answered 409 `folder_no_model` gets the
     same message.
+- **Shared or own** (*the owner's intent, 2026-10-19*). By default every Kai client, this desktop
+  and every Kai phone, shares one conversation: the folder of the default name "Kai", which the
+  phone uses by default too. Optionally a client gets its own. The settings window's Conversation
+  is that choice: "Shared with your other Kai apps" (`conversation.folder_name` removed, so its
+  default "Kai" applies) or "Only on this computer" with a name of its own (prefilled "Kai " and
+  this computer's pretty hostname, else its hostname; a stored name other than "Kai" shows this
+  choice with that name). Choosing it only shows the name field and a "Use this conversation"
+  button (Enter too): nothing is written until then, so the prefilled name never makes a folder
+  by itself, and the button writes once. Only an own name used a moment ago (the owner went back
+  to shared) returns at once. Its note says that a new conversation needs its model picked in
+  lmgw's dashboard the first time, which Kai then guides; the row says "Now using “name”".
+  - Saving switches at once (`Conversation::rename`, `Effect::Now`). The old folder is left: a
+    running voice session ends quietly (`Action::Move`: no "voice stopped" notification, the owner
+    did it), and listening, if it was on, resumes on the new folder once it is ready. A rename to
+    the same name (apart from spaces) changes nothing and leaves a lookup on its way alone.
+    `conversation.folder_id` is
+    removed: the remembered folder wins the lookup whatever its name, so it would keep the old
+    conversation. With the feed up the new name is looked up now, otherwise at the next `hello`. A
+    lookup or create of the old name on its way is dropped.
+  - From there it is a first start's path: a missing folder is created plain, its steps (model,
+    ongoing) are notified and in the tooltip, and once the owner readies it Kai remembers it and
+    asks for its thread. Back to shared, the "Kai" folder is found again and remembered.
 - **The thread.** Kai asks `POST /chat/api/folders/{id}/current`:
   - when a session opens;
   - when the folder's idle time passes with no turn;
@@ -2582,7 +2610,7 @@ owner's.
 - **Nothing lingers unseen:** the tray's Overlays menu, "Hide all", and the `hide-overlays` shortcut.
 - **The first tool through the link** *(2026-10-08, K27)*: `conversation_start` and
   `conversation_end`, the smallest tools that prove `/mcp/host` end to end, ahead of the overlays.
-- *As built in WP10, 2026-10-09 (taken in this draft):*
+- *As built in WP10, 2026-10-09 (design decision):*
   - **The sandbox in layers** (`src/widgets/sandbox.rs`): the caller's document is served by
     Kai's `kai-sandbox:` handler with the CSP above as a response header (not `srcdoc`, which
     would inherit the host page's policy) into the `allow-scripts` frame; the host page has no
@@ -2685,7 +2713,7 @@ must carry the UI resource and the structured result (api §7.3). *Answered by t
     tools.
   - A pending approval (`approval.requested`, or the bound session's `mcp_approval_request`) shows
     as an interactive overlay with keyboard on demand (Enter approves, Esc declines). It shows the
-    call's remaining time. *(WP13 (c), 2026-10-09, draft decision:)* the layer-shell keyboard mode
+    call's remaining time. *(WP13 (c), 2026-10-09, design decision:)* the layer-shell keyboard mode
     is `OnDemand`; the keyboard moves to the overlay the moment it appears, so Enter and Esc count
     only after a short arming delay (WP19). *(WP19, as built:)* a waiting thread call has no deadline in lmgw,
     so the card shows no time; the arming is `approvals.arm_ms` (WP19's notes).
@@ -2714,11 +2742,16 @@ must carry the UI resource and the structured result (api §7.3). *Answered by t
 - **Programs run in their own scope** (K14): `open`, `app_launch` and `run_command` (K24).
 - **App memory** lives in a Kai-local SQLite file (`$XDG_DATA_HOME/kai/memory.db`), keyed by app id.
   Vectors come from lmgw's `/v1/embeddings` with an `embed/` alias named in the configuration.
-- **The browser.** `kai-browser-host` (native messaging, Firefox and Chromium) forwards to
-  `$XDG_RUNTIME_DIR/kai/browser.sock` (mode 0600, peer credentials checked).
+- **The browser.** `kai-browser-host` (native messaging) forwards to
+  `$XDG_RUNTIME_DIR/kai/browser.sock` (mode 0600, peer credentials checked). *Changed 2026-11-03:*
+  designed in `kai-firefox` (`docs/design/2026-11-03-kai-firefox-design.md`, draft v3): Firefox
+  only; the peer must run in Firefox's app scope; Kai hosts the browser tools as a `browser`
+  contract area, listed while Firefox runs with the extension; the sidebar is a full lmgw Chat
+  through Kai's proxy, as Kai itself (the owner's decision, 2026-11-03).
 - *Decided by the owner, 2026-10-09 (§16 Q20):* app memory and browser integration go to
   `docs/ideas.md` for brainstorming first; the two bullets above are the facts that stand, not a
-  design. WP23 and WP24 are parked until the ideas are designed.
+  design. WP23 and WP24 are parked until the ideas are designed. *Changed 2026-11-03:* the browser
+  integration has its design (the bullet above), so WP24 is no longer parked.
 
 ### 11.2 Can wait
 
@@ -2730,7 +2763,7 @@ must carry the UI resource and the structured result (api §7.3). *Answered by t
   element is `ui_press` through AT-SPI, preferred over pixel input; all confirmed by default
   (*changed, 2026-10-09,* ruling 28);
 - the memory schema and its encryption (§16);
-- the browser extension;
+- the browser extension (*changed 2026-11-03:* designed in `kai-firefox`, §11.1);
 - answering an approval by voice without the talk key.
 
 **To verify before building on them** *(2026-10-08)*:
@@ -2769,7 +2802,10 @@ must carry the UI resource and the structured result (api §7.3). *Answered by t
     uses them, so no build holds rights it does not use (WP2 briefly carried them; removed
     2026-10-06);
   - the icons;
-  - `kai-browser-host` and its manifests (phase 3).
+  - `kai-browser-host` and its manifests (phase 3). *Built, 2026-11-03 (kai-firefox WP11, Kai's
+    half; WP24's drafts below):* `/usr/libexec/kai/kai-browser-host` and the system manifest
+    `/usr/lib64/mozilla/native-messaging-hosts/dev.rootshell.kai.json`, from the same build as Kai
+    (`cargo build --release --locked --workspace`) and the template `just browser-dev` uses.
 - **"Start with Plasma"** writes or removes `~/.config/autostart/dev.rootshell.kai.desktop`. It is
   switched on after the first pairing. *Changed during the build, 2026-10-07:* after the first
   pairing the owner confirmed (K13).
@@ -3358,7 +3394,7 @@ widget process, K18's no-bridge half, §10.1).
   `data:` sources, a body that does not decode as an image refused before WebKit sees it.
 - The owner: the emote set's look.
 - `overlay_weather {place}` is built here (ruling 30, §16 Q19), in `src/widgets/weather.rs`.
-  *Taken in this draft:*
+  *Design decision:*
   - `place` stays one plain parameter: a saved place name from Kai's configuration
     (`[weather] places`, with a default `home`) or `latitude,longitude` (models know city
     coordinates well). Bright Sky takes coordinates and has no place-name search; a geocoding
@@ -3398,7 +3434,7 @@ widget process, K18's no-bridge half, §10.1).
     checks the palette and that no SVG holds script, link or style). The names are in the tool's
     description and a test keeps the two lists equal. The look is the owner's to judge.
   - **Weather** (`src/widgets/weather.rs`): `place` is optional (default `home`), a saved name
-    (any case) or `latitude,longitude`; `[weather] places = { home = "52.52,13.405" }`, each value
+    (any case) or `latitude,longitude`; `[weather] places = { home = "53.5511,9.9937" }`, each value
     checked at load. `/current_weather` first, then `/weather?date=` with the date of the
     observation's own timestamp (so Bright Sky's time zone decides the day); the card shows
     temperature, sky, the day's low and high, the day's rain, wind and humidity, and the
@@ -3482,7 +3518,7 @@ widget process, K18's no-bridge half, §10.1).
     asked of a scripted owner who says no, a model-only tool, another server's tool, a URI without
     an authority and `ui/open-link` refused, its own resource read, the refused origin and
     permission named in the answer and `overlay_list`, nothing of it in the trace log.
-  - *Review fixes, 2026-10-09 (an Opus review of `feat/overlay-app`; taken in this draft):*
+  - *Review fixes, 2026-10-09 (a review of `feat/overlay-app`; design decision):*
     - **One dialog per view, a bound on requests in flight.** A view could open any number of
       K15 dialogs and calls. Now a call not marked `readOnlyHint` while that view's dialog is
       open is answered `-32000` ("a confirmation is already open …"), nobody asked; and a view
@@ -3546,7 +3582,7 @@ widget process, K18's no-bridge half, §10.1).
       state-changing one runs for a trusted app and asks for every other. Default: no app is
       trusted, so the dialog is as before. The Tools page lists Kai's own tools only, so a
       server's tool is set in the file or the Settings list.
-      - *Changed after review, 2026-10-09 (taken in this draft):* trust no longer
+      - *Changed after review, 2026-10-09 (design decision):* trust no longer
         covers destructive tools. A trusted app's state-changing call skips the dialog only when
         the tool says `destructiveHint: false`; an absent `destructiveHint` on a tool that is not
         read-only counts as destructive (MCP's default) and asks, unless
@@ -3828,7 +3864,7 @@ widget process, K18's no-bridge half, §10.1).
     owner's); the packaged one carries `org_kde_plasma_window_management`.
   - *The `active` shorthand, decided by the owner 2026-10-09:* `window` takes `active` (any case)
     for the active window, in every tool that has the parameter (the window tools, `see_window`,
-    `read_window`, `ui_press`, `look`), resolved first, as an omitted one is. *Taken in this draft:* the word wins over a title that contains it (that window is named by its id or
+    `read_window`, `ui_press`, `look`), resolved first, as an omitted one is. *Design decision:* the word wins over a title that contains it (that window is named by its id or
     app); the parameter is one shared definition (`contract::WINDOW`) whose description reads
     "active (the default), a window id, an app name or a title fragment"; `see_window` without the
     window list takes `active` as the active window, not as an id.
@@ -3964,7 +4000,7 @@ widget process, K18's no-bridge half, §10.1).
     follows only `ScreenReaderEnabled`; the run refutes it). *Answered by the owner, 2026-10-09 (ruling 33):*
     Kai may switch `IsEnabled`, on during conversation mode and around each read, never
     `ScreenReaderEnabled` (K33).
-  - *Taken in this draft (2026-10-09):* `read_window`'s error for an app off the bus
+  - *Design decision (2026-10-09):* `read_window`'s error for an app off the bus
     names the switch precisely: with it off, "Qt apps join it once org.a11y.Status IsEnabled is
     true (org.a11y.Bus at /org/a11y/bus on the session bus, kept as the GSettings key
     org.gnome.desktop.interface toolkit-accessibility; ScreenReaderEnabled is not needed)", then
@@ -4527,7 +4563,7 @@ disjoint files, so they can run side by side:
     by the owner, chronological order) the send follows the result, and the check's owner jobs
     share one thread: the cancel step's send comes after the announce-off job's unanswered
     result, and the mock calls the tool again (it would echo the result under the old placement).
-- *Review fixes, 2026-10-09 (`feat/async-jobs`; taken in this draft):*
+- *Review fixes, 2026-10-09 (`feat/async-jobs`; design decision):*
   - **A job's output is bounded.** The admitted call gets the room its text has in the answer to
     `tasks/result` under the link's limits at its admission (`LinkLimits::task_text_room`: the
     message limit less that answer's envelope and its related-task `_meta`, the widest numeric
@@ -4616,7 +4652,7 @@ disjoint files, so they can run side by side:
   (no audio to the session while the overlay is open; the talk key records locally),
   `src/host/policy.rs` (an approved thread call skips PD4's dialog), `src/ui.rs`, `src/config.rs`.
 - Depends on: M3, WP10, WP13 (c), WP18 (the voice files, in that order).
-- *WP13 (c), draft decision:* layer-shell keyboard mode `OnDemand`. Focus moves to the overlay the
+- *WP13 (c), design decision:* layer-shell keyboard mode `OnDemand`. Focus moves to the overlay the
   moment it appears, so a key meant for another app would answer the approval: Enter and Esc count
   only after an arming delay, a visible setting with a default, or WP19 measures it; the overlay
   shows that it is not armed yet.
@@ -4922,7 +4958,7 @@ disjoint files, so they can run side by side:
     a script in a real scope of the session's user manager calls a test tool through the real
     `kai` binary and the test's own socket, the real cgroup names it, the terminal is `cli`, and no
     routine scope is left.
-- *Review fixes (2026-10-09, `feat/routines` after the rebase onto WP21b; taken in this draft). Each changes behaviour that the notes above describe:*
+- *Review fixes (2026-10-09, `feat/routines` after the rebase onto WP21b; design decision). Each changes behaviour that the notes above describe:*
   - **The switch is a plain on/off; no pinning.** *Decided by the owner 2026-10-09: no pinning; the
     latest version always runs.* This withdraws the first version of this fix (the switch held the
     SHA-256 of the folder and any edit left the routine off as "changed since switched on"). Now
@@ -5000,7 +5036,7 @@ disjoint files, so they can run side by side:
     the CLI's stream and request bound; Kai's own windows over fakes. `just live-check-routines`
     adds a real `systemd-run` scope of the routine's name, which is `cli`, and `kai tool
     live_probe` from the terminal streaming its script's stdout.
-- *Second review fixes (2026-10-09, `feat/routines-unpin-widen`; taken in this draft):*
+- *Second review fixes (2026-10-09, `feat/routines-unpin-widen`; design decision):*
   - **A routine is its folder, now.** With no pin (the owner's decision), a switched-on routine
     runs whatever its folder holds now, so it is exactly as trustworthy as everything that can
     write its folder; `routine:<name>` identifies which routine called, not its content. Said in
@@ -5074,7 +5110,7 @@ disjoint files, so they can run side by side:
 - Tests: an operation round trip keeps the file's comments (§2); the scheme refuses other origins;
   switching `config_tools` changes the list once.
 - The owner: the window's look (lmgw's native-feel rules, at the default interface scale, 125 %).
-- *As built, 21a (2026-10-09; taken in this draft):*
+- *As built, 21a (2026-10-09; design decision):*
   - `src/settings/` is one function, `apply(file, Request) -> Result<Outcome, Refusal>`, serde in and
     out, no core or GTK in it: list, get, set, unset, plus tool state, tool level and provider
     (capability override) as typed shortcuts for `policy.tools.<tool>`, `policy.levels.<tool>` and
@@ -5128,7 +5164,7 @@ disjoint files, so they can run side by side:
     tool, narrowing always ok, a returning default counts, the opt-in unwritable by the tools,
     the owner path widens and the opt-in then works), the core's tool round trip and the window's
     path, and `ui/`'s `flag_on`.
-    *Review fixes (2026-10-09; taken in this draft):* an unset counts as the default Kai applies,
+    *Review fixes (2026-10-09; design decision):* an unset counts as the default Kai applies,
     the contract's or a loaded routine's spec (`widen::offered`, through `routines::spec`): a
     routine's is at most confirm and owner (WP20), so `config_unset policy.levels.backup` is judged
     against `owner`, not the `any` its `routine.toml` asks. A name Kai offers no tool for counts as
@@ -5147,7 +5183,7 @@ disjoint files, so they can run side by side:
     2026-10-09, see WP20), and `Set` writes only `false` there (an orphan's, WP20); `known_tool`
     knows the routines; the window's
     route refuses switching one on until the window shows routines (WP20's as-built notes).
-- *As built, 21b (2026-10-09; taken in this draft):*
+- *As built, 21b (2026-10-09; design decision):*
   - **The window.** `src/settings/window.rs` (children `assets`, `route`, `tools`): a plain
     `gtk::Window` toplevel with a `WebView` in its own ephemeral `WebContext`, opened by the tray's
     `Settings…` (`Command::OpenSettings`, `UiCmd::ShowSettings`; raised when open), dropped on close
@@ -5174,8 +5210,9 @@ disjoint files, so they can run side by side:
     *Settings*, every key `list` returns in sections, edited in place (a flag is a checkbox, any
     other value TOML text as `set` takes it, an empty text removes the key, Reset removes it too,
     `lmgw.url` is shown read-only), the loader's refusal inline under the key, filter by key. Every
-    control sends its operation at once; the answer says `applied` or `saved; applies when Kai
-    restarts`, and a footer says so for the rest of the visit. The page's wire types are
+    control sends its operation at once; the answer says "Saved" for a moment, or "Applies after Kai
+    restarts", and a footer lists which settings (by label) wait for a restart, drops one changed
+    back, and offers "Restart Kai now" (`POST /api/restart`, the core's `Command::Restart`). The page's wire types are
     `ui/src/wire.rs`, which Kai's tests compile and read its real answers with; the model logic
     (`ui/src/model.rs`) runs natively (`just ui-check`).
   - **Fixed-word settings** (2026-10-09, after the owner found no option for the weather overlay's
@@ -5218,7 +5255,7 @@ disjoint files, so they can run side by side:
     wire types, the CSP, the zoom, the size), the core's `the_windows_operations_run_in_the_core`,
     the tray's menus; `just live-check-window` (nested KWin, the page driven through its DOM
     against the real operations, screenshots at 125 %).
-  - **Profiles page** (2026-10-09; taken in this draft; ruling 29, lmgw's
+  - **Profiles page** (2026-10-09; design decision; ruling 29, lmgw's
     personality-profiles design §4.2, §5 and decision 7):
     - *The page.* A fourth rail item, *Personality*: a header that says which profile Kai's
       conversation talks with (the tray's checked Personality item, WP22's state: "Default
@@ -5280,6 +5317,43 @@ disjoint files, so they can run side by side:
     exposed to the core; the routines' switches on the Tools page (WP20); a System Settings
     entry (K29).
 
+- *As built, the settings catalog (2026-10-19; the owner's rule of that day, K29):*
+  - `src/settings/catalog/` gives every key its words: a label in sentence case, one plain help
+    line, its section, a unit (s, ms, MB, px, dBFS), a control and whether it is advanced tuning.
+    The controls are a switch, a choice with a human name per word (and one for "not set" where the
+    key is optional: "Automatic", "System default"), a number with a bound only where the loader
+    has one, a one-line text, a list (one item per line), read-only (`lmgw.url`, the routines'
+    switches), hidden (`conversation.folder_id`: a bare id, Kai's own bookkeeping), a picker over
+    what Kai can list (`audio.input`/`audio.output` from the tray's device lists, `ring.output`
+    and `overlay.output` from the compositor's outputs, by make and model with the connector in
+    brackets; `GET /api/devices`) and the Conversation's shared-or-own name (§4). A switch is a
+    plain checkbox and its help says what the setting does ("When off, …"), never "On, …". Each
+    entry carries the setting's default, and Reset shows only for a value that differs from it,
+    in a column of its own. Choice names are one set: the Tools and Desktop pages use the
+    catalog's ("Kai's own key", "You", "Trusted callers", "Any caller"). Not yet pickers:
+    `policy.trusted_callers` and `trusted_approvers` stay one `kind:name` per line (no list of
+    known callers exists to pick from). A map's entries share one pattern entry (`policy.tools.*`, `weather.places.*`) whose
+    label may name the entry.
+  - The wire: each `Entry` carries `meta` (the catalog's words, the section's heading, the order)
+    in place of the old `choices`. The serde probe that read an enum's words (`choices.rs`) is now
+    the tests' check that a choice's words are exactly its type's; a number's bounds are checked
+    against the loader the same way. `every_key_has_a_catalog_entry` fails for a key with no entry,
+    so no key ships unlabelled.
+  - The Settings page shows the sections in the catalog's order (Conversation, Voice, Audio, Voice
+    ring, Overlays, Approvals, Helpers, Routines and jobs, Reading and running, Trust, Updates,
+    Connection; the policy table's and the providers' keys stay on the Tools and Desktop pages),
+    each with its everyday settings first and the rest folded under "Advanced", groups under a
+    heading (the overlay kinds, the weather places). A row is the label, the control with its unit
+    after it, and the help line; the key is the row's tooltip. A number is checked against its
+    bounds before it is sent; a refusal of the window's write names settings by their labels
+    (`catalog::in_words`, the core's window path and the "always allow" notification only: the owner
+    tools keep the keys a model writes). It words a loader refusal from `ConfigError::Invalid`'s
+    own key, value and rule, without the file's path; a file-level error (parse, read, write)
+    keeps the path, the fact the owner needs. `conversation.folder_id` set by hand picks its
+    folder whatever the name, so a hand edit of `folder_name` while Kai is stopped is overridden
+    by the id at the next start (the config comment says so): treating a name mismatch as a
+    rename would orphan the folder whenever the owner renames it in lmgw.
+  - `conversation.folder_name` takes effect at once (§4's shared or own).
 **WP22. `personality_set` and the tray's profile picker** (ruling 29, K31).
 - Owns: `src/personality.rs`, its contract entry; hook lines in `src/core/calls.rs` and the tray.
 - Depends on: M6, WP8.
@@ -5327,7 +5401,439 @@ brainstormed in `docs/ideas.md` ("App memory") first; this WP waits for that des
 **WP24. Browser integration** (rulings 5 and 18, §11.1). `crates/kai-browser-host`, its manifests in
 `packaging/`, `src/browser/` (the socket). Depends on §16 Q20 (its tools); the extension can wait
 (§11.2). *Parked, 2026-10-09 (§16 Q20 as answered by the owner):* brainstormed in
-`docs/ideas.md` ("Browser integration") first; this WP waits for that design.
+`docs/ideas.md` ("Browser integration") first; this WP waits for that design. *Changed
+2026-11-03:* designed in `kai-firefox` (`docs/design/2026-11-03-kai-firefox-design.md`). Its WP1
+(the socket with its peer check, the host, the dev manifest), its WP5 (the `browser` contract area
+and provider) and Kai's parts of its WP6 to WP11 are this WP, built in that design's order.
+
+*Design decision, 2026-11-03 (kai-firefox WP9, Kai's half: announcements and reading aloud,
+`src/voice/speak.rs`, `src/browser/announce.rs`, `src/browser/tools/aloud.rs`):*
+- **Kai's speech without a model is never the owner's turn** (its mic echo in continuous
+  listening). lmgw does not know this speech, so the microphone can carry it back to lmgw's
+  detector. In half duplex the session hears silence while it plays, as before. In full duplex
+  the microphone stays live so a barge-in by voice still stops it; a `speech_started` while it
+  plays, or within `browser.speech_echo_guard_ms` (default 500 ms) after it stopped, cuts it and is
+  spent on the cut, as a talk press over a reply is (K6): Kai sends `input_audio_buffer.clear`
+  (lmgw's `realtime/input.rs`: the uncommitted audio and the open turn go, the detector starts
+  afresh), and the session hears silence for that guard after every stop (its end, a cut, Kai's
+  reply), so the echo's tail starts no turn. Only what the owner says after the guard forms a turn.
+  Chosen over gating the microphone during the speech: voice barge-in matters most to the
+  accessibility use this serves, and the clear makes it safe. The cost: words begun while it plays
+  are spent, as a press is; the owner says them again.
+- **Kai's own words** in announcements and notices are in Kai's reply language (the conversation
+  thread's `voice_resolved.reply_language`) for German, and in English for every other language and
+  for none; page text is said as it is. Both forms are made with each sentence, so the speech picks
+  when it speaks.
+- **The speech request carries `language` nowhere and the thread's `seed` only where lmgw's own
+  speech would send one.** `POST /v1/audio/speech` passes a client's fields to whatever answers,
+  while lmgw's own speech (`proxy/synthesize.rs`' `clause_body`) sends a language only to an lmgw
+  audio row that takes it (Kokoro refuses a mismatch, others answer a code they lack with a 500)
+  and a seed only to an lmgw row that reads one (`sends_seed`), never to a cloud route. A client
+  sees neither fact yet, so Kai sends no language (a `browser.read.voices` entry names a voice for
+  its language), and keeps the seed only where the thread says its text-to-speech alias is served
+  on this machine (`tts.local`) and every fallback it names is too; a local row that reads no seed
+  ignores it. Not yet: lmgw telling a client which rows take a language or a seed.
+- **The quiet moment** for this speech is the jobs' (`voice/jobs.rs`' `not_quiet`: locked, muted,
+  the feed down, the talk key, an approval, another client's turn (K16), the session busy or on its
+  way), plus do not disturb and PipeWire up, then `browser.speech_quiet_ms` (default 1500 ms, as
+  `jobs.quiet_ms`), so lmgw's quiet points between a turn's tool rounds start nothing a reply then
+  takes back. Nothing is made before; a notice that cannot be spoken (its speech failed, PipeWire
+  down, do not disturb) becomes a desktop notification.
+- **Announcements wait at most `browser.announce_max_age_s`** (default 60 s), checked when made and
+  when played with the site rules and Firefox's focus; dropped ones are counted in
+  `browser_context`, as are those dropped while the screen was locked.
+- **Reading aloud's failures**: a paragraph lmgw refuses (a 4xx) is skipped with one spoken notice,
+  a second refusal in a row pauses; any other failure pauses with one notice; a resumed paragraph
+  that fails again is skipped with a notice.
+
+*Design decision, 2026-11-03 (kai-firefox WP10b, the design findings of its acceptance runs,
+narrowed by its security review the same day: `src/browser/moves.rs`, `tools/act.rs`,
+`tools/tabs.rs`, `src/approvals/asked.rs`, `src/voice/speak.rs`, `src/voice/approval.rs`,
+`src/voice/jobs.rs`, `src/browser/announce/words.rs` and `words/asked.rs`):*
+- **The owner's own moves through Kai count as the user's act, hands free, and only these.** The
+  focus rule anchors on the site where the user last clicked or typed in the tab, and a hands-free
+  user never does. With the hands-and-eyes switch on, these moves Kai makes in a turn the owner
+  started count as the user's own act there (`Moves::owned`): a press of a link that loads another
+  document by GET or of a submit control, an Enter that submits a form, `tab_go`, `tab_open`,
+  `tab_back`, `tab_forward` (navigations, which move the tab's site to where they went), and
+  `tab_switch` and the tab Firefox shows after the owner had Kai close theirs (activations; these
+  two go beyond the proposal, since a hands-free user switches and closes tabs through Kai too). A
+  navigation counts only where the tab landed on the origin it was meant for, as kai-firefox's
+  contract says it (`goes`): the link's `href`, the form's action, `tab_go`'s or `tab_open`'s URL,
+  the engine a search began at, the history entry back or forward went to; for the trusted press,
+  the tab in front afterwards (the pressed one on a new page, or one Kai's key opened) on the
+  link's or the form's origin. A redirect to another origin, a navigation the page makes itself
+  (on a scroll, an input, a hover, a key, a timer), an Enter on a link and a window the page opens
+  under Kai's press are Kai's navigation, asked about as for anyone. "The owner started" is a call
+  of Kai's own device (`Caller::Own`: its voice session, its typed turn, the sidebar), never
+  another principal's turn, lmgw's own runs, a routine, the command line or a page's event, and
+  not while Kai's voice runs its continuation for jobs' results (`Jobs::continuing`: its calls are
+  `Caller::Own`, but what the model answers there is tool output). The owner's act is newer than
+  the extension's facts until the user acts there by hand. Kai keeps it beside its own marks: Kai's
+  later moves for anyone else (a switch, a raised window, a tab opened) end it, its site included;
+  the owner's own switch keeps the site the owner's moves gave the tab; a close that failed, or
+  whose call ended unanswered, hands the next tab to nobody. It counts only while the switch is on
+  (`Moves::verdict`'s `hands_free`): switched off, the rule is as it was without it, also for
+  marks left from while it was on. **The risks:** with the switch on, text on a page can steer Kai
+  to another site through a link it presses or a URL the model writes, where Kai then acts without
+  asking; the commit guard and the network gate still ask before a write and before a GET to a
+  site the user never visited. In conversation mode the microphone hears what Firefox plays unless
+  echo cancellation removes it (Kai's echo modes, §6.2: the `device` mode leaves it to the microphone's own echo cancellation, the
+  `app` mode cancels what plays through PipeWire's echo-cancel), so a page's audio can become a
+  turn of the owner's, whose calls are `Caller::Own`.
+- **Every acting operation is Kai's navigation** (the rule as written, kai-firefox WP10's probe,
+  and the review's L1): each is marked before it is sent, as `tab_go` is (`Moves::navigated`), and
+  landed once it answered or failed (`Moves::landed`), so the site the tab is anchored on stays
+  where it was wherever the page went: a press that left its page, a navigation that commits
+  after the commit guard's window (the guard off: no window), a call that failed, was cancelled
+  or timed out, and the trusted press around its real key; also where the user never acted in the
+  tab (before WP10b such a tab had no site, and Kai acted unasked wherever its press went). With
+  the switch on and the owner's turn, the moves above are the owner's act instead.
+- **Kai's own questions are spoken and answered by voice** (`crate::approvals::asked`), the way
+  the approval card's calls of Kai's own are (K17): the focus rule's question, `element_file`'s,
+  the commit guard's page-side verdicts, its network gate's and the trusted press's real key
+  (review L4), for a call of Kai's own only. The asker gives the question in Kai's words
+  (`Prepared::spoken`, `guard::ask_owner_spoken`): Kai's words first and the page's text last,
+  introduced as the page's ("May Kai press the link? Kai opened this tab. Yes or no? The page calls
+  the link: Order now"), a name past `browser.announce_max_chars` left out, in English and German;
+  a file `element_file` sends is named after the field's name, as the file's ("The file is named:
+  …"), since a name in `~/Downloads` can be one a page chose (L3). Kai's dialog shows as before
+  (`VoiceConfirmer` beside `Dialog`); the first answer decides and closes the other. **One question
+  at a time** (M2): the oldest waiting is spoken, the next once the one before is over (answered
+  at the dialog or by voice, or no longer waited for), first in line while its call waits
+  (`Kind::Question`), not at the quiet moment (the session's response waits for that call), once
+  Kai's reply has stopped playing, no talk key is held and no answer is being recorded; under do
+  not disturb or with PipeWire down it is not spoken and the dialog stands alone. While a question
+  waits the session gets no audio (a spoken yes would become a turn, which ends the call's
+  response). K17's safety holds: a press records the answer only once the question was spoken (a
+  press during it only stops it), the recording must hold speech, it is transcribed in Kai's own
+  thread and matched whole against `approvals.yes` and `approvals.no`; a barge-in or a press is
+  never a yes. Neither yes nor no, or no speech: Kai says "Kai heard neither yes nor no. Hold the
+  talk key and say yes or no." and waits on. **The press answers what was heard last** (M2, L4):
+  of a card's call of Kai's own the card armed for and a question whose speech ended, the one that
+  became answerable last (Kai's "say yes or no" makes its question that again); a card's call not
+  armed yet holds back no question. **Nothing Kai said is the answer** (M1): the recording starts
+  at the press with no pre-roll, the answer press stops Kai's own speech (another question's or a
+  reading's) as well as its reply, and what the microphone hears while Kai's reply or its own
+  speech plays and `browser.speech_echo_guard_ms` after is silence in the answer; the approval
+  card's spoken answer takes the same rule, since the end of a reply asking "yes or no?" was in its
+  pre-roll too. The cost: an owner who speaks at once over Kai's voice loses the first half second
+  of the answer, and is asked again. Not yet: an answer without the talk key in conversation mode
+  (the approval card has none either), muting Firefox's tabs while a question waits (a page's audio
+  is in the answer unless echo cancellation removes it; muting would change the user's tabs and
+  need restoring after a crash), and Kai's questions outside the browser.
+- **A live region is said with its place** (the contract's live `name`): "The page says, at “Tip
+  for the courier”: 3", the name quoted inside the framing like a field's, left out past
+  `browser.announce_max_chars`; `browser_context`'s line names it too.
+- **The contract's role words for inputs** (`file`, `date`, `time`, `datetime`, `month`, `week`,
+  `color`) have Kai's words ("file field", "Dateifeld", …), as `status` has.
+
+*Design decision, 2026-11-03 (kai-firefox WP12: Firefox's own UI and the press through
+accessibility, `src/desktop/fdo/atspi.rs` and its `whole.rs`, `src/browser/tools/chrome.rs`,
+`src/browser/tools/trusted/accessible.rs`):*
+- **Only the pages a window shows are read or pressed in.** Firefox keeps every tab's page in the
+  accessibility tree and marks a background tab's page `VISIBLE` too; only the page in front is
+  `SHOWING` (kai-firefox WP0 (d2)). A document directly below a window's own UI (a tab's page, a
+  page's dialog) is walked only while `SHOWING`; the frames inside it are walked as the rest of
+  the page is, scrolled away or not; a press checks right before its action that its page is still
+  shown. `DocURL`'s empty answer, which Firefox gives `data:` and `blob:` documents, stays the
+  strictest rule.
+- **An element's actions are read again once** after `accessibility.action_settle_ms` (100 ms, a
+  visible setting) where the first `NActions` read said none: once per find for the elements the
+  query names, and at the press.
+- **The press through accessibility comes first** (kai-firefox §6.3's second route): where the
+  desktop offers accessibility, the link knows its Firefox's process and the extension serves
+  `element.mark@1`, `element.unmark@1` and `gate.open@1`, the trusted press is AT-SPI's `doAction`
+  on the element, which Firefox makes a trusted, user-activated click (WP0 (d)), with no window to
+  the front and no key on the desktop. An element not found on the bus takes the key's path; a
+  press that was sent is never sent again. It is decided as the key is (`key_press`'s state, or
+  `element_press`'s with the switch on; asked for a call approved in lmgw), refused while the
+  screen is locked, and bracketed by the input spans and the network gate as the key is. Not yet:
+  a setting to prefer the key.
+- **The ref→node mapping is a mark**: `element.mark@1` sets a new 128-bit value in the element's
+  `aria-kai-mark`, which Firefox gives the bus as the object attribute `kai-mark` within one 10 ms
+  poll (measured on Firefox 159 on a private bus); Kai searches the documents its windows show with
+  the Collection interface (frames of any origin included), takes the mark away at once, and takes
+  the element only when exactly one carries it and, where its document gives an address, in the
+  element's document. Chosen over matching role, name and bounds: identical buttons and frame
+  offsets make those ambiguous. The cost: the page's script can see the attribute for that moment.
+- **Firefox's own UI is two browser tools and `page_text`**: `firefox_ui` (read) and
+  `firefox_press` (act) in the `browser` area, listed only where the desktop offers accessibility;
+  `page_text` reads one of Firefox's own pages, Reader view or an error page through it. All three
+  only around the tab in front of its window, chosen over desk tools on Firefox's windows so the
+  site rules, the focus rule and the commit guard apply by the tab as for every browser tool.
+- **What they read**: a page's dialog in the tab's own panel, Firefox's prompts and popups open,
+  the notification bars and the tool bars. Left out, and counted: the tab strip (`tab_list` names
+  the tabs under the rules), the bookmarks tool bar and every history or bookmark entry (Firefox's
+  class `bookmark-item`), the address bar's text and suggestions (Firefox's own fields' texts are
+  never read), documents inside Firefox's UI (a sidebar's page, an extension's popup) and parts
+  Kai cannot place. Never read or pressed in: `about:logins`, the password manager's prompt, the
+  logins' autocomplete, a password field.
+- **Their site rules are the desktop tools' (`page_rule`)**: one of Firefox's own pages gets the
+  strictest rule configured; a page's dialog the stricter of its tab's rule and the origin its
+  title names, the strictest where it names none (a `beforeunload`'s, a frame's we cannot tell).
+  Not yet: a list of Firefox's own pages that show no site's content, which would read them while
+  some site is `none`.
+- **`firefox_press` stays confirmed** (not among the switch's tools), finds its control before the
+  confirmation so the dialog names it and a dialog's words, and with the commit guard on presses a
+  page dialog's button where it offers more than one, or a prompt of Firefox's for a site, only
+  after the owner's yes (that confirmation, or the guard's question where the call ran unasked).
+  Its press opens `gate.open@1` on the tab's page. A page `prompt()`'s text is not given yet: a
+  headless Firefox 159 answered EditableText's `SetTextContents` (and `InsertText`) on its field
+  with yes and kept the field as it was, so `firefox_press` takes no text (K22's two parameters
+  would need a tool of its own besides); the capability's `set_text` reads the field again and
+  says when a text was not taken. Whether a windowed Firefox takes it is not checked yet. Not
+  yet: Firefox's own fields (the address bar), the file and save dialogs (separate windows, not
+  seen headless), a dialog's frame's writes beyond the top page's gate, a Firefox that started
+  before accessibility was on (it does not join; the error says to restart it), and the moment
+  after a tab switch (about 230 ms on a headless Firefox) in which Firefox still shows the page
+  before as `SHOWING` too: a read or a press then can reach it, each judged by its own address.
+
+*Design decision, 2026-11-03 (kai-firefox WP12's security review round; these revise the
+WP12 drafts above where they differ; kai-firefox §14 items 37 to
+41):*
+- **`page_rule` is an allow-list:** only an `http:`, `https:` or `file:` page with a host gets its
+  site's rule; every other page gets the strictest rule configured. Another extension's
+  `moz-extension:` page has a host that is no site, so before this a password manager's vault in
+  a tab was `act`'s and `page_text` read it. WP7b's rule for pages without a host and the desktop
+  tools (`desktop/sites/pages.rs`, `browser/shown.rs`) read the same function, so they hold as
+  before and judge such pages the strictest way too.
+- **Never read or pressed in, whatever the rules** (`tools/chrome/never.rs`): `about:logins`,
+  another extension's page and Firefox's saved cards and addresses (`chrome://formautofill/`).
+  **Never pressed, read as the rules say:** `about:config`, `about:addons`, `about:debugging`,
+  `about:profiles`, `about:support`, `about:policies` and the whole of `about:preferences` (chosen
+  over its privacy and security panes alone: its panes are one document whose categories, search
+  and sub-dialogs reach every pane, and the General pane holds the proxy, the applications that
+  open file types and the updates); Firefox's add-on doorhangers (installs, permissions, optional
+  permissions such as `userScripts` and private-window access); a site's request to share the
+  screen or a window; a page dialog with a password field (a site's sign-in). A control named in
+  one is refused by name, whatever the commit guard and `firefox_press`'s state. Not on the list
+  yet: `about:downloads` (its "open" runs a downloaded file).
+- **The tab's own window** (`tools/chrome/window.rs`): the window whose page in front has the
+  tab's address and whose tab strip's selected tab is the tab (its title), not the address
+  alone. Its page in front is the page in its selected tab panel (Firefox's `deck-selected`), not
+  every page `SHOWING`: a headless Firefox 159 kept a background tab's page `SHOWING` for good
+  (the first tab's, after an add-on opened a tab), and the page before for about 230 ms after a
+  switch. Two shown pages with no selected panel (a split view) are refused. Not yet: the
+  provider's own walk (`read_window`, `ui_press`) still takes every `SHOWING` page, so a page
+  Firefox keeps `SHOWING` is read there too, judged by its own address. Firefox 159's error page
+  gives the address that failed as `DocURL` (checked on a private bus);
+  an `about:neterror?u=` form would be read as its `u`.
+- **What `firefox_ui` reads is an allow-list** (`tools/chrome/parts.rs`): the page's dialog
+  (`commonDialog.xhtml` in the tab's own panel only), Firefox's prompt for the tab's site, the
+  notification bars, the main tool bars without the tab strip, and the menus (the application
+  menu's main view by its items' ids, open menus); everything else left out and counted (the
+  all-tabs list, the downloads, synced and recently closed tabs, saved cards' and addresses' save
+  prompts, every other prompt and panel). Firefox 159 exposes a prompt's parts, not the prompt, so
+  a prompt is a site's when its description names the tab's site (host and port, as Firefox writes
+  them) and it holds nothing but the generic parts and the camera, microphone, speaker, screen,
+  serial port and canvas choices; add-on prompts are told by their `addon-` ids.
+- **A prompt for a site says what it grants and is always asked:** its words are in the
+  confirmation ("Firefox's prompt for a site says: “Allow example.com to use your camera and
+  microphone?”", each check box with its state, the sites it names), it is judged by the stricter
+  of the tab's rule and every site it names, and it is pressed only after the owner's yes to those
+  words, whatever the commit guard and the tool's state (the call's own confirmation, or a
+  question of its own where the policy let the call run unasked). So is a notification bar's
+  button (Firefox's bars carry a site's pop-ups, DRM and other permissions), with the bar's words.
+  A dialog's choice keeps the commit guard's yes.
+- **Read again right before `doAction`:** after the confirmation and again right before the press
+  Kai reads the tab (the extension's listing: same address, still the tab in front), its window
+  (the selected tab), and the control (shown, the same part, role, name and words); any difference
+  refuses and says what changed, and the element pressed is the one the last read found. An
+  element of Firefox's own UI is pressed only while it is `SHOWING` itself
+  (`Accessibility::found_at`), since it has no page whose `SHOWING` would say it.
+- **The press through accessibility, tightened:** Kai searches only the page of the tab's own
+  window (`Accessibility::find_marked` takes the page; it says one, none or several). Several is
+  the page copying the mark: refused as tampering, with no fall back to the key. The element's
+  documents must be the frames the extension names (`element.mark@1`'s new `frames`, top page
+  first; an empty `DocURL` is refused where the extension gave an address), each passes
+  `page_rule` and is none Kai never reads, and the bus's role and name fit the extension's
+  (`trusted/accessible.rs`' role table for the roles a press takes; the name whitespace and case
+  aside, Firefox adding a file input's button and state after it). The window is looked at again
+  right before the press. The extension takes a mark away by itself after `MARK_TTL_MS` (5000 ms),
+  a constant of its contract, not a setting: Kai searches at once and unmarks at once.
+- **Kept gates:** each kept gate of a document gets its own `click_seen` element (kai-firefox's
+  content script sends one per gate).
+
+*Design decision, 2026-11-03 (kai-firefox WP11, Kai's half: the RPM's host and manifest and the
+settings window's "Install Kai for Firefox"; `packaging/kai.spec`, `packaging/dev.rootshell.kai.json.in`,
+`scripts/browser-manifest.sh`, `src/browser/install.rs`, `ui/src/firefox.rs`):*
+- **The RPM ships the host and a system manifest.** `kai-browser-host` goes to
+  `%{_libexecdir}/kai/` (`/usr/libexec/kai/kai-browser-host`: Kai's own helper, not a command) and
+  the manifest to `%{_libdir}/mozilla/native-messaging-hosts/dev.rootshell.kai.json`
+  (`/usr/lib64/...`). Where Firefox looks was read from Firefox 159's own files on Fedora 44
+  (`firefox-159.0-1.fc44`): `NativeManifests.sys.mjs` takes two folders, `XREUserNativeManifests`
+  (`~/.mozilla`) and `XRESysNativeManifests`, and `libxul.so` holds `/usr/lib64/mozilla` as the only
+  system path (a 64-bit Firefox never reads `/usr/lib/mozilla/native-messaging-hosts`, which
+  `mozilla-filesystem` creates too); Fedora's own `plasma-browser-integration` installs its manifest
+  in the same `/usr/lib64` folder. The package requires `mozilla-filesystem`, which owns the folder.
+  The spec builds the workspace, so the host comes from the same build as Kai.
+- **One manifest source.** The manifest is `packaging/dev.rootshell.kai.json.in` made by
+  `scripts/browser-manifest.sh`: the RPM's `%install` and `scripts/browser-dev.sh` both call it, so the
+  name, the type and the one extension that may start the host (`kai-firefox@rootshell.dev`) are
+  written once, and only the path and the description differ. `src/browser/tests/manifest.rs` runs the
+  script as the spec does and reads the spec's own lines (the workspace build, both `install` lines,
+  `%files`, `Requires`).
+- **A dev manifest shadows the RPM's, and removing it is the way back.** Firefox reads the user's
+  `~/.mozilla/native-messaging-hosts` first, so while `just browser-dev`'s manifest exists every
+  profile starts the checkout's debug host. `browser-dev.sh install` already said so;
+  `just browser-dev-remove` now also says which manifest Firefox reads next (the RPM's, with the
+  host it names, or none).
+- **"Install Kai for Firefox" opens the build's link.** Firefox installs signed XPIs only, and the
+  signed file's URL depends on the channel (the builds channel's needs a deploy token while
+  the builds channel's registry is private, the releases channel's is public). So the link is compiled in
+  from `KAI_FIREFOX_INSTALL_URL` (`option_env!`, as the updater's feed), which Kai's CI sets per
+  channel: a CI variable (`.gitlab-ci.yml`) for the private builds channel, a repository variable
+  (`.github/workflows/release.yml`) for the releases channel, which `packaging/gh-build.sh` refuses
+  when it carries credentials. Chosen over a setting (a key the owner or a tool could point at any
+  address, with a token in the configuration file) and over a run-time lookup (a network call and a
+  token at run time). The cost: a build cannot change its link.
+- **The link never reaches the page or the log.** It may hold a token. The settings page learns only
+  whether the build has a usable link (`GET /api/browser`), the click (`POST /api/browser/install`)
+  has the core hand it to `xdg-open`, the log names the link's host at most, and the errors say the
+  rule, not the link. It must be `https` (Firefox installs an add-on only from a secure origin;
+  `http` only to this computer, for a try with a local server); user information is allowed.
+- **`xdg-open`, not `firefox <url>`.** Kai opens other addresses the same way, and KIO starts the
+  browser in its own app scope; a Firefox that Kai started itself would run in Kai's unit and fail
+  Kai's own peer check (`browser.peer_scopes`). So the button opens the link in the default browser,
+  and the section says that it has to be Firefox. Not yet: a launch of Firefox itself when the
+  default browser is another.
+- **Without a link the section says how to install by hand:** the signed `.xpi`, about:addons, the
+  gear, "Install Add-on From File…". A link that is set but unusable says why first.
+- **Connected now** is the browser server's link count (`Command::BrowserLinked`, one per Firefox
+  profile whose extension was welcomed): the section reads it when it opens and again at the
+  `kai-browser` event the core sends the window at each change. Not yet: telling a missing host or
+  manifest from a Firefox that is not running.
+- **Not yet:** neither channel serves the newest XPI under a name that does not change. kai-firefox
+  uploads `kai-firefox-<version>.xpi` to the registry and the release, and GitHub's
+  `releases/latest/download/` needs a fixed asset name, so a variable that always points at the
+  newest signed file needs kai-firefox to upload a copy under a fixed name too; until then the
+  variable names one version's file and is moved at each release. No pipeline has run, so Firefox's
+  handling of the link (an XPI served as `application/octet-stream`, a private channel's user
+  information) is not observed.
+
+*Design decision, 2026-11-03 (kai-firefox WP8a, Kai's half: the sidebar's proxy and its turn
+marking; `src/browser/sidebar/`, `src/lmgw_link/proxy/relay.rs`, `src/core/sidebar.rs`; the wire is
+kai-firefox's `docs/protocol/operations.md`, "The sidebar's requests"; kai-firefox §14 items 42 to 50):*
+- **The sidebar's requests go through the core and the voice's link,** as the settings window's
+  Personality page does (`Command::Sidebar`, `VoiceLink::sidebar`): one HTTP client with Kai's
+  device certificate, the pairing's state and words in one place, and the voice's tests can hold a
+  request open. `browser.sock`'s reader parses and admits a `req` and hands it on; the exchange runs
+  in a task of its own.
+- **The admit list is the Chat's call sites, not the Chat plane.** Read in lmgw's `lmgw-chat-ui`
+  and the kit pieces it renders (WP3b, checked against lmgw 0.6.0): 51
+  method-and-path routes. Out: the profile editor's writes (the Chat only lists profiles; the
+  editor stays the settings window's and the dashboard's), `GET /chat/api/profiles/{id}` (nothing
+  calls it), `GET /chat/api/folders` (the Chat reads the folders inside `GET /chat/api/threads`),
+  `/v1/realtime` (not proxied yet), every `/api` route and the rest of `/v1`. `{id}` is any `i64`
+  lmgw reads, and every segment is checked percent-decoded: not empty, `.` or `..`, no `/` or `\`,
+  since a URL library reads `%2e%2e` as `..` and `…/tasks/%2e%2e/cancel` would reach another
+  route. Dictation's `transcribe` and `voice/warm` are in: the Chat calls them, and the sidebar
+  shows no voice controls until it has voice. A query passes as it came, checked only for its
+  characters: lmgw reads it, and the Chat's queries are many. Why not the whole plane: a route the
+  Chat does not call is one more thing a compromised page beside it could reach with Kai's
+  identity, for nothing.
+- **Headers:** the page may send `content-type` and `last-event-id`; any other is refused (400
+  `header_not_admitted`), not dropped, so a Chat that starts sending one fails visibly instead of
+  being changed silently. Back: `content-type`, `content-disposition`, `retry-after` and every
+  `x-lmgw-*`, nothing else of lmgw's (no cookies, no server headers). Content types pass as lmgw
+  sent them, unlike the settings window's reduced set: the Chat shows proxied bytes only as an
+  `<img>`, an `<audio>` or a download, and a download keeps its type.
+- **Whole or stream is the page's word** (`read`, the kit's `Read`). A whole answer is read first
+  under `window.proxy_max_mb`, so its refusal (502 `answer_too_large`, as soon as `content-length`
+  says it) is a status the Chat shows in a picture's box or a recording's toast; `window.proxy_timeout_s`
+  bounds its whole exchange, as for the settings window. A stream's head is timed and its body is
+  not bounded at all: nothing holds it, and the feed runs for hours (its dead link is the page's
+  watchdog, lmgw's D23). The two `window.proxy_*` settings serve both pages and say so (relabelled,
+  and they take effect at the next request, which they always did).
+- **The window is Kai's, in bytes, and the acks are the page's** (`browser.sidebar_ahead_mb`,
+  default 4 MB, 0 none): Kai sends a piece while the unacknowledged pieces, it included, stay within
+  it, and one piece always goes (a piece is at most 1 MiB, Firefox's message limit). While full,
+  Kai reads no more of lmgw's stream, so the pressure ends on lmgw's connection. The page acks
+  each piece as it takes it from its port, cumulatively, counted like `end`'s `seq`, for whole
+  answers and streams alike: only a stream's consumer may pace, and a whole answer acked only once
+  complete would stall forever past the window (kai-firefox WP8b's transport must ack so). An ack
+  above the pieces sent counts those and is logged, so `u64::MAX` does not take the window away.
+  The background passes acks on and makes none, since a runtime port has no backpressure either.
+  Bytes and not pieces, because a piece is 30 bytes of SSE or 1 MiB of a picture; cumulative, so a
+  late or coalesced ack is made good by the next.
+- **Bodies:** a request's body rides inside its `req` frame (text or base64), which the extension
+  splits like any long frame: a body never interleaves with other frames' pieces, and Kai's joiner
+  is the one it has. An answer is text where it is UTF-8 JSON or `text/*` (whole) or an SSE or JSON
+  stream (decoded as SSE decodes: an invalid sequence is U+FFFD, a character split between lmgw's
+  chunks kept whole), base64 otherwise, each base64 piece whole 3-byte groups so it decodes alone.
+- **Cancel:** an `abort` drops the request (lmgw sees the connection go: a send's turn stops, as the
+  dashboard's Stop does) and Kai sends nothing more for it; no confirmation, since the page has
+  stopped listening. A link that ends ends all its requests. Leaving the gateway (a pairing with
+  another lmgw begins, the key is revoked: `Core::drop_requests`) ends every open request with
+  `end` and `gateway_left`, before its head or after it, since the link stays and the page would
+  otherwise wait on a stream of a gateway Kai left. A second `req` under an open id is an `error`
+  frame (`duplicate_req`), since a `res` under that id would land in the first request; the
+  background ends the page's request with it and aborts Kai's under the id.
+- **Kai's refusals are `res` frames in lmgw's error shape** (`not_admitted` 404, `header_not_admitted`
+  and `bad_req` 400, `body_limit` 413, `not_paired` 503, `lmgw_unreachable` 502, `timeout` 504,
+  `answer_too_large` and `lmgw_broke_off` 502, `kai_quitting` and `no_proxy` 503, the latter on
+  `browser.sock` and on the voice's link alike), so the Chat shows them as it shows lmgw's; a stream
+  that breaks off after its head ends with an `end` carrying the error.
+- **The turn marking** (kai-firefox §8.3, `src/browser/sidebar/turns.rs`) is for the voice only
+  and never touches `Caller::Own`: the sidebar is Kai, its turns' tool calls reach Kai as
+  `Caller::Own` and count as the owner's act in hands-free mode (WP10b's `moves.rs`, `tools.rs`,
+  `approvals/asked.rs`). The core passes the feed's facts through it before the voice reads them,
+  and a turn read as the sidebar's becomes `By::sidebar()` ("Kai's sidebar in Firefox",
+  `own: false`, `sidebar: true`): K16 holds automatic listening back during it, and K17 does not
+  take its calls even in the conversation's thread (`Approvals::mine`): they are answered on the
+  card, which names the sidebar, or in the sidebar. Whose a turn is follows the turn:
+  - `send`, `continue`, `answer`, a message's `edit` and `regenerate` mark their thread before
+    they go; the thread's next own `turn.started` that is no voice turn takes the mark. The mark
+    lives while the request is open, then until the core read the thread's next `turn.started` or
+    `turn.done` (or a running list without the thread): the feed is its own connection, and a
+    short turn's stream can end before its start is read. A request lmgw refused (no success head:
+    lmgw refuses a turn route before a turn begins) drops its mark at once.
+  - A resume: lmgw runs a turn whose calls were decided as its starter, whoever decided them. An
+    own turn that is no voice turn while the thread's last reply waits on calls, or had calls
+    decided since its last `turn.started`, is read as the thread's last turn was. One whose turn Kai
+    never saw start (Kai started after it) is the sidebar's when the sidebar sent the verdicts
+    (`approvals` marks as a resume), else Kai's; not yet told apart otherwise.
+  - Any other own turn is Kai's: a voice turn never takes a mark, so Kai's spoken turn racing a
+    sidebar send stays Kai's, and so is an own turn neither marked nor a resume.
+  - A `hello`'s or `state`'s running list is read the same way, and the voice gives each entry to
+    the approvals as a `turn.started`, so the card is right after the feed came back.
+  - lmgw's `turn.done` carries no turn's id, and a turn that starts cancels the thread's running
+    one, whose `turn.done` comes after the new `turn.started` when the cancelled worker stops after
+    the new turn registered (lmgw `chat_live::begin_where`, `chat_feed::live::TurnWatch`). Kai
+    counts each thread's turns started and not done; a `turn.done` that leaves one running is the
+    cancelled turn's, and the voice does not hear it.
+  - Considered and not taken: reading every own turn that is no voice turn as the sidebar's unless
+    Kai started it itself. lmgw's `voice` on a bound session's turn is its speech plan, none for a
+    response with text output only, so that default would read such a response of Kai's own
+    session as the sidebar's.
+  An image card's action (`/chat/api/attachments/{id}/media`) starts no turn: lmgw runs it with no
+  model in the loop (lmgw's `chat_media/actions.rs`).
+
+*Design decision, 2026-11-04 (kai-firefox WP8b, Kai's half: the sidebar's site question;
+`src/browser/sidebar/site.rs`; the wire is kai-firefox's `docs/protocol/operations.md`, "The page's
+own calls"; kai-firefox §14 item 59):*
+- **The sidebar asks Kai a site's rule** for its site strip and "Attach this page" (kai-firefox
+  §8.1): `{t:"site", id, urls}` on `browser.sock`, answered `{t:"site", id, rules:[{site, rule}]}`
+  by the browser server itself from the rules the tools apply (`SiteRules::rule`; `""`, an opaque
+  origin, the strictest), read from the shared policy for every question, so a change of
+  `[browser.sites]` shows at the next question; nothing goes to lmgw, and the answer is what Kai's
+  settings window shows anyway. A question that does not read is an `error` frame `bad_site`.
+  `hosted_server` hands the policy back to `main` for it.
+- **The sidebar's real run** (`just live-check-sidebar`, `src/browser/tests/sidebar_live.rs`):
+  kai-firefox's page in a headless Firefox, through the real `kai-browser-host`, this server (the
+  peer check at its default scopes) and the sidebar relay (`relay::send`, `Reply::run`) over the
+  device link with a device the test pairs as Kai pairs (`voice::lmgw_live_tests::device`), to a
+  dev lmgw with an echoing mock. The core around the relay (the paired state, the turn marking,
+  leaving the gateway) is not in it; WP8a's tests cover it. Passed once, 2026-11-04.
+- *Review round (kai-firefox §14 items 59 and 71):* the answer applies `SiteRules::frame_rule`
+  instead of `rule`, so `"null"` (an opaque origin as a browser serializes it) gets the strictest
+  rule as `""` does; `rule` gave it `act`. The `welcome` lists the extension's frames Kai takes
+  (`takes`), as the `hello` lists the operations the extension serves, so the extension asks
+  `site` only of a Kai that answers it (a Kai before the list gets no question, and the strip says
+  "update Kai"); a frame of a type Kai does not take that carries an `id` is answered with an
+  `error` frame `unknown_frame` with that id, so nothing waits on a frame Kai dropped. `PROTOCOL`
+  stays 1: both are additive, and it is raised only for a change that is not.
 
 **WP25. The owner's acceptance,** twice: after WP12 (phase 2) and at the end of phase 3. The RPM
 with the restricted-interface keys, installed; the grant on the owner's lmgw; PD5's step; real voice,
@@ -5551,6 +6057,68 @@ Each is recorded where it applies; this list points there.
   rule, examples, speech style and voice, reasoning, voice block; K31), with the profile editor in
   the shared UI crate. Kai depends on it; until then the owner keeps the current prompt.
 - **A port to GTK4 and webkitgtk-6.0,** if the 4.1 API is dropped.
+- **Kai's browser site rules in the desktop's tools** (raised by kai-firefox WP7's review; built
+  for the tab in front, 2026-11-03, kai-firefox WP7b and its review round, `src/browser/shown.rs`,
+  `src/desktop/sites.rs` and `src/desktop/sites/`): `see_window`, `read_window` and
+  `read_selection` refuse a Firefox window whose tab in front is on a `none` site, checked before
+  and after; `see_screen` blanks such a window grey by its frame (read before and after the
+  capture, whatever lies over it included); `ui_press`, `type_text` and `key_press` refuse one on a
+  `read` or `none` site, before the dialog, after it, and for the keys again once the focus is back
+  and whenever the window's title changes between two keys. A Firefox window whose page Kai cannot
+  tell gets the strictest rule there is: no linked Firefox owns it, its title fits no tab in front
+  (Private Browsing in any language, Firefox's own windows, a title KWin changed or cut), a tab in
+  front fits two windows of that Firefox (one look takes all its windows), its tab in front has no
+  site (`about:`, `data:`, `file:`, `blob:` of an opaque origin; an `about:blank` keeps no
+  opener's rule, since the listing does not name the opener), or, for a capture, that tab is still
+  loading or came to the front within `browser.see_settle_ms` (500 ms). While a site is `none`,
+  `see_window` refuses a Firefox window that is minimized or only on another desktop, and
+  `see_screen` refuses while KWin runs an effect not known to keep windows on their frames
+  (`activeEffects`, before and after the capture). `read_window` and `read_selection` judge each
+  page and frame they read by its AT-SPI `DocURL` and leave out those Kai may not read, and take
+  Firefox's window on the accessibility bus by its exact name; `ui_press` presses only inside a
+  page whose page and frame Kai may act on, never Firefox's own controls under the rules. Under
+  the rules `key_press` refuses Firefox's tab, address, history and panel chords, and while a site
+  is `none` the desktop's window shortcuts (Meta, Alt+Tab, Ctrl+F-keys …); before each key the
+  frame with the keyboard focus is checked by its own site (`context.get@1`). `look` and `find`
+  call the same tools. With no rule that could refuse a tool, nothing is checked or listed.
+  **Not covered yet:**
+  - in a desktop capture, everything Firefox's window shows besides its tab in front: a frame of a
+    `none` site inside an `act` page, a second tab of a split view, the sidebar (web panels, the
+    history, the bookmarks), DevTools docked in the window, and other tabs' titles in the tab
+    strip (the answers say so; `page_see` and `element_see` blank such frames, kai-firefox design
+    §6.4); in a read, other tabs' titles in the tab strip. The extension's tab listing does not say
+    which tabs a split view or a web panel shows, so only the tab in front decides the window;
+  - of Firefox's own surfaces that show other sites' titles and addresses, the windows of their
+    own (the Library, Page Info, DevTools undocked) count as untold, so they are refused or
+    blanked, and `key_press` refuses their shortcuts under the rules; inside the browser window
+    (the history and bookmarks sidebars, docked DevTools) a capture shows them as the first item
+    says, and a read leaves out their `chrome:` documents only while a site is `none`;
+  - a keyboard focus already in Firefox's own controls (the address bar, the search bar, the
+    sidebar): `context.get@1` does not tell it from the page's body, so keys there are judged by
+    the page's rule, and an address typed there loads without `tab_go`'s rules; a focus a page's
+    script moves between the frame check and the key is seen at the next key only. Acting through
+    a `none` or `read` frame is otherwise closed (keys by the focused frame's origin, presses by
+    the element's documents);
+  - a page that finished loading has no time in the listing, so the settling time covers tab
+    switches and loading only; a Firefox window hidden otherwise (another activity, covered whole
+    by other windows, where Firefox may stop painting) is captured as the compositor has it;
+  - shortcuts the owner rebound: Firefox's chords and KWin's or Plasma's shortcuts on other keys
+    than the defaults are not told apart (kglobalaccel is not read yet);
+  - the compositor's previews of a window outside KWin's effects (the task switcher's and the
+    task bar's thumbnails), and an effect that starts and ends between `see_screen`'s two looks:
+    a model gets there with two allowed calls sent together, a window tool (`window_minimize`,
+    `window_to_desktop`) and `see_screen`, or by the user's own shortcut; a third-party effect
+    that is always active refuses every `see_screen` while a site is `none` (the answer names
+    it);
+  - Firefox's window titles in `window_list`, `desktop_context` and the delegates' window list;
+  - the window tools (`window_close`, …) on such a window;
+  - Firefox's popups (a `<select>`'s list, menus), which the window list does not name;
+  - a `none` site's desktop notifications in `see_screen`: plasmashell draws them, not Firefox;
+  - MPRIS: a `none` tab's media title in `desktop_context`, and `media_play_pause` on its media;
+  - `clipboard_get` of text copied there; `open`, `app_launch` and `run_command` with a URL on
+    such a site (Firefox loads it; `tab_open` and `tab_go` refuse it).
+  Open: `page_see` among `look`'s tools (the browser provider beside the desktop's in the
+  delegate's).
 - **Spoken filler while a tool runs** (realtime §19), and the phone's push and assist app.
   *Note, 2026-10-08:* K26's few-second synchronous class (`look`, `find`, short delegates) makes
   the filler more pressing.

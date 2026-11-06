@@ -40,6 +40,11 @@
 //!   and otherwise gives up with a notification (the result waits in its chat). A cough is never a
 //!   continuation (lmgw: only the client's own create is), so it never speaks a result; Kai never
 //!   answers a cough's `empty_turn` with a create.
+//! - **Not the owner's turn** (kai-firefox WP10b's review, M3): while the continuation runs (its
+//!   create sent, until its response ended or was refused) the job table says so
+//!   (`crate::jobs::Jobs::continuing`), and the browser's focus rule takes none of its calls'
+//!   moves for the owner's own: they come as Kai's own, but what the model answers there is tool
+//!   output.
 //! - **The screen lock** (WP18, a draft of 2026-10-09):
 //!   results that arrive while locked wait, notifications included; after the unlock they are
 //!   spoken (or notified) at the first quiet moment. The lock ended the session, so a spoken one
@@ -200,6 +205,9 @@ impl<L: VoiceLink> Voice<L> {
     pub fn set_dnd(&mut self, on: bool) {
         self.results.dnd = on;
         self.jobs_wake();
+        if self.speak.busy() {
+            self.ensure_tick();
+        }
     }
 
     /// Something the jobs' wait reads changed outside an event of the session (the feed's live
@@ -252,22 +260,47 @@ impl<L: VoiceLink> Voice<L> {
 
     /// Nothing goes on that a spoken result would cut into (module doc), for `thread`.
     fn jobs_quiet(&self, thread: i64) -> bool {
-        if self.locked || self.muted || !self.feed_up || self.key.is_some() {
-            return false;
+        self.not_quiet(Some(thread)).is_none()
+    }
+
+    /// What goes on that Kai's own speech would cut into, for `thread` (module doc's quiet
+    /// moment): `None` at a quiet moment. A job's result and Kai's speech without a model
+    /// (`super::speak`) both wait for it, each with its own hold-off after it.
+    pub(super) fn not_quiet(&self, thread: Option<i64>) -> Option<&'static str> {
+        if self.locked {
+            return Some("the screen is locked");
+        }
+        if self.muted {
+            return Some("Kai is muted");
+        }
+        if !self.feed_up {
+            return Some("Kai's link to lmgw's feed is down");
+        }
+        if self.key.is_some() {
+            return Some("the talk key is held");
         }
         if self.approvals.gates_audio()
             || self.approvals.recording()
             || self.approvals.waiting_in_session(self.session_no)
         {
-            return false;
+            return Some("an approval waits for an answer");
         }
-        if self.turns_elsewhere.contains_key(&thread) {
-            return false;
+        if thread.is_some_and(|t| self.turns_elsewhere.contains_key(&t)) {
+            return Some("another client's turn runs in Kai's conversation");
         }
         match self.session.as_ref() {
-            Some(s) => s.created && s.quiet(),
-            None => !self.opening() && self.current_req.is_none(),
+            Some(s) if !(s.created && s.quiet()) => Some("Kai's voice session is busy"),
+            Some(_) => None,
+            None if self.opening() || self.current_req.is_some() => {
+                Some("Kai's voice session is opening")
+            }
+            None => None,
         }
+    }
+
+    /// Do not disturb is on (`crate::dnd`).
+    pub(super) fn results_dnd(&self) -> bool {
+        self.results.dnd
     }
 
     /// The tick's part (module doc).
@@ -404,6 +437,7 @@ impl<L: VoiceLink> Voice<L> {
                     event_id,
                     response: None,
                 });
+                self.results_continuing();
             }
             Some(_) => self.jobs_not_spoken(
                 target,
@@ -431,6 +465,13 @@ impl<L: VoiceLink> Voice<L> {
             }
             None => self.jobs_not_spoken(target, "it waits in its chat"),
         }
+    }
+
+    /// Tells the job table whether the continuation runs now (module doc).
+    pub(super) fn results_continuing(&self) {
+        self.results
+            .table
+            .set_continuing(self.results.create.is_some());
     }
 
     /// Every waiting result of `thread` is notified instead of spoken.

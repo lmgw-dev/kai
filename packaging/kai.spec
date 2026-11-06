@@ -16,7 +16,7 @@
 # KAI_UPDATE_DEPLOY_TOKEN and KAI_UPDATE_PUBLIC_FEED in rpmbuild's environment (CI sets them:
 # packaging/ci-build.sh the private feed with its token, packaging/gh-build.sh the public feed,
 # marked public so it never gets a token); a build without them has no feed.
-%{!?kai_version: %global kai_version 0.2.0}
+%{!?kai_version: %global kai_version 0.3.0}
 # The lmgw commit the tarball's lmgw crates come from (LMGW_PIN; packaging/build-rpm.sh defines it),
 # and how the description names that source: "commit <sha>" where the build's lmgw checkout holds the
 # pinned commit (the private checkout), else "<lmgw_tag> (tree <sha>)" (a clone of the public
@@ -43,6 +43,17 @@ Summary:        Voice, tray state and overlays for lmgw on Plasma
 License:        MIT
 URL:            https://github.com/lmgw-dev/kai
 Source0:        kai-%{version}.tar.gz
+
+# Kai for Firefox (kai-firefox design §4.5, §10): the native-messaging host kai-browser-host, which
+# Firefox starts for the extension, and the system manifest that tells Firefox where it is. Firefox
+# 159 on Fedora reads native manifests from the user's ~/.mozilla/native-messaging-hosts and, as
+# the only system folder, /usr/lib64/mozilla/native-messaging-hosts (libdir's mozilla folder; Fedora's
+# mozilla-filesystem owns it, as it owns /usr/lib/mozilla/native-messaging-hosts, which a 64-bit
+# Firefox does not read). The host is Kai's own helper, not a command, so it goes to libexec. The
+# extension itself is not installed by the RPM (Firefox takes signed XPIs only); Kai's settings
+# offer it.
+%global browser_host %{_libexecdir}/kai/kai-browser-host
+%global native_hosts %{_libdir}/mozilla/native-messaging-hosts
 
 # Rust's own debug info is not packaged (lmgw's RPM has none either); the binary is stripped.
 %global debug_package %{nil}
@@ -71,8 +82,14 @@ Requires:       xdg-desktop-portal-kde
 # spa-0.2/aec/libspa-aec-webrtc.so, which Fedora ships in pipewire-libs (a dependency of pipewire;
 # no package of its own, so no explicit Requires, which rpmlint rejects for libraries).
 Requires:       pipewire
-# Open in lmgw.
+# Open in lmgw, and the settings window's "Install Kai for Firefox".
 Requires:       xdg-utils
+# Owns the folder of Firefox's native manifests, so this package does not.
+Requires:       mozilla-filesystem
+# page_text reads a PDF in Firefox's viewer with poppler's pdftotext (kai-firefox design §5.3),
+# in a bwrap sandbox where bubblewrap is installed (without it unsandboxed, said in the log).
+Requires:       poppler-utils
+Recommends:     bubblewrap
 # The Secret Service for the device key (KWallet answers it on Plasma).
 Recommends:     kf6-kwallet
 
@@ -80,7 +97,8 @@ Recommends:     kf6-kwallet
 Kai is a Plasma desktop client of lmgw, the local model gateway:
 voice at any time through global shortcuts, a tray item with the gateway's
 state, a ring overlay while a turn runs, and the lmgw-pair: link handler
-that pairs it with a gateway.
+that pairs it with a gateway. It also carries the native-messaging host and the
+manifest Kai for Firefox's extension links to Kai through.
 
 Built with lmgw-client and lmgw-update of lmgw %{lmgw_source}.
 
@@ -97,7 +115,8 @@ cd kai
 test -f ui/dist/index.html || { echo "ui/dist is missing: build the RPM with packaging/build-rpm.sh" >&2; exit 1; }
 export CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-8}
 export KAI_VERSION=%{kai_version}
-cargo build --release --locked
+# The workspace: kai and crates/kai-browser-host (Kai for Firefox's host, a binary of its own).
+cargo build --release --locked --workspace
 
 %install
 cd kai
@@ -111,6 +130,14 @@ install -Dm644 assets/icons/hicolor/scalable/apps/dev.rootshell.kai.svg \
 for f in assets/icons/hicolor/scalable/status/kai-tray-*.svg; do
     install -Dm644 "$f" %{buildroot}%{_datadir}/icons/hicolor/scalable/status/$(basename "$f")
 done
+# Kai for Firefox: the host, and the manifest made from the same template as `just browser-dev`'s
+# (packaging/dev.rootshell.kai.json.in): name dev.rootshell.kai, stdio, the one extension
+# kai-firefox@rootshell.dev, the host's absolute path. A per-user manifest of a dev build
+# (~/.mozilla/native-messaging-hosts, `just browser-dev`) shadows this one until
+# `just browser-dev-remove`.
+install -Dsm755 "${CARGO_TARGET_DIR:-target}/release/kai-browser-host" %{buildroot}%{browser_host}
+bash scripts/browser-manifest.sh %{browser_host} > dev.rootshell.kai.json
+install -Dm644 dev.rootshell.kai.json %{buildroot}%{native_hosts}/dev.rootshell.kai.json
 
 # No %%post/%%postun: Fedora's file triggers (desktop-file-utils, gtk-update-icon-cache, shared-mime-info)
 # refresh the desktop database and the icon cache when these files are installed or removed, which
@@ -121,6 +148,9 @@ done
 %files
 %license kai/LICENSE.md
 %{_bindir}/kai
+%dir %{_libexecdir}/kai
+%{browser_host}
+%{native_hosts}/dev.rootshell.kai.json
 %{_datadir}/applications/dev.rootshell.kai.desktop
 %{_datadir}/icons/hicolor/scalable/apps/dev.rootshell.kai.svg
 %{_datadir}/icons/hicolor/scalable/status/kai-tray-*.svg

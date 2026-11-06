@@ -287,6 +287,7 @@ areas! {
     personality,
     routines,
     jobs,
+    browser,
 }
 
 /// Every tool of every area, in the areas' order.

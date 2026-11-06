@@ -431,13 +431,14 @@ async fn scenario(out: PathBuf, notes: Arc<Mutex<Report>>) {
     let (ui_tx, ui) = async_channel::unbounded();
     let (cmds, cmd_rx) = mpsc::unbounded_channel();
     let screen = crate::screen_lock::ScreenLock::default();
-    let (host, policy_notes) = crate::hosted_server(
+    let (host, policy_notes, _, _) = crate::hosted_server(
         &config,
         cmds.clone(),
         ui_tx.clone(),
         crate::host::registry::SessionBus::lazy(config.dbus.timeout()),
         screen.clone(),
         crate::desktop::fdo::atspi::switch::A11ySwitch::inert(),
+        None,
     );
     let mut core = Core::new(
         config,

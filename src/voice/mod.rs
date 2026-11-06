@@ -30,6 +30,7 @@ mod events;
 mod jobs;
 pub mod link;
 mod session;
+pub mod speak;
 mod thread;
 mod timing;
 
@@ -42,7 +43,7 @@ mod jobs_live_tests;
 #[cfg(test)]
 mod live_tests;
 #[cfg(test)]
-mod lmgw_live_tests;
+pub(crate) mod lmgw_live_tests;
 #[cfg(test)]
 mod log_tests;
 #[cfg(test)]
@@ -135,6 +136,12 @@ pub struct VoiceSettings {
     pub approvals: approvals::ApprovalSettings,
     /// `jobs.quiet_ms` (WP18): how long nothing goes on before a job's result is spoken.
     pub jobs_quiet: Duration,
+    /// `browser.speech_quiet_ms` (kai-firefox §7.2): the same for Kai's speech without a model
+    /// (`speak`).
+    pub speech_quiet: Duration,
+    /// `browser.speech_echo_guard_ms`: the session hears silence this long after that speech
+    /// stops (`speak`).
+    pub speech_echo_guard: Duration,
 }
 
 impl VoiceSettings {
@@ -150,6 +157,8 @@ impl VoiceSettings {
             conversation_timeout: c.voice.conversation_timeout(),
             approvals: approvals::ApprovalSettings::from_config(c),
             jobs_quiet: c.jobs.quiet(),
+            speech_quiet: Duration::from_millis(c.browser.speech_quiet_ms),
+            speech_echo_guard: Duration::from_millis(c.browser.speech_echo_guard_ms),
         }
     }
 }
@@ -159,23 +168,38 @@ impl VoiceSettings {
 pub struct By {
     pub name: String,
     pub own: bool,
+    /// A turn Kai relayed for Firefox's sidebar (kai-firefox §8.3, `crate::browser::sidebar::turns`):
+    /// lmgw names it as Kai's own, and Kai reads it as another principal's (`own` is false).
+    pub sidebar: bool,
+}
+
+impl By {
+    /// The sidebar's turn (`crate::browser::sidebar::turns`).
+    pub fn sidebar() -> Self {
+        Self {
+            name: crate::browser::sidebar::turns::NAME.to_owned(),
+            own: false,
+            sidebar: true,
+        }
+    }
 }
 
 /// The feed's facts the voice acts on (§3.2's table). The feed raises them through the
 /// `lmgw_link` seam; the core passes them on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FeedFact {
-    /// `hello`'s and `state`'s live part: the voice sessions and the turns that run now.
+    /// `hello`'s and `state`'s live part: the voice sessions and the turns that run now (each
+    /// turn's thread, who started it and whether it is a bound session's voice turn).
     Live {
         voice: Vec<(i64, By)>,
-        turns: Vec<(i64, By)>,
+        turns: Vec<(i64, By, bool)>,
     },
     /// `voice.bound`.
     VoiceBound { thread_id: i64, by: By },
     /// `voice.ended`.
     VoiceEnded { thread_id: i64, by: By },
-    /// `turn.started`.
-    TurnStarted { thread_id: i64, by: By },
+    /// `turn.started`; `voice`: a bound session's voice turn.
+    TurnStarted { thread_id: i64, by: By, voice: bool },
     /// `turn.done`.
     TurnDone { thread_id: i64 },
     /// `folder.current` for Kai's folder (the core passes on only its own folder's): the
@@ -233,6 +257,8 @@ pub enum Wake {
     Idle,
     /// An answer on the approval card, or an approvals request that came back (WP19).
     Approval(approvals::Wake),
+    /// A speech of Kai's own was made, or Kai's voice read (`speak`).
+    Speak(speak::SpeakWake),
 }
 
 /// What a pending `current` request is for.
@@ -335,6 +361,10 @@ pub struct Voice<L> {
     /// Push-to-talk's pre-roll: the last `prefix_padding_ms` of the microphone.
     preroll: VecDeque<i16>,
     preroll_ms: Option<u32>,
+    /// A spoken answer to an approval or one of Kai's own questions hears silence until then: the
+    /// echo of Kai's reply, which played up to `browser.speech_echo_guard_ms` before
+    /// (`crate::approvals::asked`, kai-firefox WP10b's review, M1).
+    reply_echo_until: Option<Instant>,
     /// What did not fill a 20 ms chunk yet.
     carry: Vec<i16>,
     tick: Option<Interval>,
@@ -392,11 +422,14 @@ pub struct Voice<L> {
     locked: bool,
     /// Jobs' results to speak (WP18, `jobs`).
     results: jobs::Results,
+    /// What Kai says without a model (kai-firefox §7.2, §7.3: `speak`).
+    speak: speak::Speaker,
 }
 
 impl<L: VoiceLink> Voice<L> {
     pub fn new(s: VoiceSettings, link: L) -> Self {
         let jobs_quiet = s.jobs_quiet;
+        let speaker = speak::Speaker::new(s.speech_quiet, s.speech_echo_guard);
         let approvals = Approvals::new(
             s.approvals.clone(),
             Box::new(crate::approvals::overlay::send),
@@ -427,6 +460,7 @@ impl<L: VoiceLink> Voice<L> {
             commit_on_create: false,
             preroll: VecDeque::new(),
             preroll_ms: None,
+            reply_echo_until: None,
             carry: Vec::new(),
             tick: None,
             thread: None,
@@ -452,6 +486,7 @@ impl<L: VoiceLink> Voice<L> {
             session_no: 0,
             locked: false,
             results: jobs::Results::new(jobs_quiet),
+            speak: speaker,
         }
     }
 
@@ -473,6 +508,7 @@ impl<L: VoiceLink> Voice<L> {
             current_req,
             tick,
             approvals,
+            speak,
             ..
         } = self;
         tokio::select! {
@@ -504,6 +540,7 @@ impl<L: VoiceLink> Voice<L> {
                 }
             } => Wake::Idle,
             w = approvals.next() => Wake::Approval(w),
+            w = speak.next() => Wake::Speak(w),
         }
     }
 
@@ -742,10 +779,16 @@ impl<L: VoiceLink> Voice<L> {
                     .filter(|(_, by)| !by.own)
                     .map(|(t, by)| (t, by.name))
                     .collect();
+                // Who started each running turn is the card's "asked by" too, as at its
+                // `turn.started`: a list after the feed came back may be the first Kai reads of it.
+                for (t, by, _) in &turns {
+                    self.approvals
+                        .turn_started(*t, &by.name, by.own, by.sidebar);
+                }
                 self.turns_elsewhere = turns
                     .into_iter()
-                    .filter(|(_, by)| !by.own)
-                    .map(|(t, by)| (t, by.name))
+                    .filter(|(_, by, _)| !by.own)
+                    .map(|(t, by, _)| (t, by.name))
                     .collect();
                 self.jobs_wake();
             }
@@ -757,9 +800,10 @@ impl<L: VoiceLink> Voice<L> {
                 self.voice_elsewhere.remove(&thread_id);
             }
             FeedFact::VoiceBound { .. } | FeedFact::VoiceEnded { .. } => {}
-            FeedFact::TurnStarted { thread_id, by } => {
+            FeedFact::TurnStarted { thread_id, by, .. } => {
                 self.turn_seen(thread_id);
-                self.approvals.turn_started(thread_id, &by.name, by.own);
+                self.approvals
+                    .turn_started(thread_id, &by.name, by.own, by.sidebar);
                 if by.own {
                     self.turns_elsewhere.remove(&thread_id);
                 } else {
@@ -839,6 +883,7 @@ impl<L: VoiceLink> Voice<L> {
                 "voice: the screen locked; Kai stops listening and speaking"
             );
             self.conversation_dropped("the screen locked");
+            self.speak_locked();
             self.key = None;
             self.listening = false;
             self.end_session().await;
@@ -906,6 +951,9 @@ impl<L: VoiceLink> Voice<L> {
 
     fn settle(&mut self) {
         self.conversation_settle();
+        // Kai's continuation for jobs' results runs: its calls are no turn of the owner's
+        // (`crate::jobs::Jobs::continuing`, kai-firefox WP10b's review, M3).
+        self.results_continuing();
         // WP19: Kai's own threads and the live session, as the approvals read them; verdicts a
         // session carried that ended before lmgw took them go by the route.
         let own: Vec<i64> = self
@@ -938,7 +986,8 @@ impl<L: VoiceLink> Voice<L> {
             || self.current_req.is_some()
             || self.capture.is_some()
             || self.key.is_some()
-            || self.jobs_need_tick();
+            || self.jobs_need_tick()
+            || self.speak.busy();
         if !needs_tick {
             self.tick = None;
         } else {
@@ -954,6 +1003,7 @@ impl<L: VoiceLink> Voice<L> {
         self.key = None;
         self.current_req = None;
         self.bind_wait = None;
+        self.speak_quit();
         if let Some(s) = self.session.take() {
             let t = self.close(s).await;
             self.closing.push(t);

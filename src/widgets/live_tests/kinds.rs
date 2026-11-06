@@ -33,13 +33,13 @@ fn bodies(rt: &tokio::runtime::Runtime) -> Vec<(Kind, Result<Body, String>)> {
         let s = serve(vec![
             ("/p.png", response("200 OK", &[("Content-Type", "image/png")], &png())),
             (
-                "/current_weather?lat=52.52&lon=13.405",
+                "/current_weather?lat=53.5511&lon=9.9937",
                 ok(json!({"weather": {"timestamp": "2026-10-09T14:00:00+02:00", "temperature": 14.4,
                     "icon": "partly-cloudy-day", "wind_speed_10": 12.0, "relative_humidity": 71},
                     "sources": [{"station_name": "Test Station"}]})),
             ),
             (
-                "/weather?lat=52.52&lon=13.405&date=2026-10-09",
+                "/weather?lat=53.5511&lon=9.9937&date=2026-10-09",
                 ok(json!({"weather": [
                     {"timestamp": "2026-10-09T03:00:00+02:00", "temperature": 8.1, "precipitation": 0.0},
                     {"timestamp": "2026-10-09T15:00:00+02:00", "temperature": 16.9, "precipitation": 1.5}]})),
@@ -48,7 +48,7 @@ fn bodies(rt: &tokio::runtime::Runtime) -> Vec<(Kind, Result<Body, String>)> {
         .await;
         let mut from = Sources::of(&Default::default(), &Default::default());
         from.weather_base = format!("http://127.0.0.1:{}", s.port);
-        from.weather.places.insert("home".into(), "52.52,13.405".into());
+        from.weather.places.insert("home".into(), "53.5511,9.9937".into());
         let url = format!("http://127.0.0.1:{}/p.png", s.port);
         vec![
             (Kind::Image, Kind::Image.body(&args(Kind::Image, "src", &url), &from).await),

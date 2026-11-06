@@ -549,7 +549,7 @@ async fn a_failed_switch_takes_the_grants_back() {
             if let crate::core::Command::Setting { request, reply } = cmd {
                 let answer = match request {
                     crate::settings::Request::Routine { .. } => {
-                        Err(crate::settings::Refusal("the switch was refused".into()))
+                        Err(crate::settings::Refusal::plain("the switch was refused"))
                     }
                     r => crate::settings::apply(&file, r).map(|o| o.response),
                 };

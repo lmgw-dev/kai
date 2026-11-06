@@ -8,7 +8,7 @@ set -euo pipefail
 here=$(cd "$(dirname "$0")/.." && pwd)
 lmgw=${1:-$here/../lmgw}
 viz=$here/assets/overlay/viz
-src=crates/lmgw-ui/assets/voice/viz
+src=crates/lmgw-chat-ui/assets/voice/viz
 files=(engine.js ring.js)
 pin=$(git -C "$lmgw" log -1 --format=%H main -- "${files[@]/#/$src/}")
 for f in "${files[@]}"; do

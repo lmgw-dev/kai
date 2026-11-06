@@ -25,10 +25,10 @@
 //!   scope is killed (`KillUnit`, and the process group). The result carries the real output
 //!   sizes.
 
-mod entries;
+pub(crate) mod entries;
 #[cfg(test)]
 mod live_tests;
-mod mime;
+pub(crate) mod mime;
 pub mod settings;
 pub mod spawn;
 pub mod terminal;

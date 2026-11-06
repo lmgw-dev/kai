@@ -8,6 +8,10 @@
 #        updater's feed and its token, KAI_UPDATE_PUBLIC_FEED as the mark of a public feed that
 #        never gets a token (src/update.rs; CI sets them: packaging/ci-build.sh,
 #        packaging/gh-build.sh); unset, the build has no update feed.
+#        KAI_FIREFOX_INSTALL_URL, when set, is compiled in as the link the settings window's
+#        "Install Kai for Firefox" opens (src/browser/install.rs; the signed XPI of the build's
+#        channel, which may carry a deploy token, so it is only ever named as set or not); unset,
+#        the settings say how to install the extension by hand.
 # lmgw's crates come from the tree LMGW_PIN names (`git archive`), never from that checkout's
 # working tree or HEAD: the RPM is the same whatever is checked out there. The tree, not the commit:
 # it is the same in lmgw's development history and in its public repository (other commits, the
@@ -111,16 +115,18 @@ echo "the configuration window's page: $(du -sh "$src/kai/ui/dist" | cut -f1) in
 $page_only && exit 0
 tar -C "$src" -czf "$rpmdir/SOURCES/kai-$version.tar.gz" kai lmgw
 
-# The updater's feed is decided at compile time (option_env! in src/update.rs): what is set here
-# reaches cargo, in place or through podman's -e (by name, so a token never sits in an argv).
+# The updater's feed and the Firefox install link are decided at compile time (option_env! in
+# src/update.rs and src/browser/install.rs): what is set here reaches cargo, in place or through podman's -e (by name, so a token never sits in an argv).
 feed_env=()
-for v in KAI_UPDATE_MANIFEST_URL KAI_UPDATE_DEPLOY_TOKEN KAI_UPDATE_PUBLIC_FEED; do
+for v in KAI_UPDATE_MANIFEST_URL KAI_UPDATE_DEPLOY_TOKEN KAI_UPDATE_PUBLIC_FEED KAI_FIREFOX_INSTALL_URL; do
   # shellcheck disable=SC2163 # exports the variable $v names
   if [[ -n "${!v:-}" ]]; then export "$v"; feed_env+=(-e "$v"); fi
 done
 echo "kai $version; update feed baked in: ${KAI_UPDATE_MANIFEST_URL:-none (this build does not poll)}" \
   "(deploy token: $([[ -n "${KAI_UPDATE_DEPLOY_TOKEN:-}" ]] && echo yes || echo no);" \
   "public, never a token: $([[ -n "${KAI_UPDATE_PUBLIC_FEED:-}" ]] && echo yes || echo no))"
+echo "Kai for Firefox install link baked in: $([[ -n "${KAI_FIREFOX_INSTALL_URL:-}" ]] && echo yes \
+  || echo "no (the settings say how to install by hand)")"
 
 rpmbuild_args=(-bb --define "kai_version $version" --define "lmgw_commit $pin" --define "lmgw_source $lmgw_source"
                --define "_topdir $rpmdir/rpmbuild" --define "_sourcedir $rpmdir/SOURCES" --define "_rpmdir $rpmdir/out" "$root/packaging/kai.spec")

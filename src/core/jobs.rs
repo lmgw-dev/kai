@@ -39,6 +39,9 @@ pub(super) fn preparer(tool: &str, jobs: &Jobs) -> Option<Preparer> {
                 state: Arc::new(()),
                 notes: Vec::new(),
                 options: Vec::new(),
+                ask: None,
+                spoken: None,
+                confirmed: false,
             }),
         };
         Box::pin(async move { found })

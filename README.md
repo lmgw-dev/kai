@@ -87,6 +87,23 @@ again.</sub>
   tool calls, or a goal for a helper model. You can also run it from the tray or a shortcut. A
   routine the model writes stays off until you switch it on.
 
+**Use Firefox**
+- **[Kai for Firefox](https://github.com/lmgw-dev/kai-firefox)** gives Kai hands and eyes in the
+  browser. While a Firefox is linked, Kai's tools gain tabs, reading (outline, controls, text,
+  tables, PDFs in Firefox's viewer), screenshots for a vision model, pressing, filling and choosing,
+  numbered hints over the controls in view, Reader view, bookmarks, history, downloads and tools for
+  developers. The same tools reach lmgw's Chat and your phone, and Firefox's sidebar runs lmgw's
+  Chat through Kai.
+- **Site rules.** Each site is `act`, `read` or `none`. Reading runs for you and acting asks first,
+  unless you switch on **Kai may act in Firefox without asking**, which covers only the tab in
+  front. The rules also apply to Kai's desktop tools on Firefox's windows.
+- **Announcements and reading aloud.** Kai can say on its own that a page loaded or a field shows
+  an error, and read a page aloud paragraph by paragraph.
+- **Install it from the settings.** The **Firefox** section has **Install Kai for Firefox**. A
+  build without an install link (`KAI_FIREFOX_INSTALL_URL`) explains the manual install instead.
+  The RPM ships the native-messaging host (`kai-browser-host`) and registers it with Firefox; Kai
+  takes the link only from a Firefox that Plasma started.
+
 **Stay in control**
 - **A policy for every tool.** Each tool can run, ask first, be refused, or not be offered at all,
   and each says who may call it. See [Privacy and permissions](#privacy-and-permissions).
@@ -99,12 +116,13 @@ again.</sub>
 
 - **KDE Plasma 6 on Wayland**, with PipeWire. Kai is packaged as an x86_64 RPM, built on current
   Fedora.
-- **lmgw 0.5.0 or later, with device pairing over TLS** (its device listener), on this machine or reachable over
-  the network, with
+- **lmgw 0.6.0 or later, with device pairing over TLS** (its device listener), on this machine or
+  reachable over the network, with
   - a chat model (one with vision for the tools that look at the screen), and
   - speech-to-text and text-to-speech models set up for voice: **Settings → Chat → Voice** in lmgw,
     or **Settings → Realtime**, which the Chat falls back to.
 - **KWallet** (or another Secret Service) to keep Kai's key.
+- **Firefox 154 or newer**, as a regular package, only for the browser integration.
 
 ## Install
 
@@ -199,7 +217,7 @@ anchor = "bottom-right"       # where the ring sits (size = 240 and margin = 24 
 look = "my-vision-model"      # the lmgw alias the look helper uses (default: the conversation's)
 
 [weather]
-places = { home = "52.52,13.405" }
+places = { home = "53.5511,9.9937" }
 
 [policy.tools]
 clipboard_get = "allow"       # allow | allow_trusted | confirm | deny | off
@@ -293,7 +311,7 @@ RemoteDesktop portal, which asks once; `kai --forget-remote-control` makes it as
 
 ## Status and limits
 
-Kai 0.1.0 is the first public release. It works end to end, but it is young.
+Kai works end to end, but it is young.
 
 - **KDE Plasma 6 on Wayland only.** The tools, overlays and shortcuts rely on KWin and Plasma's
   portals. GNOME, X11 sessions and other compositors are not supported.
@@ -301,8 +319,9 @@ Kai 0.1.0 is the first public release. It works end to end, but it is young.
 - **lmgw is required.** Kai does not talk to model providers directly.
 - **The weather card covers Germany only**, since its data comes from the German Weather Service
   (DWD).
-- **Not built yet:** memory across apps and a browser integration are planned, but not part of
-  0.1.0.
+- **Firefox only for the browser.** Other browsers, private windows, and a Flatpak or Snap Firefox
+  are not covered yet.
+- **Not built yet:** memory across apps is planned.
 
 Bugs and ideas are welcome in the [issues](https://github.com/lmgw-dev/kai/issues).
 

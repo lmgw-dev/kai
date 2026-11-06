@@ -12,6 +12,7 @@ mod hosting;
 mod jobs;
 mod personality;
 mod settings_ops;
+mod sidebar;
 mod window;
 /// What the window's Personality page says while Kai is not paired (its live check's stand-in core).
 #[cfg(test)]
@@ -84,17 +85,47 @@ pub enum Command {
     WindowConversation {
         reply: oneshot::Sender<crate::settings::window::profiles::Conversation>,
     },
+    /// How many Firefox extensions are linked (`crate::browser::Links::linked`): the warning of
+    /// kai-firefox design §8.3 follows it.
+    BrowserLinked(usize),
+    /// Something Kai says without a model (kai-firefox §7.2, §7.3: an announcement, a paragraph
+    /// read aloud), through lmgw's text-to-speech and Kai's playback (`crate::voice::speak`).
+    Speak(Box<crate::voice::speak::Utterance>),
+    /// One of Kai's own questions, to be spoken and heard answered too
+    /// (`crate::approvals::asked`).
+    Ask(Box<crate::approvals::asked::Ask>),
+    /// The configuration window's notices (`GET /api/notices`): lines it shows above its pages
+    /// (the warning of kai-firefox design §8.3 while it holds).
+    WindowNotices {
+        reply: oneshot::Sender<Vec<String>>,
+    },
+    /// The configuration window's pickers: the microphones and speakers Kai lists (the screens are
+    /// the scheme handler's to ask the compositor).
+    WindowDevices {
+        reply: oneshot::Sender<crate::settings::window::devices::Devices>,
+    },
     /// One of the Personality page's profile-editor requests: sent to the paired lmgw over the
     /// device link, lmgw's answer (or the refusal) going back to the scheme handler.
     WindowProxy {
         forward: crate::lmgw_link::proxy::Forward,
         reply: oneshot::Sender<crate::lmgw_link::proxy::Proxied>,
     },
+    /// One request of Firefox's sidebar, admitted by `browser.sock` (`crate::browser::sidebar`):
+    /// sent to the paired lmgw over the device link, its answer relayed to the extension; a request
+    /// that starts a turn marks its thread (kai-firefox design §8.3).
+    Sidebar(Box<crate::browser::sidebar::Relay>),
     /// The configuration window's Desktop page: whether the RemoteDesktop portal's restore token
     /// is stored, or (`forget`) its removal, as `kai --forget-remote-control` does (WP16c).
     WindowRemoteControl {
         forget: bool,
         reply: oneshot::Sender<Result<crate::settings::window::remote::RemoteControl, String>>,
+    },
+    /// The configuration window's Firefox section: what this build and the links say about Kai for
+    /// Firefox (`install: false`), or the click that opens the extension's link in the browser
+    /// (`crate::browser::install`).
+    WindowBrowser {
+        install: bool,
+        reply: oneshot::Sender<Result<crate::browser::install::Facts, String>>,
     },
     SetAutostart(bool),
     /// The tray's Echo mode radio (§7), or the device warning's offer of half duplex.
@@ -146,7 +177,8 @@ pub enum Command {
     /// PD3: a hosted tool that acts on the core, with its answer's channel (boxed: a call carries
     /// its context, and the other commands are small).
     Tool(Box<calls::CoreCall>),
-    /// The updater's Restart, after an update was installed: the quit sequence of [`Command::Quit`],
+    /// The updater's Restart, after an update was installed, or the settings window's "Restart Kai
+    /// now": the quit sequence of [`Command::Quit`],
     /// then `main` execs the installed binary ([`Ended::Restart`]). After a quit began it does
     /// nothing but a log line.
     Restart,
@@ -437,6 +469,23 @@ pub struct Core<S, L, A, V> {
     a11y: Option<crate::desktop::fdo::atspi::switch::A11ySwitch>,
     /// What the switch was last told of conversation mode.
     a11y_conversation: bool,
+    /// Kai for Firefox and Kai's lmgw admin level (kai-firefox design §8.3): the warning said once
+    /// per link and at each raise of the level.
+    browser_warning: crate::browser::warning::AdminWarning,
+    /// The settings window's notices as it was last told they changed (`UiCmd::NoticesChanged`).
+    window_notices: Vec<String>,
+    /// How many Firefox extensions are linked to Kai now (`Command::BrowserLinked`); the window's
+    /// Firefox section shows it and is told at each change (`UiCmd::BrowserChanged`).
+    browser_linked: usize,
+    /// This build's link to Kai for Firefox's signed XPI (`crate::browser::install::build_url`);
+    /// the tests give their own.
+    firefox_install: Option<String>,
+    /// The turns Kai relayed for Firefox's sidebar (kai-firefox design §8.3): the feed's facts go
+    /// through it before the voice reads them.
+    sidebar_turns: crate::browser::sidebar::turns::SidebarTurns,
+    /// Cancelled when Kai leaves its gateway (a re-pair, a revocation): the sidebar's requests on
+    /// their way to it end with an error the sidebar shows ([`Self::drop_requests`]).
+    sidebar_left: tokio_util::sync::CancellationToken,
     /// Where notifications go instead of the bus (the tests).
     #[cfg(test)]
     notices: Option<mpsc::UnboundedSender<Notice>>,
@@ -526,6 +575,12 @@ impl<S: SecretStore, L: LmgwLink, A: AudioPort, V: VoiceLink> Core<S, L, A, V> {
             lock_applied: false,
             a11y: None,
             a11y_conversation: false,
+            browser_warning: Default::default(),
+            window_notices: Vec::new(),
+            browser_linked: 0,
+            sidebar_turns: Default::default(),
+            sidebar_left: Default::default(),
+            firefox_install: crate::browser::install::build_url().map(str::to_owned),
             #[cfg(test)]
             notices: None,
             #[cfg(test)]
@@ -583,6 +638,12 @@ impl<S: SecretStore, L: LmgwLink, A: AudioPort, V: VoiceLink> Core<S, L, A, V> {
     #[cfg(test)]
     pub fn open_into(&mut self, tx: mpsc::UnboundedSender<String>) {
         self.opened = Some(tx);
+    }
+
+    /// The tests give the build's link to Kai for Firefox's XPI.
+    #[cfg(test)]
+    pub fn set_firefox_install(&mut self, url: Option<&str>) {
+        self.firefox_install = url.map(str::to_owned);
     }
 
     /// The tests read notifications here.
@@ -787,13 +848,36 @@ impl<S: SecretStore, L: LmgwLink, A: AudioPort, V: VoiceLink> Core<S, L, A, V> {
             }),
             Command::OpenSettings => self.ui_send(UiCmd::ShowSettings),
             Command::Setting { request, reply } => {
-                let _ = reply.send(self.apply_request(request));
+                let _ = reply.send(self.apply_window_request(request).await);
             }
-            Command::AllowAlways { tool } => self.allow_always(&tool),
+            Command::AllowAlways { tool } => self.allow_always(&tool).await,
             Command::WindowConversation { reply } => {
                 let _ = reply.send(self.window_conversation());
             }
+            Command::Speak(u) => self.voice.speak(*u),
+            Command::Ask(a) => self.voice.ask(*a),
+            Command::BrowserLinked(n) => {
+                if let Some(text) = self.browser_warning.linked(n > 0) {
+                    self.notify(crate::browser::warning::SUMMARY, text);
+                }
+                self.notices_moved();
+                if std::mem::replace(&mut self.browser_linked, n) != n {
+                    self.ui_send(UiCmd::BrowserChanged);
+                }
+            }
+            Command::WindowBrowser { install, reply } => {
+                let _ = reply.send(self.window_browser(install));
+            }
+            Command::WindowNotices { reply } => {
+                let _ = reply.send(self.notices());
+            }
+            Command::WindowDevices { reply } => {
+                let _ = reply.send(crate::settings::window::devices::Devices::from_audio(
+                    &self.model.audio.devices,
+                ));
+            }
             Command::WindowProxy { forward, reply } => self.window_proxy(forward, reply),
+            Command::Sidebar(relay) => self.sidebar(*relay),
             Command::WindowRemoteControl { forget, reply } => {
                 let file = crate::desktop::fdo::input::token_file(&self.paths.state_dir);
                 let _ = reply.send(crate::settings::window::remote::answer(&file, forget));
@@ -1481,6 +1565,11 @@ impl<S: SecretStore, L: LmgwLink, A: AudioPort, V: VoiceLink> Core<S, L, A, V> {
         self.profiles_req = None;
         self.drop_personality_sets();
         self.conversation.dropped();
+        // The sidebar's requests went to the gateway Kai leaves: each ends with an error it shows
+        // (kai-firefox §8.2), and what Kai read of that gateway's turns no longer applies.
+        self.sidebar_left.cancel();
+        self.sidebar_left = Default::default();
+        self.sidebar_turns.forget();
     }
 
     /// Starts the link for a stored pairing and its key; each start gets its own event channel, so
@@ -1540,7 +1629,12 @@ impl<S: SecretStore, L: LmgwLink, A: AudioPort, V: VoiceLink> Core<S, L, A, V> {
                 let acts = self.conversation.resync();
                 return self.apply(acts).await;
             }
-            LinkEvent::Fact(fact) => return self.voice.fact(fact),
+            LinkEvent::Fact(fact) => {
+                if let Some(fact) = self.sidebar_turns.fact(fact) {
+                    self.voice.fact(fact);
+                }
+                return;
+            }
             LinkEvent::Device(facts) => return self.device_facts(facts),
             LinkEvent::Folder(e) => return self.on_folder_event(e).await,
             LinkEvent::Profile(e) => return self.personality.event(e),
@@ -1549,6 +1643,8 @@ impl<S: SecretStore, L: LmgwLink, A: AudioPort, V: VoiceLink> Core<S, L, A, V> {
         let Pairing::Paired { link, .. } = &mut self.model.pairing else {
             return;
         };
+        // The level the feed said, for the warning of kai-firefox design §8.3.
+        let mut admin_said = None;
         match event {
             LinkEvent::Connected {
                 device,
@@ -1556,6 +1652,7 @@ impl<S: SecretStore, L: LmgwLink, A: AudioPort, V: VoiceLink> Core<S, L, A, V> {
                 hosts_label,
                 admin,
             } => {
+                admin_said = Some(admin.clone());
                 self.model.certificate = self.paired.as_ref().and_then(certificate_note);
                 if let Some(host) = self.hosting.host_mut() {
                     host.feed_up(&device, hosts_label.as_deref());
@@ -1612,6 +1709,7 @@ impl<S: SecretStore, L: LmgwLink, A: AudioPort, V: VoiceLink> Core<S, L, A, V> {
                 self.voice.hold(active);
             }
             LinkEvent::AdminTools(level) => {
+                admin_said = Some(level.clone());
                 if let Link::Up { admin, .. } = link
                     && *admin != level
                 {
@@ -1628,6 +1726,12 @@ impl<S: SecretStore, L: LmgwLink, A: AudioPort, V: VoiceLink> Core<S, L, A, V> {
                 unreachable!("handled above")
             }
         }
+        if let Some(level) = admin_said
+            && let Some(text) = self.browser_warning.level(level)
+        {
+            self.notify(crate::browser::warning::SUMMARY, text);
+        }
+        self.notices_moved();
         self.show_tools();
         self.publish();
     }
@@ -1936,6 +2040,12 @@ impl<S: SecretStore, L: LmgwLink, A: AudioPort, V: VoiceLink> Core<S, L, A, V> {
                 }
                 Action::AskCurrent => self.voice.follow(Why::Start),
                 Action::Leave(note) => self.voice.leave_conversation(note).await,
+                Action::Move => {
+                    // Listening resumes once the new folder is ready (the `Use` above takes it).
+                    if self.voice.move_conversation().await {
+                        self.start_listening = true;
+                    }
+                }
                 Action::Notify(n) => self.notify(n.summary, n.body),
             }
         }
@@ -2169,8 +2279,38 @@ impl<S: SecretStore, L: LmgwLink, A: AudioPort, V: VoiceLink> Core<S, L, A, V> {
     }
 
     fn set_pairing(&mut self, pairing: Pairing) {
+        // A pairing Kai no longer uses gives it no admin tools on lmgw: the level is off until a
+        // feed says another (kai-firefox §8.3's warning, its line in the settings window).
+        if matches!(
+            pairing,
+            Pairing::NotPaired
+                | Pairing::PairAgain { .. }
+                | Pairing::Revoked { .. }
+                | Pairing::Disabled { .. }
+                | Pairing::Expired { .. }
+        ) {
+            let _ = self
+                .browser_warning
+                .level(crate::lmgw_link::AdminLevel::Off);
+            self.notices_moved();
+        }
         self.model.pairing = pairing;
         self.publish();
+    }
+
+    /// The lines the settings window shows above its pages (`GET /api/notices`).
+    fn notices(&self) -> Vec<String> {
+        self.browser_warning.line().into_iter().collect()
+    }
+
+    /// Tells an open settings window that its notices changed, when they did, so it reads them
+    /// again (`UiCmd::NoticesChanged`).
+    fn notices_moved(&mut self) {
+        let now = self.notices();
+        if now != self.window_notices {
+            self.window_notices = now;
+            self.ui_send(UiCmd::NoticesChanged);
+        }
     }
 
     /// Publishes the model when it changed (the voice ticks every 20 ms during a session).
@@ -2397,6 +2537,8 @@ mod tests {
         paths: Paths,
         _dir: tempfile::TempDir,
         updates: mpsc::UnboundedReceiver<crate::update::Request>,
+        /// The links the core hands to the desktop's browser instead of `xdg-open`.
+        opened: mpsc::UnboundedReceiver<String>,
         task: tokio::task::JoinHandle<Ended>,
     }
 
@@ -2419,6 +2561,17 @@ mod tests {
         prepare: impl FnOnce(&MemoryStore, &Paths),
         enrol: Enroller,
         voice: V,
+    ) -> Rig {
+        rig_build(config_text, prepare, enrol, voice, None)
+    }
+
+    /// [`rig_with`] whose build has `firefox` as its link to Kai for Firefox's XPI.
+    fn rig_build<V: VoiceLink>(
+        config_text: &str,
+        prepare: impl FnOnce(&MemoryStore, &Paths),
+        enrol: Enroller,
+        voice: V,
+        firefox: Option<&str>,
     ) -> Rig {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::under_config_home(dir.path());
@@ -2449,6 +2602,9 @@ mod tests {
         );
         core.set_enroller(enrol);
         core.notify_into(ntx);
+        let (opened_tx, opened) = mpsc::unbounded_channel();
+        core.open_into(opened_tx);
+        core.set_firefox_install(firefox);
         core.set_host(Box::new(host.clone()), vec!["policy.tools.nothing".into()]);
         let (updates_tx, updates) = mpsc::unbounded_channel();
         core.set_updates(updates_tx);
@@ -2466,6 +2622,7 @@ mod tests {
             paths,
             _dir: dir,
             updates,
+            opened,
             task,
         }
     }
@@ -2645,6 +2802,80 @@ mod tests {
         let (link, stops) = (r.link.clone(), *r.link.stops.lock().unwrap());
         r.quit().await;
         assert!(*link.stops.lock().unwrap() > stops, "quit closes the link");
+    }
+
+    /// kai-firefox design §8.3: with Kai's lmgw admin level above off and a Firefox linked, a
+    /// notification when Firefox first links and again at each raise of the level, and the
+    /// settings window's line while it holds; nothing more when Firefox restarts.
+    #[tokio::test(start_paused = true)]
+    async fn a_linked_firefox_at_an_admin_level_is_warned_about_once_and_at_each_raise() {
+        use crate::browser::warning::SUMMARY;
+        use crate::lmgw_link::AdminLevel;
+        let mut r = rig("", paired_at(OLD));
+        r.until(paired).await;
+        r.link.raise(LinkEvent::Connected {
+            device: "desktop".into(),
+            held: false,
+            hosts_label: None,
+            admin: AdminLevel::Full,
+        });
+        r.until(|m| {
+            matches!(
+                &m.pairing,
+                Pairing::Paired {
+                    link: Link::Up { .. },
+                    ..
+                }
+            )
+        })
+        .await;
+        let notices = |r: &Rig| {
+            let (reply, rx) = oneshot::channel();
+            r.cmds.send(Command::WindowNotices { reply }).unwrap();
+            rx
+        };
+        assert!(notices(&r).await.unwrap().is_empty(), "no Firefox linked");
+        r.cmds.send(Command::BrowserLinked(1)).unwrap();
+        let first = r.notice(SUMMARY).await;
+        assert!(
+            first.body.contains("can change lmgw (admin level: full)"),
+            "{first:?}"
+        );
+        assert_eq!(
+            notices(&r).await.unwrap(),
+            std::slice::from_ref(&first.body)
+        );
+        // Firefox quits and starts again: nothing more is said.
+        r.cmds.send(Command::BrowserLinked(0)).unwrap();
+        assert!(notices(&r).await.unwrap().is_empty());
+        r.cmds.send(Command::BrowserLinked(1)).unwrap();
+        assert_eq!(notices(&r).await.unwrap().len(), 1);
+        while let Ok(n) = r.notices.try_recv() {
+            assert_ne!(n.summary, SUMMARY, "said once: {n:?}");
+        }
+        // Lowered, then raised again: said again.
+        r.link.raise(LinkEvent::AdminTools(AdminLevel::ReadOnly));
+        r.link.raise(LinkEvent::AdminTools(AdminLevel::Full));
+        assert_eq!(r.notice(SUMMARY).await.body, first.body);
+        // An open settings window was told at each change of its lines (first link, quit, link
+        // again, read only, full), so it reads them again.
+        let told = |r: &Rig| {
+            std::iter::from_fn(|| r.ui.try_recv().ok())
+                .filter(|c| matches!(c, UiCmd::NoticesChanged))
+                .count()
+        };
+        assert_eq!(notices(&r).await.unwrap().len(), 1);
+        assert_eq!(told(&r), 5);
+        // The pairing ends: no admin tools, no line, and the window is told.
+        r.link.raise(LinkEvent::Revoked {
+            reason: "the key of device 'desktop' was replaced — pair it again".into(),
+            loss: Some(KeyLoss::PairAgain),
+        });
+        r.until(|m| matches!(m.pairing, Pairing::Revoked { .. }))
+            .await;
+        assert!(notices(&r).await.unwrap().is_empty(), "unpaired");
+        assert_eq!(told(&r), 1);
+        r.quit().await;
     }
 
     #[tokio::test(start_paused = true)]
@@ -3531,6 +3762,79 @@ mod tests {
         r.quit().await;
     }
 
+    /// The settings window's Conversation choice (2026-10-19): saving another folder name
+    /// switches at once. The remembered shared folder leaves the file (it would win any lookup),
+    /// the new name is looked up while the feed is up, and its ready folder is remembered.
+    #[tokio::test(start_paused = true)]
+    async fn a_new_conversation_name_switches_the_folder_at_once() {
+        use crate::settings::{Effect, Request, Response};
+
+        let ready = |id: i64, name: &str| FolderInfo {
+            id,
+            name: name.into(),
+            model: Some("kai-chat".into()),
+            idle_minutes: Some(120),
+            ..FolderInfo::default()
+        };
+        let lookups = async |voice: &HeldFolders, n: usize| {
+            for _ in 0..100 {
+                if voice.count() == n {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(voice.count(), n, "lookups asked");
+        };
+        let file_has = |r: &Rig, id: Option<i64>| {
+            for _ in 0..100 {
+                if Config::load(&r.paths.config_file)
+                    .unwrap()
+                    .conversation
+                    .folder_id
+                    == id
+                {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            false
+        };
+        let voice = HeldFolders::default();
+        let mut r = rig_with("", paired_at(OLD), fresh_enroller(), voice.clone());
+        r.until(paired).await;
+        r.link.raise(connected());
+        lookups(&voice, 1).await;
+        assert!(voice.answer(0, Ok(vec![ready(3, "Kai")])));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(file_has(&r, Some(3)), "the shared folder is remembered");
+
+        let (reply, rx) = oneshot::channel();
+        let request = Request::Set {
+            key: "conversation.folder_name".into(),
+            value: "Kai desktop".into(),
+        };
+        r.cmds.send(Command::Setting { request, reply }).unwrap();
+        let answer = rx.await.unwrap().unwrap();
+        assert!(
+            matches!(
+                answer,
+                Response::Changed {
+                    effect: Effect::Now,
+                    ..
+                }
+            ),
+            "{answer:?}"
+        );
+        assert!(file_has(&r, None), "the shared folder's id left the file");
+        lookups(&voice, 2).await;
+        assert!(voice.answer(1, Ok(vec![ready(3, "Kai"), ready(8, "Kai desktop")])));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(file_has(&r, Some(8)), "the own folder is remembered");
+        let text = std::fs::read_to_string(&r.paths.config_file).unwrap();
+        assert!(text.contains("folder_name = \"Kai desktop\""), "{text}");
+        r.quit().await;
+    }
+
     /// S1's second line: a key refusal counts only for the pairing it went under.
     #[tokio::test(start_paused = true)]
     async fn a_key_refusal_answers_for_the_pairing_it_went_under() {
@@ -4375,7 +4679,11 @@ mod tests {
         ))
         .unwrap();
         let refusal = ask(bad).await.unwrap().unwrap_err();
-        assert!(refusal.0.contains("host.keepalive_s"), "{refusal}");
+        // The window's refusal names the setting by its label, without the file's path.
+        assert_eq!(
+            refusal.0, "Tool link keep-alive: must be at least 1 (seconds); you entered 0",
+            "{refusal}"
+        );
         assert_eq!(
             std::fs::read_to_string(&r.paths.config_file).unwrap(),
             before
@@ -4432,6 +4740,122 @@ mod tests {
         let forgot = ask(true).await.unwrap().unwrap();
         assert_eq!((forgot.stored, forgot.forgot), (false, Some(true)));
         assert!(!file.0.exists());
+    }
+
+    /// The Firefox section (kai-firefox design §10): the count of linked extensions follows the
+    /// browser server's, an open window is told at each change, the click opens the build's link
+    /// once through the desktop, and a build without a usable link refuses it in words.
+    #[tokio::test]
+    async fn the_window_shows_the_linked_firefox_and_opens_the_builds_link() {
+        const LINK: &str = "https://deploy:s3cret@git.example/api/v4/kai-firefox-0.1.0.52.xpi";
+        let ask = |r: &Rig, install: bool| {
+            let (reply, rx) = oneshot::channel();
+            r.cmds
+                .send(Command::WindowBrowser { install, reply })
+                .unwrap();
+            rx
+        };
+        let told = |r: &Rig| {
+            std::iter::from_fn(|| r.ui.try_recv().ok())
+                .filter(|c| matches!(c, UiCmd::BrowserChanged))
+                .count()
+        };
+        let mut r = rig_build("", |_, _| {}, enroller(), crate::voice::NoVoice, Some(LINK));
+        let look = ask(&r, false).await.unwrap().unwrap();
+        assert!(
+            look.install && look.linked == 0 && look.opened.is_none(),
+            "{look:?}"
+        );
+        // The first link, a second profile, the same number again, then both gone.
+        for (n, expected) in [(1, 1), (2, 1), (2, 0), (0, 1)] {
+            r.cmds.send(Command::BrowserLinked(n)).unwrap();
+            assert_eq!(ask(&r, false).await.unwrap().unwrap().linked, n);
+            assert_eq!(
+                told(&r),
+                expected,
+                "the window is told at a change only (n = {n})"
+            );
+        }
+        r.cmds.send(Command::BrowserLinked(1)).unwrap();
+        let clicked = ask(&r, true).await.unwrap().unwrap();
+        assert_eq!((clicked.opened, clicked.linked), (Some(true), 1));
+        assert_eq!(r.opened.try_recv().as_deref(), Ok(LINK));
+        assert!(r.opened.try_recv().is_err(), "opened once");
+        let json = serde_json::to_string(&clicked).unwrap();
+        assert!(
+            !json.contains("s3cret") && !json.contains("git.example"),
+            "{json}"
+        );
+        r.quit().await;
+
+        // A build without a link, and one whose link is no use: nothing opens, the owner is told.
+        for link in [None, Some("ftp://git.example/a.xpi")] {
+            let mut r = rig_build("", |_, _| {}, enroller(), crate::voice::NoVoice, link);
+            let look = ask(&r, false).await.unwrap().unwrap();
+            assert!(!look.install);
+            assert_eq!(look.problem.is_some(), link.is_some(), "{look:?}");
+            let refused = ask(&r, true).await.unwrap().unwrap_err();
+            assert!(refused.contains("by hand"), "{refused}");
+            assert!(r.opened.try_recv().is_err());
+            r.quit().await;
+        }
+    }
+
+    /// Firefox's sidebar (kai-firefox §8.2): unpaired, a request is refused 503 with the pairing's
+    /// words; paired, a body over `window.proxy_max_mb` is refused 413 before it goes, and one
+    /// within it goes to the voice's link (this rig's has none, so it answers that).
+    #[tokio::test]
+    async fn the_sidebars_requests_need_a_pairing_and_stay_bounded() {
+        use crate::browser::sidebar::{Relay, Reply, Request};
+        use crate::lmgw_link::proxy::Method;
+        use crate::lmgw_link::proxy::relay::Outbound;
+
+        // The answer's status and its body's code.
+        async fn send(r: &Rig, body: Vec<u8>) -> (u64, String) {
+            let (out, mut frames) = mpsc::unbounded_channel();
+            let (_acks, acked) = watch::channel(0);
+            let reply = Reply::detached(
+                serde_json::json!(1),
+                out,
+                acked,
+                tokio_util::sync::CancellationToken::new(),
+            );
+            let request = Request {
+                out: Outbound {
+                    method: Method::Post,
+                    path: "/chat/api/threads".into(),
+                    headers: vec![("content-type".into(), "application/json".into())],
+                    body,
+                    stream: false,
+                },
+                turn: None,
+            };
+            r.cmds
+                .send(Command::Sidebar(Box::new(Relay { request, reply })))
+                .unwrap();
+            let mut text = String::new();
+            let mut status = 0;
+            while let Some(f) = frames.recv().await {
+                let f: serde_json::Value = serde_json::from_str(&f.text).unwrap();
+                match f["t"].as_str() {
+                    Some("res") => status = f["status"].as_u64().unwrap(),
+                    Some("chunk") => text.push_str(f["data"].as_str().unwrap()),
+                    _ => break,
+                }
+            }
+            let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+            (status, v["code"].as_str().unwrap().to_owned())
+        }
+
+        let mut r = rig("", |_, _| {});
+        r.until(|m| matches!(m.pairing, Pairing::NotPaired)).await;
+        assert_eq!(send(&r, b"{}".to_vec()).await, (503, "not_paired".into()));
+        let r = paired_rig().await;
+        assert_eq!(
+            send(&r, vec![b' '; 64 * 1024 * 1024 + 1]).await,
+            (413, "body_limit".into())
+        );
+        assert_eq!(send(&r, b"{}".to_vec()).await, (503, "no_proxy".into()));
     }
 
     /// WP21b's Personality page: unpaired, the facts and every forwarded request say so and

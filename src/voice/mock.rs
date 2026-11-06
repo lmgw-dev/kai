@@ -30,9 +30,9 @@ use lmgw_client::types::chat_threads::{ServedModel, VoiceModels};
 use tokio::sync::mpsc::UnboundedSender;
 
 use super::link::{
-    ChatReply, ClientEvent, Current, ErrorFacts, FolderInfo, FolderPatched, ModelState, Pending,
-    ProfileList, Refusal, ServerEvent, SessionEvent, SessionFacts, ThreadFacts, ThreadRef,
-    TurnDetection, VoiceLink, VoiceSocket,
+    ChatReply, ClientEvent, Current, ErrorFacts, FolderInfo, FolderPatched, KaiVoice, ModelState,
+    Pending, ProfileList, Refusal, ServerEvent, SessionEvent, SessionFacts, SpeechVoice,
+    ThreadFacts, ThreadRef, TurnDetection, VoiceLink, VoiceSocket,
 };
 use crate::audio::RATE;
 use crate::lmgw_link::Credentials;
@@ -221,6 +221,24 @@ pub struct MockState {
     /// The next tagged `response.create`s are refused with these codes, one each: an `error`
     /// echoing the create's `event_id` and no response (lmgw's refusal of a create, WP19's M1).
     pub refuse_creates: Vec<String>,
+    /// Kai's voice (`kai_voice`), and the threads it was read for.
+    pub kai_voice: Result<KaiVoice, Refusal>,
+    pub voices_read: Vec<i64>,
+    /// `POST /v1/audio/speech`: what was asked, in order (the voice, the text). Each answer is
+    /// what lmgw passes on from an audio row, audio.cpp's canonical 44-byte WAV (PCM16, mono, at
+    /// the row's rate: `speech_rate`, Supertonic's 44.1 kHz by default), `speech_ms_per_char` of
+    /// it per character, read by Kai's own WAV reader as the real link reads it; `speech_lag`
+    /// after the ask; or the next of `speech_errors`.
+    pub speeches: Vec<(SpeechVoice, String)>,
+    pub speech_ms_per_char: u64,
+    pub speech_rate: u32,
+    pub speech_lag: Duration,
+    pub speech_errors: Vec<Refusal>,
+    /// Firefox's sidebar's requests (kai-firefox §8.2), as they came; each is answered `200
+    /// text/event-stream`, its body what the test sends into the request's entry of
+    /// `sidebar_streams` until it drops it.
+    pub sidebar: Vec<crate::lmgw_link::proxy::relay::Outbound>,
+    pub sidebar_streams: Vec<UnboundedSender<Result<Vec<u8>, String>>>,
     next: u64,
 }
 
@@ -269,6 +287,22 @@ impl Default for MockState {
             transcribed: Vec::new(),
             pending: HashMap::new(),
             pending_read: Vec::new(),
+            kai_voice: Ok(KaiVoice {
+                voice: SpeechVoice {
+                    model: "kai-tts".into(),
+                    voice: Some("alba".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            voices_read: Vec::new(),
+            speeches: Vec::new(),
+            speech_ms_per_char: 20,
+            speech_rate: 44_100,
+            speech_lag: Duration::from_millis(50),
+            speech_errors: Vec::new(),
+            sidebar: Vec::new(),
+            sidebar_streams: Vec::new(),
             next: 0,
         }
     }
@@ -598,6 +632,32 @@ impl VoiceLink for MockLink {
         self.with(|s| s.creds = creds.map(|c| c.url()));
     }
 
+    fn sidebar(
+        &mut self,
+        out: crate::lmgw_link::proxy::relay::Outbound,
+        _limits: crate::lmgw_link::proxy::Limits,
+    ) -> Pending<Result<crate::lmgw_link::proxy::relay::Answer, crate::lmgw_link::proxy::Proxied>>
+    {
+        use crate::lmgw_link::proxy::relay::{Answer, Body};
+        use futures_util::StreamExt;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        self.with(|s| {
+            s.sidebar.push(out);
+            s.sidebar_streams.push(tx);
+        });
+        let body = futures_util::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        })
+        .boxed();
+        Box::pin(async move {
+            Ok(Answer {
+                status: 200,
+                headers: vec![("content-type".into(), "text/event-stream".into())],
+                body: Body::Stream(body),
+            })
+        })
+    }
+
     fn current(&mut self, folder: i64, new: bool) -> Pending<Result<Current, Refusal>> {
         let st = self.st.clone();
         Box::pin(async move {
@@ -757,6 +817,43 @@ impl VoiceLink for MockLink {
             } else {
                 s.transcripts.remove(0)
             }
+        })
+    }
+
+    fn kai_voice(&mut self, thread: i64) -> Pending<Result<KaiVoice, Refusal>> {
+        let st = self.st.clone();
+        Box::pin(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let mut s = st.lock().unwrap();
+            s.voices_read.push(thread);
+            s.kai_voice.clone()
+        })
+    }
+
+    fn speech(&mut self, voice: &SpeechVoice, text: &str) -> Pending<Result<Vec<i16>, Refusal>> {
+        let st = self.st.clone();
+        let asked = (voice.clone(), text.to_owned());
+        let chars = text.chars().count() as u64;
+        Box::pin(async move {
+            let lag = st.lock().unwrap().speech_lag;
+            tokio::time::sleep(lag).await;
+            let mut s = st.lock().unwrap();
+            s.speeches.push(asked);
+            if !s.speech_errors.is_empty() {
+                return Err(s.speech_errors.remove(0));
+            }
+            let ms = chars * s.speech_ms_per_char;
+            let rate = s.speech_rate;
+            let wav = crate::audio::wav::wav16(
+                &vec![900; (ms * u64::from(rate) / 1000) as usize],
+                rate,
+                1,
+            );
+            crate::audio::wav::pcm24k(&wav).map_err(|why| Refusal {
+                status: 200,
+                code: None,
+                message: format!("lmgw's speech does not play: {why}"),
+            })
         })
     }
 

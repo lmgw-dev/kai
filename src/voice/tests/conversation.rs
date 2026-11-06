@@ -165,10 +165,12 @@ async fn the_folders_idle_time_with_no_turn_rolls_the_conversation_over_at_a_qui
     assert_eq!(calls(&r), 3);
     // Its first turn (Kai's own, as the feed says it) starts the timer; lmgw keeps the thread.
     r.feed.fact(FeedFact::TurnStarted {
+        voice: false,
         thread_id: 900,
         by: By {
             name: "device 'desktop'".into(),
             own: true,
+            sidebar: false,
         },
     });
     r.feed.fact(FeedFact::TurnDone { thread_id: 900 });
@@ -251,10 +253,12 @@ async fn the_idle_time_passing_during_a_turn_of_another_principal_waits_for_it()
     let r = rig_with("", mock).await;
     assert_eq!(calls(&r), 1);
     r.feed.fact(FeedFact::TurnStarted {
+        voice: false,
         thread_id: 812,
         by: By {
             name: "device 'phone'".into(),
             own: false,
+            sidebar: false,
         },
     });
     sleep(Duration::from_secs(90)).await;
@@ -479,5 +483,64 @@ async fn a_401_on_current_says_pair_again_with_the_servers_words() {
             ..
         }
     ));
+    r.quit().await;
+}
+
+/// The settings window's Conversation choice (2026-10-19): a switch the owner chose ends the
+/// session without a "voice stopped" report, and listening, if it was on, resumes on the new
+/// folder once it is ready.
+#[tokio::test(start_paused = true)]
+async fn switching_the_conversation_keeps_listening_on_without_a_report() {
+    let mut r = rig("").await;
+    r.listening_on().await;
+    assert_eq!(r.mock.opens(), 1);
+    r.mock.with(|s| {
+        s.folders.push(FolderInfo {
+            id: 8,
+            name: "Kai desktop".into(),
+            ..super::super::mock::kai_folder()
+        })
+    });
+    let (reply, answer) = tokio::sync::oneshot::channel();
+    r.send(Command::Setting {
+        request: crate::settings::Request::Set {
+            key: "conversation.folder_name".into(),
+            value: "Kai desktop".into(),
+        },
+        reply,
+    });
+    answer.await.unwrap().unwrap();
+    r.until(|m| m.voice.thread.is_some() && m.voice.shown == crate::tray::model::VoiceShown::Quiet)
+        .await;
+    sleep(Duration::from_secs(1)).await;
+    assert_eq!(r.mock.opens(), 2, "a session on the new folder");
+    assert_eq!(r.mock.with(|s| s.current_folders.last().copied()), Some(8));
+    r.no_notice("Kai: voice stopped");
+    r.quit().await;
+}
+
+/// Listening that was off stays off over a switch.
+#[tokio::test(start_paused = true)]
+async fn switching_the_conversation_leaves_listening_off_when_it_was_off() {
+    let mut r = rig("").await;
+    r.mock.with(|s| {
+        s.folders.push(FolderInfo {
+            id: 8,
+            name: "Kai desktop".into(),
+            ..super::super::mock::kai_folder()
+        })
+    });
+    let (reply, answer) = tokio::sync::oneshot::channel();
+    r.send(Command::Setting {
+        request: crate::settings::Request::Set {
+            key: "conversation.folder_name".into(),
+            value: "Kai desktop".into(),
+        },
+        reply,
+    });
+    answer.await.unwrap().unwrap();
+    sleep(Duration::from_secs(2)).await;
+    assert_eq!(r.mock.opens(), 0);
+    r.no_notice("Kai: voice stopped");
     r.quit().await;
 }

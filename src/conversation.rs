@@ -210,6 +210,10 @@ pub enum Action {
     /// The folder is gone: the voice leaves its conversation (the session ends, listening off),
     /// with this note.
     Leave(String),
+    /// The owner moved the conversation to another folder: the voice leaves quietly (the session
+    /// ends, nothing is reported) and the core turns listening on again at the new folder if it
+    /// was on.
+    Move,
     Notify(Notice),
 }
 
@@ -293,6 +297,41 @@ impl Conversation {
         self.folder
             .as_ref()
             .is_some_and(|f| f.readiness() == Readiness::Ready)
+    }
+
+    /// The owner gave the conversation another folder name (`conversation.folder_name`, the
+    /// settings window's Conversation choice): the folder of the old name is left, the remembered
+    /// id forgotten (it would win the lookup whatever its name, [`pick`]'s first rule), and with
+    /// the feed up the new name is looked up at once: an ongoing folder of it is used and its
+    /// thread asked for, a missing one created plain, and one that is not ready gets the owner's
+    /// steps, as at a start. A lookup or create of the old name still on its way is replaced (the
+    /// core's next request takes its place, so its answer is dropped). With the feed down, the
+    /// next `hello` looks the new name up.
+    /// `None`: the name is the same (apart from spaces around it), nothing changed and nothing
+    /// is on its way.
+    pub fn rename(&mut self, name: impl Into<String>, feed_up: bool) -> Option<Vec<Action>> {
+        let name = name.into();
+        if name.trim() == self.name.trim() {
+            self.name = name;
+            return None;
+        }
+        tracing::info!(from = %self.name, to = %name, "conversation: another folder name");
+        let had = self.folder.is_some() || self.remembered.is_some();
+        let remembered = self.remembered.is_some();
+        self.reset();
+        self.name = name;
+        let mut acts = Vec::new();
+        if remembered {
+            acts.push(Action::Remember(None));
+        }
+        if had {
+            acts.extend([Action::Use(None), Action::Move]);
+        }
+        if feed_up {
+            self.stage = Stage::Looking { start: false };
+            acts.push(Action::Lookup);
+        }
+        Some(acts)
     }
 
     /// Forgets the gateway's folder (a confirmed re-pair to another gateway): the remembered id

@@ -76,19 +76,15 @@ desktop already says which windows those are (`desktop_context`, the window mana
 
 ## Browser integration (owner, 2026-10-09)
 
-**What stands** (ruling 18, §11.1): a native-messaging helper, `kai-browser-host`, for Firefox and
-Chromium, which forwards to a Kai socket (`$XDG_RUNTIME_DIR/kai/browser.sock`, mode 0600, the
-peer's credentials checked). The extension can wait (§11.2).
+*Designed 2026-11-03* in the `kai-firefox` repository
+(`docs/design/2026-11-03-kai-firefox-design.md`): Kai's browser tools, Kai as the user's hands and
+eyes in Firefox, and the sidebar as a full lmgw Chat. The open questions that stood here are
+answered there.
 
-**A first tool sketch, as open questions only:**
-- **Tabs:** list them (title, URL, which is active, which window), switch to one, close one?
-  Which of these are read-only, which need a confirmation by default?
-- **Read the page's text:** the visible part, the whole document, or the selection; how a long
-  page is cut, and whether it goes through a delegate like `look` so the main context stays small.
-- **Open a URL:** in a new tab or the current one; is that different from `open` with a URL,
-  which already starts the default browser?
-- **Find:** in the current page (the browser's find), across open tabs, or in history and
-  bookmarks?
-- **Without the extension:** what the helper alone can do, and what needs the extension's
-  content scripts.
-- **Which browsers first,** and whether one extension serves Firefox and Chromium.
+## Spoken commands without a model (2026-11-03)
+
+From the Firefox design (§6.5): in conversation mode, "scroll down" or "press 14" runs a whole model
+turn. A path that maps simple, unambiguous commands (scroll, back, press a number, stop reading)
+straight to tool calls, without a model, would make browsing by voice feel immediate. Open: which
+commands, in which languages, how it falls back to the model, and how it stays out of the way of
+normal speech.

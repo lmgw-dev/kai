@@ -2,7 +2,8 @@
 //! the talk key records the spoken answer while the card asks for it (a call of Kai's own, the
 //! card armed for it), and the verdicts go out through the bound session (`mcp_approval_response`
 //! each, then `response.create`) or the approvals route, the spoken answer through `…/transcribe`,
-//! a thread's waiting calls read again through `GET /chat/api/threads/{id}`.
+//! a thread's waiting calls read again through `GET /chat/api/threads/{id}`; Kai's own questions
+//! (`crate::approvals::asked`) spoken through its own speech and answered the same way.
 
 use tokio::time::Instant;
 
@@ -14,10 +15,11 @@ use crate::audio::AudioPort;
 use lmgw_client::requests::approvals::ApprovalsRequest;
 
 impl<L: VoiceLink> Voice<L> {
-    /// The press while the card asks for the voice: the spoken answer is recorded from the
-    /// pre-roll on. A reply
-    /// still playing stops (K6: the press is the owner's turn to speak). Muted, the hold records
-    /// nothing (§5.4).
+    /// The press while the card or one of Kai's own questions asks for the voice: the spoken
+    /// answer is recorded from the press on, with no pre-roll (`crate::approvals::asked`, M1). A
+    /// reply still playing stops (K6: the press is the owner's turn to speak), and so does Kai's
+    /// own speech, another question's included; their echo's guard runs from the press. Muted, the
+    /// hold records nothing (§5.4).
     pub(super) async fn approval_press(&mut self, audio: &impl AudioPort, now: Instant) {
         // The key is held for the answer: nothing else of K6 applies to this press.
         self.key = Some(Key {
@@ -40,9 +42,14 @@ impl<L: VoiceLink> Voice<L> {
             if let Some(s) = self.session.as_mut() {
                 s.cut(&rid, Cut::Stop, wait, now).await;
             }
+            self.reply_echo_until = Some(now + self.s.speech_echo_guard);
         }
-        let preroll: Vec<i16> = self.preroll.drain(..).collect();
-        if self.approvals.press(preroll) {
+        if self.speak_cut("you pressed the talk key to answer") {
+            tracing::info!("talk: the press stops what Kai says by itself to hear the answer");
+        }
+        // What the microphone heard before the press may be Kai's own voice: no pre-roll.
+        self.preroll.clear();
+        if self.approvals.press() {
             self.open_capture(audio);
             self.ensure_tick();
         }
@@ -69,10 +76,30 @@ impl<L: VoiceLink> Voice<L> {
         self.approval_acts(acts);
     }
 
+    /// One of Kai's own questions (`crate::approvals::asked`, the core's `Command::Ask`): held by
+    /// the approvals and spoken. While the screen is locked it is not taken: the dialog has it, and
+    /// the host stops waiting at the lock anyway.
+    pub fn ask(&mut self, a: crate::approvals::asked::Ask) {
+        if self.locked {
+            tracing::info!("approvals: the screen is locked; Kai's question stays with its dialog");
+            return;
+        }
+        // Spoken now, or once the questions before it are over (`Act::Speak`).
+        if let Some(u) = self.approvals.asked(a) {
+            self.speak(u);
+        }
+        self.settle();
+    }
+
     /// Carries out what the approvals ask.
     pub(super) fn approval_acts(&mut self, acts: Vec<Act>) {
         for act in acts {
             match act {
+                Act::Speak { id, words } => {
+                    if let Some(u) = self.approvals.speak_again(&id, words) {
+                        self.speak(u);
+                    }
+                }
                 Act::Session {
                     thread_id,
                     decisions,

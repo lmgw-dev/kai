@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use kai_desktop::caps::windows::{Output, Snapshot, Window};
+use kai_desktop::caps::windows::{Output, Placed, Placement, Snapshot, Window};
 use wayland_client::globals::{GlobalListContents, registry_queue_init};
 use wayland_client::protocol::wl_output::{self, WlOutput};
 use wayland_client::protocol::wl_registry::{self, WlRegistry};
@@ -497,23 +497,9 @@ fn output_of(geometry: Option<(i32, i32, u32, u32)>, outputs: &[&OutFacts]) -> S
         .unwrap_or_default()
 }
 
-/// The table and `extra` as one [`Snapshot`] (module doc).
-pub fn snapshot(table: &Table, extra: &Extra) -> Snapshot {
-    let mut outs: Vec<&OutFacts> = table
-        .outputs
-        .values()
-        .filter(|o| !o.name.is_empty())
-        .collect();
-    outs.sort_by_key(|o| (o.x, o.y));
-    let name_of = |id: &str| {
-        extra
-            .desktops
-            .iter()
-            .find(|(i, _)| i == id)
-            .map(|(_, n)| n.clone())
-            .unwrap_or_else(|| id.to_owned())
-    };
-    // Topmost first: the stacking order reversed, then any window it did not name yet.
+/// The table's windows KWin sent the initial state of, topmost first: the stacking order
+/// reversed, then any window it did not name yet.
+fn stacked(table: &Table) -> Vec<(&String, &Facts)> {
     let mut order: Vec<&String> = table.stacking.iter().rev().collect();
     let mut rest: Vec<&String> = table
         .windows
@@ -522,26 +508,61 @@ pub fn snapshot(table: &Table, extra: &Extra) -> Snapshot {
         .collect();
     rest.sort();
     order.extend(rest);
-    let windows = order
+    order
         .into_iter()
         .filter_map(|id| table.windows.get(id).map(|f| (id, f)))
-        .filter(|(_, f)| f.initial && f.state & state::SKIP_TASKBAR == 0)
-        .map(|(id, f)| Window {
-            id: id.clone(),
-            app: f.app_id.clone(),
-            title: f.title.clone(),
-            pid: f.pid,
-            output: output_of(f.geometry, &outs),
-            desktops: if f.state & state::ON_ALL_DESKTOPS != 0 {
-                Vec::new()
-            } else {
-                f.desktops.iter().map(|d| name_of(d)).collect()
-            },
-            active: f.state & state::ACTIVE != 0,
-            minimized: f.state & state::MINIMIZED != 0,
-            maximized: f.state & state::MAXIMIZED != 0,
-            fullscreen: f.state & state::FULLSCREEN != 0,
-        })
+        .filter(|(_, f)| f.initial)
+        .collect()
+}
+
+/// The outputs with a name, left to right.
+fn named_outputs(table: &Table) -> Vec<&OutFacts> {
+    let mut outs: Vec<&OutFacts> = table
+        .outputs
+        .values()
+        .filter(|o| !o.name.is_empty())
+        .collect();
+    outs.sort_by_key(|o| (o.x, o.y));
+    outs
+}
+
+/// A desktop's name by its id, as `extra` has it (the id where it has none).
+fn desktop_name(extra: &Extra, id: &str) -> String {
+    extra
+        .desktops
+        .iter()
+        .find(|(i, _)| i == id)
+        .map(|(_, n)| n.clone())
+        .unwrap_or_else(|| id.to_owned())
+}
+
+/// One window of the table as a snapshot names it.
+fn window_of(id: &str, f: &Facts, outs: &[&OutFacts], extra: &Extra) -> Window {
+    Window {
+        id: id.to_owned(),
+        app: f.app_id.clone(),
+        title: f.title.clone(),
+        pid: f.pid,
+        output: output_of(f.geometry, outs),
+        desktops: if f.state & state::ON_ALL_DESKTOPS != 0 {
+            Vec::new()
+        } else {
+            f.desktops.iter().map(|d| desktop_name(extra, d)).collect()
+        },
+        active: f.state & state::ACTIVE != 0,
+        minimized: f.state & state::MINIMIZED != 0,
+        maximized: f.state & state::MAXIMIZED != 0,
+        fullscreen: f.state & state::FULLSCREEN != 0,
+    }
+}
+
+/// The table and `extra` as one [`Snapshot`] (module doc).
+pub fn snapshot(table: &Table, extra: &Extra) -> Snapshot {
+    let outs = named_outputs(table);
+    let windows = stacked(table)
+        .into_iter()
+        .filter(|(_, f)| f.state & state::SKIP_TASKBAR == 0)
+        .map(|(id, f)| window_of(id, f, &outs, extra))
         .collect();
     let outputs = outs
         .iter()
@@ -562,8 +583,27 @@ pub fn snapshot(table: &Table, extra: &Extra) -> Snapshot {
         windows,
         outputs,
         desktops: extra.desktops.iter().map(|(_, n)| n.clone()).collect(),
-        desktop: name_of(&extra.current),
+        desktop: desktop_name(extra, &extra.current),
         activity: extra.activity.clone(),
+    }
+}
+
+/// Every window of the table with its geometry, those that skip the task bar included
+/// (`Windows::placed`): KWin's frame rounded to whole pixels, [`super::windows::widened`] as the
+/// script's is.
+pub fn placed(table: &Table, extra: &Extra) -> Placement {
+    let outs = named_outputs(table);
+    Placement {
+        windows: stacked(table)
+            .into_iter()
+            .map(|(id, f)| Placed {
+                window: window_of(id, f, &outs, extra),
+                frame: f.geometry.map(|(x, y, w, h)| {
+                    super::windows::widened(f64::from(x), f64::from(y), f64::from(w), f64::from(h))
+                }),
+            })
+            .collect(),
+        desktop: desktop_name(extra, &extra.current),
     }
 }
 
@@ -715,5 +755,53 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(logical(&bare), (1440, 900, 2.0));
+    }
+
+    /// `placed`: every window KWin announced, the panel's too, with its frame as the protocol said
+    /// it; one with no geometry yet has none; the current desktop by name.
+    #[test]
+    fn every_window_is_placed_with_its_frame() {
+        let mut t = Table::default();
+        t.outputs.insert(7, out("DP-1", 0, 2048, 2560));
+        let facts = |state: u32, geo: Option<(i32, i32, u32, u32)>| Facts {
+            title: "Picture-in-Picture".into(),
+            app_id: "org.mozilla.firefox".into(),
+            pid: 4,
+            state,
+            desktops: vec!["d1".into()],
+            geometry: geo,
+            initial: true,
+        };
+        t.windows.insert(
+            "a".into(),
+            facts(state::SKIP_TASKBAR, Some((10, 20, 300, 200))),
+        );
+        t.windows.insert("b".into(), facts(state::MINIMIZED, None));
+        let mut c = facts(0, Some((0, 0, 1, 1)));
+        c.initial = false;
+        t.windows.insert("c".into(), c);
+        t.stacking = vec!["b".into(), "a".into()];
+        let extra = Extra {
+            desktops: vec![("d1".into(), "Main".into())],
+            current: "d1".into(),
+            ..Default::default()
+        };
+        let p = placed(&t, &extra);
+        assert_eq!(p.desktop, "Main");
+        let ids: Vec<&str> = p.windows.iter().map(|w| w.window.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["a", "b"],
+            "topmost first, the skip-taskbar window kept"
+        );
+        assert_eq!(
+            p.windows[0].frame,
+            Some((9, 19, 302, 202)),
+            "widened by one"
+        );
+        assert_eq!(p.windows[1].frame, None);
+        assert!(p.drawn(&p.windows[0].window));
+        assert!(!p.drawn(&p.windows[1].window), "minimized");
+        assert_eq!(p.windows[0].window.desktops, ["Main"]);
     }
 }
